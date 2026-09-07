@@ -353,6 +353,65 @@ static bool gui_ui_selected_device_is_fx3(const gui_app_t *app)
 }
 #endif
 
+// --- Level autostop backend classification ---
+// Last device type seen by the Vpp reconcile so we re-default level_autostop_vpp
+// only when the active backend actually changes (not every frame).
+static int s_level_autostop_vpp_last_type = -1;
+
+// True if the active capture backend is a voltage-input ADC with a known Vpp
+// (hsdaoh/CXADC/DdD/FX3/playback). Non-voltage backends (RTL-SDR I/Q, simple
+// capture, simulated) hide the Vpp control + mV readout; the 0.X level still
+// works as a normalized threshold.
+static bool gui_ui_level_autostop_has_vpp(const gui_app_t *app)
+{
+    if (!app) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+    device_type_t t = app->devices[app->selected_device].type;
+    if (t == DEVICE_TYPE_HSDAOH) return true;
+    if (t == DEVICE_TYPE_CXADC) return true;
+    if (t == DEVICE_TYPE_PLAYBACK) return true;
+#ifdef ENABLE_DDD
+    if (t == DEVICE_TYPE_DDD) return true;
+#endif
+#ifdef ENABLE_FX3
+    if (t == DEVICE_TYPE_FX3) return true;
+#endif
+    return false;
+}
+
+// True if the active backend is hsdaoh (MISRC v1.5/2.5), which uses the
+// hardware-selectable 1/2 Vpp jumper toggle instead of a free-edit Vpp box.
+static bool gui_ui_level_autostop_is_hsdaoh(const gui_app_t *app)
+{
+    if (!app) return false;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
+    return app->devices[app->selected_device].type == DEVICE_TYPE_HSDAOH;
+}
+
+// Per-frame reconcile: when the active capture backend type changes, re-default
+// level_autostop_vpp to the new backend's default (hsdaoh uses the stored 1/2
+// hardware-jumper memory). Keeps the mV readout correct per-backend without a
+// global custom flag leaking across backends.
+static void gui_ui_level_autostop_reconcile_vpp(gui_app_t *app)
+{
+    if (!app) return;
+    int cur_type = DEVICE_TYPE_HSDAOH;
+    if (app->selected_device >= 0 && app->selected_device < app->device_count) {
+        cur_type = (int)app->devices[app->selected_device].type;
+    }
+    if (cur_type == s_level_autostop_vpp_last_type) return;
+    s_level_autostop_vpp_last_type = cur_type;
+    if (gui_ui_level_autostop_is_hsdaoh(app)) {
+        app->settings.level_autostop_vpp = app->settings.level_autostop_vpp_hsdaoh;
+    } else {
+        app->settings.level_autostop_vpp = gui_app_level_autostop_default_vpp(app);
+    }
+    if (!(app->settings.level_autostop_vpp > 0.1f)) {
+        app->settings.level_autostop_vpp = 2.0f;
+    }
+    gui_settings_save(&app->settings);
+}
+
 #ifdef ENABLE_RTLSDR
 // Generic SDR device check. True for any I/Q-providing SDR backend (today
 // only RTL-SDR; add future SDR backends here so the SDR controls show for
@@ -451,7 +510,7 @@ typedef enum {
     UI_TEXT_FIELD_AUDIO_LABEL_2,
     UI_TEXT_FIELD_AUDIO_LABEL_3,
     UI_TEXT_FIELD_AUDIO_LABEL_4,
-    UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL,    // Level autostop threshold percent
+    UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL,    // Level autostop threshold (normalized 0.1-0.8)
     UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION,  // Level autostop sustain seconds
     UI_TEXT_FIELD_INGEST_PROJECT,
     UI_TEXT_FIELD_INGEST_TAPE_ID,
@@ -2136,8 +2195,9 @@ static bool gui_ui_text_field_char_allowed(ui_text_field_t field, int ch)
         return gui_ui_flac_affinity_char_allowed(ch);
     }
     if (field == UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL) {
-        // Integer percent only.
-        return (ch >= '0' && ch <= '9');
+        // Normalized 0.X level (0.1-0.8): digits and a single '.' (allow typing;
+        // parse clamps on commit).
+        return (ch >= '0' && ch <= '9') || ch == '.';
     }
     if (field == UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION) {
         // Decimal seconds: digits and a single '.' (allow typing; parse clamps).
@@ -2582,6 +2642,25 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     if (s_active_text_field == UI_TEXT_FIELD_RTLSDR_FREQ && s_rtlsdr_freq_str[0]) {
         unsigned long long parsed = strtoull(s_rtlsdr_freq_str, NULL, 10);
         if (parsed > 0) app->settings.rtlsdr_freq_hz = (uint64_t)parsed;
+    }
+    // Level-autostop level text field: clamp the edited 0.X into 0.1-0.8 on commit.
+    // The live string is allowed to be partial while typing; final clamping happens
+    // here so the saved value is always in range.
+    if (s_active_text_field == UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL &&
+        app->settings.level_autostop_level_str[0]) {
+        float lvl = (float)atof(app->settings.level_autostop_level_str);
+        if (lvl > 0.0f) {
+            if (lvl < 0.1f) lvl = 0.1f;
+            if (lvl > 0.8f) lvl = 0.8f;
+            char tmp[16];
+            snprintf(tmp, sizeof(tmp), "%.2f", (double)lvl);
+            size_t len = strlen(tmp);
+            while (len > 0 && tmp[len - 1] == '0') { tmp[--len] = '\0'; }
+            if (len > 0 && tmp[len - 1] == '.') { tmp[--len] = '\0'; }
+            if (tmp[0] == '\0') snprintf(tmp, sizeof(tmp), "0.1");
+            snprintf(app->settings.level_autostop_level_str,
+                     sizeof(app->settings.level_autostop_level_str), "%s", tmp);
+        }
     }
 
     bool changed = false;
@@ -3625,11 +3704,26 @@ static void render_record_limit_window(gui_app_t *app)
         CLAY_TEXT(CLAY_STRING("Shorter changes are ignored until the next recording."),
             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
-        // Level autostop (tape-end detection): enable/disable + level box + duration box.
+        // Level autostop (tape-end detection): ON/OFF toggle on one row,
+        // then a tidy "Level <box> Duration <box>" row underneath.
         // Lives in the timer window alongside the record time limit. Independent from
         // the digital dropout (frame error/missed frame) logic in the main settings.
-        CLAY_TEXT(CLAY_STRING("Level autostop (tape end):"),
-            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+        // Level is a normalized 0.X value (0.1-0.8); the mV peak readout beside it
+        // is derived from the ADC Vpp (set via the waveform monitor's scale dropdown).
+        // mV peak readout: level * (Vpp/2) * 1000 (Vpp is peak-to-peak; half is peak).
+        float las_level = (float)atof(app->settings.level_autostop_level_str);
+        if (las_level < 0.1f) las_level = 0.1f;
+        if (las_level > 0.8f) las_level = 0.8f;
+        bool las_has_vpp = gui_ui_level_autostop_has_vpp(app);
+        float las_vpp = gui_app_level_autostop_vpp(app);
+        int las_mv = (int)roundf(las_level * (las_vpp * 0.5f) * 1000.0f);
+        char las_mv_buf[32];
+        snprintf(las_mv_buf, sizeof(las_mv_buf), "= %d mVpk", las_mv);
+        bool las_enabled = app->settings.level_autostop_enabled;
+        Color las_box_bg = las_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
+        Color las_box_fg = las_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+
+        // Row 1: ON/OFF toggle on the left, with the label text beside it.
         CLAY(CLAY_ID("LevelAutostopRow"), {
             .layout = {
                 .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
@@ -3638,7 +3732,7 @@ static void render_record_limit_window(gui_app_t *app)
                 .childGap = 10
             }
         }) {
-            Color las_bg = app->settings.level_autostop_enabled ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+            Color las_bg = las_enabled ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
             CLAY(CLAY_ID("LevelAutostopToggle"), {
                 .layout = {
                     .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(32) },
@@ -3647,50 +3741,67 @@ static void render_record_limit_window(gui_app_t *app)
                 .backgroundColor = to_clay_color(las_bg),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
-                CLAY_TEXT(app->settings.level_autostop_enabled ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
+                CLAY_TEXT(las_enabled ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
             }
+            CLAY_TEXT(CLAY_STRING("Level autostop (tape end)"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            CLAY(CLAY_ID("LevelAutostopSpacer"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
+        }
 
-            // Level percent box (click to edit)
-            Color lvl_box_bg = app->settings.level_autostop_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
-            Color lvl_box_fg = app->settings.level_autostop_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+        // Row 2: "Level <box> Duration <box>" — tidy labels + edit boxes.
+        CLAY(CLAY_ID("LevelAutostopBoxesRow"), {
+            .layout = {
+                .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
+                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                .childGap = 10
+            }
+        }) {
+            CLAY_TEXT(CLAY_STRING("Level:"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             CLAY(CLAY_ID("LevelAutostopLevelField"), {
                 .layout = {
                     .sizing = { CLAY_SIZING_FIXED(56), CLAY_SIZING_FIXED(32) },
                     .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER },
                     .padding = { 6, 6, 0, 0 }
                 },
-                .backgroundColor = to_clay_color(lvl_box_bg),
+                .backgroundColor = to_clay_color(las_box_bg),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
-                const char *lvl = app->settings.level_autostop_level_str[0] ? app->settings.level_autostop_level_str : "33";
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL) && app->settings.level_autostop_enabled) {
-                    gui_ui_render_active_text(UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL, lvl, FONT_SIZE_STATS, 1, lvl_box_fg);
+                const char *lvl = app->settings.level_autostop_level_str[0] ? app->settings.level_autostop_level_str : "0.4";
+                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL) && las_enabled) {
+                    gui_ui_render_active_text(UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL, lvl, FONT_SIZE_STATS, 1, las_box_fg);
                 } else {
-                    CLAY_TEXT(make_string(lvl), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(lvl_box_fg) }));
+                    CLAY_TEXT(make_string(lvl), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(las_box_fg) }));
                 }
             }
-            CLAY_TEXT(CLAY_STRING("% level"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            // mV peak readout (voltage backends); plain "0.X" hint otherwise.
+            if (las_has_vpp) {
+                CLAY_TEXT(make_string(las_mv_buf),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            } else {
+                CLAY_TEXT(CLAY_STRING("0.X"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            }
 
-            CLAY(CLAY_ID("LevelAutostopSpacer"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
+            CLAY(CLAY_ID("LevelAutostopBoxesSpacer"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
 
-            // Duration seconds box (click to edit)
-            Color dur_box_bg = app->settings.level_autostop_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
-            Color dur_box_fg = app->settings.level_autostop_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
+            CLAY_TEXT(CLAY_STRING("Duration:"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             CLAY(CLAY_ID("LevelAutostopDurationField"), {
                 .layout = {
                     .sizing = { CLAY_SIZING_FIXED(64), CLAY_SIZING_FIXED(32) },
                     .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER },
                     .padding = { 6, 6, 0, 0 }
                 },
-                .backgroundColor = to_clay_color(dur_box_bg),
+                .backgroundColor = to_clay_color(las_box_bg),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
                 const char *dur = app->settings.level_autostop_duration_str[0] ? app->settings.level_autostop_duration_str : "5.0";
-                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION) && app->settings.level_autostop_enabled) {
-                    gui_ui_render_active_text(UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION, dur, FONT_SIZE_STATS, 1, dur_box_fg);
+                if (gui_ui_is_text_field_active(UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION) && las_enabled) {
+                    gui_ui_render_active_text(UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION, dur, FONT_SIZE_STATS, 1, las_box_fg);
                 } else {
-                    CLAY_TEXT(make_string(dur), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(dur_box_fg) }));
+                    CLAY_TEXT(make_string(dur), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(las_box_fg) }));
                 }
             }
             CLAY_TEXT(CLAY_STRING("s below"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
@@ -7560,6 +7671,10 @@ void gui_handle_interactions(gui_app_t *app) {
     gui_ui_sync_capture_mode_state(app);
     gui_record_limit_runtime_tick(app);
     gui_ui_update_check_tick(app);
+    // Re-default level-autostop Vpp when the active backend type changes so the
+    // mV readout matches the selected hardware (hsdaoh uses its 1/2 Vpp jumper
+    // memory; other backends use their verified default Vpp).
+    gui_ui_level_autostop_reconcile_vpp(app);
     bool playback_mode = gui_ui_selected_device_is_playback(app);
     if (playback_mode) {
         s_record_limit_window_open = false;
@@ -8159,6 +8274,8 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
                 return;
             }
+            // Vpp (ADC range) control lives on the waveform monitor's Layout
+            // dropdown (channel A) — see handle_layout_dropdown.
             if (Clay_PointerOver(CLAY_ID("RecordLimitWindow"))) {
                 gui_ui_set_click_consumed();
                 return;

@@ -2621,6 +2621,80 @@ void gui_app_stop_recording(gui_app_t *app) {
     gui_record_stop(app);
 }
 
+// --- Level autostop helpers (device-aware level scaling) ---
+// Resolve the active capture backend's device type from the selected device.
+// Returns DEVICE_TYPE_HSDAOH when no device is selected (safe default that
+// matches the 12-bit/2048 container used by the common hsdaoh path).
+static device_type_t gui_capture_active_device_type(const gui_app_t *app)
+{
+    if (!app) return DEVICE_TYPE_HSDAOH;
+    if (app->selected_device < 0 || app->selected_device >= app->device_count) {
+        return DEVICE_TYPE_HSDAOH;
+    }
+    return app->devices[app->selected_device].type;
+}
+
+// Peak full-scale counts for the active capture mode.
+// - hsdaoh / cxadc (8-bit + tenbit) / FX3 / simulated / rtlsdr / simple_capture
+//   all normalize peaks into the 12-bit signed container (max magnitude 2048).
+// - DdD stores native 10-bit magnitude (max 512) directly into the peak
+//   atomics (gui_ddd.c), so its full scale is 512.
+// - 8-bit FLAC playback stays in the 8-bit range (max 128); 12/16-bit playback
+//   normalizes to the 12-bit container (2048). The bps is read from the FLAC
+//   STREAMINFO via gui_playback_get_file_info_a(); if unavailable (e.g. no
+//   file loaded yet / LIBFLAC disabled), fall back to 2048.
+uint16_t gui_app_level_autostop_full_scale(const gui_app_t *app)
+{
+    if (!app) return 2048;
+    device_type_t t = gui_capture_active_device_type(app);
+#ifdef ENABLE_DDD
+    if (t == DEVICE_TYPE_DDD) return 512;
+#endif
+    if (t == DEVICE_TYPE_PLAYBACK) {
+        playback_file_info_t info;
+        if (gui_playback_get_file_info_a((gui_app_t *)app, &info) && info.valid) {
+            if (info.bits_per_sample == 8) return 128;
+        }
+        return 2048;
+    }
+    return 2048;
+}
+
+// Per-backend default ADC full-scale Vpp (user-verified):
+//   hsdaoh (MISRC v1.5/2.5): selectable 1 or 2 Vpp via hardware jumper (def 2)
+//   CXADC: 2 Vpp
+//   DdD: 2 Vpp (TI ADS825 10-bit ADC, 2 Vpp input range — DdD Hardware Guide)
+//   FX3ADC: 1 Vpp
+//   others (simulated/rtlsdr/simple_capture): 2 Vpp (non-voltage backends;
+//     the mV readout is hidden in the UI for these)
+float gui_app_level_autostop_default_vpp(const gui_app_t *app)
+{
+    if (!app) return 2.0f;
+    device_type_t t = gui_capture_active_device_type(app);
+#ifdef ENABLE_FX3
+    if (t == DEVICE_TYPE_FX3) return 1.0f;
+#endif
+    // hsdaoh default is 2.0; the actual hardware jumper (1 or 2) is remembered
+    // in settings.level_autostop_vpp_hsdaoh and applied by the UI on device
+    // change, so this default is only used before the user ever toggles it.
+    return 2.0f;
+}
+
+// Effective ADC full-scale Vpp for the mV readout. Derived from the waveform
+// scale mode (mV w/2Vpp -> 2.0, mV w/1Vpp -> 1.0); for the 0.X level modes
+// the stored level_autostop_vpp is used (re-defaulted per backend on device
+// change). Clamped to a sane positive minimum.
+float gui_app_level_autostop_vpp(const gui_app_t *app)
+{
+    if (!app) return 2.0f;
+    int mode = app->settings.waveform_scale_mode;
+    if (mode == 3) return 1.0f;   // 1Vpp
+    if (mode == 4) return 2.0f;   // 2Vpp
+    float v = app->settings.level_autostop_vpp;
+    if (!(v > 0.1f)) v = 2.0f;  // clamp sane positive minimum (also catches NaN)
+    return v;
+}
+
 // Helper to update one direction of VU meter (pos or neg)
 static void update_vu_direction(float *level, float *peak, float *peak_hold_time,
                                  float target, float dt) {

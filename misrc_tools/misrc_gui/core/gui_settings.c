@@ -480,16 +480,22 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->stop_on_dropout = false;
 
     // Level autostop defaults (tape-end detection). Disabled by default.
-    // Defaults mirror PR #11: 33% threshold, 5.0s sustain.
+    // Level is a normalized 0.X string (range 0.1-0.8); default 0.4 mirrors the
+    // original PR #11 33% intent (~0.33, rounded to 0.4 as a sane default).
+    // Vpp defaults to 2.0 (hsdaoh/CXADC/DdD); FX3 overrides to 1.0 on device
+    // change. level_autostop_vpp_hsdaoh remembers the hsdaoh 1/2 Vpp jumper.
     settings->level_autostop_enabled = false;
-    strcpy(settings->level_autostop_level_str, "33");
+    strcpy(settings->level_autostop_level_str, "0.4");
     strcpy(settings->level_autostop_duration_str, "5.0");
+    settings->level_autostop_vpp = 2.0f;
+    settings->level_autostop_vpp_hsdaoh = 2.0f;
     
     // Display settings
     settings->show_grid = true;
     settings->time_scale = 1.0f;
     settings->amplitude_scale = 1.0f;
     settings->ui_scale_percent = GUI_UI_SCALE_DEFAULT_PERCENT;
+    settings->waveform_scale_mode = 0;  // Basic (0.X, majors only +-0.5/0) by default
 
     // V4L2/simple_capture device discovery is opt-in (disabled by default).
     settings->discover_simple_capture = false;
@@ -592,6 +598,8 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"level_autostop_enabled\": %s,\n", settings->level_autostop_enabled ? "true" : "false");
     fprintf(f, "  \"level_autostop_level_str\": \"%s\",\n", settings->level_autostop_level_str);
     fprintf(f, "  \"level_autostop_duration_str\": \"%s\",\n", settings->level_autostop_duration_str);
+    fprintf(f, "  \"level_autostop_vpp\": %.3f,\n", settings->level_autostop_vpp);
+    fprintf(f, "  \"level_autostop_vpp_hsdaoh\": %.3f,\n", settings->level_autostop_vpp_hsdaoh);
     fprintf(f, "  \"ingest_project\": \"%s\",\n", settings->ingest_project);
     fprintf(f, "  \"ingest_tape_id\": \"%s\",\n", settings->ingest_tape_id);
     fprintf(f, "  \"ingest_tape_format\": \"%s\",\n", settings->ingest_tape_format);
@@ -630,6 +638,7 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"flac_threads\": %d,\n", settings->flac_threads);
     fprintf(f, "  \"flac_affinity_enabled\": %s,\n", settings->flac_affinity_enabled ? "true" : "false");
     fprintf(f, "  \"flac_affinity_cpu_list\": \"%s\",\n", settings->flac_affinity_cpu_list);
+    fprintf(f, "  \"waveform_scale_mode\": %d,\n", settings->waveform_scale_mode);
     fprintf(f, "  \"enable_resample_a\": %s,\n", settings->enable_resample_a ? "true" : "false");
     fprintf(f, "  \"enable_resample_b\": %s,\n", settings->enable_resample_b ? "true" : "false");
     fprintf(f, "  \"resample_rate_a\": %.1f,\n", settings->resample_rate_a);
@@ -896,6 +905,37 @@ bool gui_settings_choose_playback_file(gui_settings_t *settings, int channel) {
     return true;
 }
 
+// Normalize level_autostop_level_str on load: migrate legacy integer percent
+// (1-99, e.g. "33") to the normalized 0.X fraction (0.1-0.8), and clamp any
+// value into the valid 0.1-0.8 range. Reformat canonically with up to 2
+// decimals and no trailing zeros (0.4 stays "0.4", 0.45 stays "0.45",
+// legacy "33" -> "0.33").
+static void gui_settings_normalize_level_autostop_level(char *buf, size_t cap)
+{
+    if (!buf || cap == 0) return;
+    char *end = NULL;
+    double v = strtod(buf, &end);
+    bool has_dot = (strchr(buf, '.') != NULL);
+    // Legacy integer percent (no decimal point, 1-99) -> fraction.
+    if (!has_dot && end != buf && *end == '\0') {
+        long pct = strtol(buf, NULL, 10);
+        if (pct >= 1 && pct <= 99) {
+            v = (double)pct / 100.0;
+        }
+    }
+    // Clamp to valid 0.1-0.8 range.
+    if (v < 0.1) v = 0.1;
+    if (v > 0.8) v = 0.8;
+    char tmp[16];
+    snprintf(tmp, sizeof(tmp), "%.2f", v);
+    // Strip trailing zeros and a trailing dot.
+    size_t len = strlen(tmp);
+    while (len > 0 && tmp[len - 1] == '0') { tmp[--len] = '\0'; }
+    if (len > 0 && tmp[len - 1] == '.') { tmp[--len] = '\0'; }
+    if (tmp[0] == '\0') snprintf(tmp, sizeof(tmp), "0.1");
+    snprintf(buf, cap, "%s", tmp);
+}
+
 void gui_settings_load(gui_settings_t *settings) {
     if (!settings) return;
     
@@ -1091,6 +1131,14 @@ void gui_settings_load(gui_settings_t *settings) {
     if ((value = find_value(content, "ui_scale_percent")) != NULL) {
         settings->ui_scale_percent = gui_ui_scale_parse_percent(value);
     }
+    if ((value = find_value(content, "waveform_scale_mode")) != NULL) {
+        int mode = atoi(value);
+        if (mode < 0 || mode > 4) mode = 0;
+        settings->waveform_scale_mode = mode;
+    } else if ((value = find_value(content, "waveform_scale_mv")) != NULL) {
+        // Backward compat: migrate the old bool (false->0 Basic, true->4 2Vpp).
+        settings->waveform_scale_mode = (strcmp(value, "true") == 0) ? 4 : 0;
+    }
     if ((value = find_value(content, "discover_simple_capture")) != NULL) {
         settings->discover_simple_capture = (strcmp(value, "true") == 0);
     }
@@ -1211,10 +1259,22 @@ void gui_settings_load(gui_settings_t *settings) {
     if ((value = find_value(content, "level_autostop_level_str")) != NULL) {
         strncpy(settings->level_autostop_level_str, value, sizeof(settings->level_autostop_level_str) - 1);
         settings->level_autostop_level_str[sizeof(settings->level_autostop_level_str) - 1] = '\0';
+        // Migrate legacy integer percent (1-99) -> normalized 0.X (0.1-0.8)
+        // and clamp into range. Idempotent for already-0.X saves.
+        gui_settings_normalize_level_autostop_level(settings->level_autostop_level_str,
+                                                    sizeof(settings->level_autostop_level_str));
     }
     if ((value = find_value(content, "level_autostop_duration_str")) != NULL) {
         strncpy(settings->level_autostop_duration_str, value, sizeof(settings->level_autostop_duration_str) - 1);
         settings->level_autostop_duration_str[sizeof(settings->level_autostop_duration_str) - 1] = '\0';
+    }
+    if ((value = find_value(content, "level_autostop_vpp")) != NULL) {
+        settings->level_autostop_vpp = (float)atof(value);
+        if (!(settings->level_autostop_vpp > 0.1f)) settings->level_autostop_vpp = 2.0f;
+    }
+    if ((value = find_value(content, "level_autostop_vpp_hsdaoh")) != NULL) {
+        settings->level_autostop_vpp_hsdaoh = (float)atof(value);
+        if (!(settings->level_autostop_vpp_hsdaoh > 0.1f)) settings->level_autostop_vpp_hsdaoh = 2.0f;
     }
     if ((value = find_value(content, "ingest_project")) != NULL) {
         strncpy(settings->ingest_project, value, sizeof(settings->ingest_project) - 1);

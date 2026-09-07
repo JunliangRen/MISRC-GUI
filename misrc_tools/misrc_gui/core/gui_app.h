@@ -274,8 +274,19 @@ typedef struct {
     // configurable percentage for a configurable duration (tape-end detection).
     // Independent from the digital dropout (frame error/missed frame) logic above.
     bool level_autostop_enabled;               // Enable/disable the level-based autostop
-    char level_autostop_level_str[16];         // Signal level threshold as a percent string (e.g. "33")
+    // Level threshold as a normalized 0.X string (range 0.1-0.8). Historically
+    // an integer percent string (e.g. "33"); loaded values are migrated to 0.X
+    // on settings load (see gui_settings.c backward-compat path).
+    char level_autostop_level_str[16];         // Normalized level threshold (e.g. "0.4")
     char level_autostop_duration_str[16];      // Sustain duration as a seconds string (e.g. "5.0")
+    // ADC full-scale peak-to-peak voltage for the level-autostop mV readout.
+    // Device-specific (hsdaoh selectable 1/2 Vpp via hardware jumper, CXADC/DdD
+    // 2 Vpp, FX3 1 Vpp). Re-defaulted to the backend default when the selected
+    // device changes. level_autostop_vpp_hsdaoh remembers the hsdaoh hardware
+    // 1/2 jumper setting across backend switches so switching away and back
+    // restores the user's physical jumper value.
+    float level_autostop_vpp;                  // Effective ADC full-scale Vpp (e.g. 2.0)
+    float level_autostop_vpp_hsdaoh;           // hsdaoh hardware 1/2 Vpp jumper memory (1.0 or 2.0)
 
     // Per-channel audio labels (for auto naming, e.g. "linear", "baseband")
     char audio_1ch_labels[4][32];
@@ -297,6 +308,12 @@ typedef struct {
     float time_scale;         // Time per division (ms)
     float amplitude_scale;    // Amplitude scale factor
     int ui_scale_percent;     // Ctrl/Cmd+wheel or +/- UI zoom, persisted as 75-200
+    // Waveform amplitude scale mode (0=Basic majors-only, 1=Expanded thinned,
+    // 2=Full all 0.1-0.8, 3=mV/1Vpp, 4=mV/2Vpp). Selected via a dropdown
+    // on the waveform panel overlay beside the CH A/CH B label. Grid lines and
+    // waveform stay put; only the tick labels (and tick density) change. The
+    // mV modes also fix the ADC Vpp used by the level-autostop mV readout.
+    int waveform_scale_mode;
 
     // Device discovery: V4L2/simple_capture device enumeration is opt-in.
     // Disabled by default since most users use hsdaoh/CXADC/DdD/FX3 backends;
