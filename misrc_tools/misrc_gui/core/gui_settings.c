@@ -480,13 +480,12 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
     settings->stop_on_dropout = false;
 
     // Level autostop defaults (tape-end detection). Disabled by default.
-    // Level is a normalized 0.X string (range 0.1-0.8); default 0.4 mirrors the
-    // original PR #11 33% intent (~0.33, rounded to 0.4 as a sane default).
+    // Stock config: trigger level 0.2 (normalized 0.1-0.8), sustain 30 seconds.
     // Vpp defaults to 2.0 (hsdaoh/CXADC/DdD); FX3 overrides to 1.0 on device
     // change. level_autostop_vpp_hsdaoh remembers the hsdaoh 1/2 Vpp jumper.
     settings->level_autostop_enabled = false;
-    strcpy(settings->level_autostop_level_str, "0.4");
-    strcpy(settings->level_autostop_duration_str, "5.0");
+    strcpy(settings->level_autostop_level_str, "0.2");
+    strcpy(settings->level_autostop_duration_str, "30");
     settings->level_autostop_vpp = 2.0f;
     settings->level_autostop_vpp_hsdaoh = 2.0f;
     

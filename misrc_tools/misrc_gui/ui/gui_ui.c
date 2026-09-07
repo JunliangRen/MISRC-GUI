@@ -358,27 +358,6 @@ static bool gui_ui_selected_device_is_fx3(const gui_app_t *app)
 // only when the active backend actually changes (not every frame).
 static int s_level_autostop_vpp_last_type = -1;
 
-// True if the active capture backend is a voltage-input ADC with a known Vpp
-// (hsdaoh/CXADC/DdD/FX3/playback). Non-voltage backends (RTL-SDR I/Q, simple
-// capture, simulated) hide the Vpp control + mV readout; the 0.X level still
-// works as a normalized threshold.
-static bool gui_ui_level_autostop_has_vpp(const gui_app_t *app)
-{
-    if (!app) return false;
-    if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
-    device_type_t t = app->devices[app->selected_device].type;
-    if (t == DEVICE_TYPE_HSDAOH) return true;
-    if (t == DEVICE_TYPE_CXADC) return true;
-    if (t == DEVICE_TYPE_PLAYBACK) return true;
-#ifdef ENABLE_DDD
-    if (t == DEVICE_TYPE_DDD) return true;
-#endif
-#ifdef ENABLE_FX3
-    if (t == DEVICE_TYPE_FX3) return true;
-#endif
-    return false;
-}
-
 // True if the active backend is hsdaoh (MISRC v1.5/2.5), which uses the
 // hardware-selectable 1/2 Vpp jumper toggle instead of a free-edit Vpp box.
 static bool gui_ui_level_autostop_is_hsdaoh(const gui_app_t *app)
@@ -3466,10 +3445,10 @@ static void render_record_limit_window(gui_app_t *app)
 {
     if (!s_record_limit_window_open) return;
 
-    int record_limit_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 420);
-    int record_limit_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 440);
-    int record_limit_min_width = gui_ui_clamp_int(record_limit_max_width, 1, 420);
-    int record_limit_min_height = gui_ui_clamp_int(record_limit_max_height, 1, 235);
+    // Fixed narrow width: window stays compact and can't scroll sideways.
+    int record_limit_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 340);
+    int record_limit_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 420);
+    int record_limit_min_height = gui_ui_clamp_int(record_limit_max_height, 1, 200);
 
     uint32_t parsed_seconds = 0;
     bool timecode_valid = parse_record_limit_timecode(s_record_limit_timecode, &parsed_seconds);
@@ -3510,7 +3489,7 @@ static void render_record_limit_window(gui_app_t *app)
     CLAY(CLAY_ID("RecordLimitWindow"), {
         .layout = {
             .sizing = {
-                CLAY_SIZING_FIT(.min = record_limit_min_width, .max = record_limit_max_width),
+                CLAY_SIZING_FIXED(record_limit_width),
                 CLAY_SIZING_FIT(.min = record_limit_min_height, .max = record_limit_max_height)
             },
             .layoutDirection = CLAY_TOP_TO_BOTTOM,
@@ -3522,7 +3501,7 @@ static void render_record_limit_window(gui_app_t *app)
             .attachPoints = { .element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER }
         },
         .clip = {
-            .horizontal = true,
+            .horizontal = false,
             .vertical = true,
             .childOffset = Clay_GetScrollOffset()
         },
@@ -3705,20 +3684,11 @@ static void render_record_limit_window(gui_app_t *app)
             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
         // Level autostop (tape-end detection): ON/OFF toggle on one row,
-        // then a tidy "Level <box> Duration <box>" row underneath.
+        // then a tidy "Level: <box> Duration: <box>" row underneath — tight,
+        // centered, no extra readout text on the row.
         // Lives in the timer window alongside the record time limit. Independent from
         // the digital dropout (frame error/missed frame) logic in the main settings.
-        // Level is a normalized 0.X value (0.1-0.8); the mV peak readout beside it
-        // is derived from the ADC Vpp (set via the waveform monitor's scale dropdown).
-        // mV peak readout: level * (Vpp/2) * 1000 (Vpp is peak-to-peak; half is peak).
-        float las_level = (float)atof(app->settings.level_autostop_level_str);
-        if (las_level < 0.1f) las_level = 0.1f;
-        if (las_level > 0.8f) las_level = 0.8f;
-        bool las_has_vpp = gui_ui_level_autostop_has_vpp(app);
-        float las_vpp = gui_app_level_autostop_vpp(app);
-        int las_mv = (int)roundf(las_level * (las_vpp * 0.5f) * 1000.0f);
-        char las_mv_buf[32];
-        snprintf(las_mv_buf, sizeof(las_mv_buf), "= %d mVpk", las_mv);
+        // Level is a normalized 0.X value (0.1-0.8).
         bool las_enabled = app->settings.level_autostop_enabled;
         Color las_box_bg = las_enabled ? (Color){25,25,30,255} : ui_disabled_color((Color){25,25,30,255});
         Color las_box_fg = las_enabled ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
@@ -3749,16 +3719,18 @@ static void render_record_limit_window(gui_app_t *app)
             CLAY(CLAY_ID("LevelAutostopSpacer"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
         }
 
-        // Row 2: "Level <box> Duration <box>" — tidy labels + edit boxes.
+        // Row 2: "Level: [box] Duration: [box]" — tight, centered as one block,
+        // labels centered to boxes, no extra readout text on the line.
         CLAY(CLAY_ID("LevelAutostopBoxesRow"), {
             .layout = {
                 .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) },
                 .layoutDirection = CLAY_LEFT_TO_RIGHT,
                 .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
-                .childGap = 10
+                .childGap = 6
             }
         }) {
-            CLAY_TEXT(CLAY_STRING("Level:"),
+            CLAY(CLAY_ID("LevelAutostopBoxesPadLeft"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
+            CLAY_TEXT(CLAY_STRING("Trigger Level:"),
                 CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             CLAY(CLAY_ID("LevelAutostopLevelField"), {
                 .layout = {
@@ -3769,23 +3741,13 @@ static void render_record_limit_window(gui_app_t *app)
                 .backgroundColor = to_clay_color(las_box_bg),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
-                const char *lvl = app->settings.level_autostop_level_str[0] ? app->settings.level_autostop_level_str : "0.4";
+                const char *lvl = app->settings.level_autostop_level_str[0] ? app->settings.level_autostop_level_str : "0.2";
                 if (gui_ui_is_text_field_active(UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL) && las_enabled) {
                     gui_ui_render_active_text(UI_TEXT_FIELD_LEVEL_AUTOSTOP_LEVEL, lvl, FONT_SIZE_STATS, 1, las_box_fg);
                 } else {
                     CLAY_TEXT(make_string(lvl), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(las_box_fg) }));
                 }
             }
-            // mV peak readout (voltage backends); plain "0.X" hint otherwise.
-            if (las_has_vpp) {
-                CLAY_TEXT(make_string(las_mv_buf),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-            } else {
-                CLAY_TEXT(CLAY_STRING("0.X"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
-            }
-
-            CLAY(CLAY_ID("LevelAutostopBoxesSpacer"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
-
             CLAY_TEXT(CLAY_STRING("Duration:"),
                 CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             CLAY(CLAY_ID("LevelAutostopDurationField"), {
@@ -3797,14 +3759,14 @@ static void render_record_limit_window(gui_app_t *app)
                 .backgroundColor = to_clay_color(las_box_bg),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
-                const char *dur = app->settings.level_autostop_duration_str[0] ? app->settings.level_autostop_duration_str : "5.0";
+                const char *dur = app->settings.level_autostop_duration_str[0] ? app->settings.level_autostop_duration_str : "30";
                 if (gui_ui_is_text_field_active(UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION) && las_enabled) {
                     gui_ui_render_active_text(UI_TEXT_FIELD_LEVEL_AUTOSTOP_DURATION, dur, FONT_SIZE_STATS, 1, las_box_fg);
                 } else {
                     CLAY_TEXT(make_string(dur), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(las_box_fg) }));
                 }
             }
-            CLAY_TEXT(CLAY_STRING("s below"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            CLAY(CLAY_ID("LevelAutostopBoxesPadRight"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(1) } } }) { }
         }
     }
 }
