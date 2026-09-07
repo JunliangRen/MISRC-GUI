@@ -3748,7 +3748,7 @@ static void render_record_limit_window(gui_app_t *app)
                     CLAY_TEXT(make_string(lvl), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(las_box_fg) }));
                 }
             }
-            CLAY_TEXT(CLAY_STRING("Duration:"),
+            CLAY_TEXT(CLAY_STRING("Trigger Time:"),
                 CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             CLAY(CLAY_ID("LevelAutostopDurationField"), {
                 .layout = {
