@@ -1282,6 +1282,16 @@ void gui_app_cleanup(gui_app_t *app) {
         app->display_thread = NULL;
     }
 
+    // Wait for any in-flight recording finalize to complete before freeing the
+    // ringbuffers it is still draining. gui_record_stop() spawns finalization
+    // on a background thread to keep the UI responsive; if the app exits (or
+    // capture is torn down) while that thread is still joining the writer
+    // threads, bufmgr_cleanup would free BUF_RECORD_A/B out from under them —
+    // a use-after-free that truncates/corrupts the capture file. gui_record_cleanup
+    // blocks until the finalize thread is done, so the buffers stay valid for
+    // the writer threads to drain first.
+    gui_record_cleanup();
+
     // Cleanup buffer manager
     bufmgr_cleanup(&app->buffers);
 }

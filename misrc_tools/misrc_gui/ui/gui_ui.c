@@ -8313,6 +8313,18 @@ void gui_handle_interactions(gui_app_t *app) {
                 control_capturing = gui_net_client_peer_capturing(app);
             }
             if (control_capturing) {
+                // Refuse to disconnect while recording: tearing capture down
+                // mid-recording races the async record finalize thread (which
+                // is still joining the writer threads draining BUF_RECORD_A/B)
+                // and can corrupt/truncate the capture file. Force the user to
+                // stop recording first via the Record button, which finalizes
+                // cleanly before this control becomes usable again. Mirrors the
+                // "settings locked while recording" pattern at gui_ui_settings_locked.
+                if (app->is_recording) {
+                    gui_app_set_status(app, "Stop recording before disconnecting (protects the capture file)");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
 #if defined(__ANDROID__)
                 /* Async stop: hsdaoh_stop_stream/close on the wrapped fd can
                  * hang joining libusb/libuvc threads; never block the render
@@ -8373,11 +8385,22 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_app_set_status(app, "DdD backend selected; MISRC/HSDAOH mode not applicable");
             } else if (gui_net_is_client(app)) {
                 gui_app_set_status(app, "Client mode mirrors server capture mode; change mode on server");
-            } else if (app->is_recording) {
+            } else if (app->is_recording || gui_record_is_finalizing()) {
+                // Mode switch is locked while recording is active AND while a
+                // recording finalize is still in flight. gui_record_stop() sets
+                // is_recording=false before the async finalize thread completes,
+                // so checking is_recording alone would re-enable the toggle
+                // mid-finalize — switching backend at that point would race the
+                // writer threads draining BUF_RECORD_A/B. Mirrors the Disconnect
+                // lockout and the "settings locked while recording" pattern.
                 TraceLog(LOG_INFO,
-                         "MODE TRACE: source=CaptureModeToggle blocked current=%s recording=1",
-                         gui_ui_capture_mode_name(s_capture_mode_state_misrc));
-                gui_app_set_status(app, "Capture mode is locked while recording is active");
+                         "MODE TRACE: source=CaptureModeToggle blocked current=%s recording=%d finalizing=%d",
+                         gui_ui_capture_mode_name(s_capture_mode_state_misrc),
+                         app->is_recording ? 1 : 0,
+                         gui_record_is_finalizing() ? 1 : 0);
+                gui_app_set_status(app, app->is_recording
+                    ? "Capture mode is locked while recording is active"
+                    : "Capture mode is locked while recording finalizes");
             } else {
                 gui_ui_set_capture_mode_state(app, !s_capture_mode_state_misrc);
                 gui_settings_save(&app->settings);

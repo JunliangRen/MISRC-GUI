@@ -748,7 +748,17 @@ int main(int argc, char **argv) {
 
             if (IsKeyPressed(KEY_SPACE) && !app.settings_panel_open) {
                 if (app.is_capturing) {
-                    gui_app_stop_capture(&app);
+                    // Refuse to disconnect via space-bar while recording:
+                    // tearing capture down mid-recording races the async record
+                    // finalize thread and can corrupt/truncate the capture file.
+                    // Force the user to stop recording first (mirrors the
+                    // Disconnect-button guard and the "settings locked while
+                    // recording" pattern).
+                    if (app.is_recording) {
+                        gui_app_set_status(&app, "Stop recording before disconnecting (protects the capture file)");
+                    } else {
+                        gui_app_stop_capture(&app);
+                    }
                 } else {
                     gui_app_start_capture(&app);
                 }
