@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
 #include <stdatomic.h>
 
@@ -21,14 +22,16 @@
 #include <rtl-sdr.h>
 
 #include "gui_rtlsdr.h"
+#include "gui_capture.h"
 #include "../core/gui_app.h"
+#include "../output/gui_record.h"
+#if LIBSOXR_ENABLED
+#include "../output/gui_rtlsdr_record.h"
+#endif
 #include "../processing/gui_extract.h"
 #include "../processing/gui_display_thread.h"
 #include "../../common/buffer_manager.h"
 #include "../../common/threading.h"
-
-/* do_exit is defined in the core capture module; declared extern here like gui_fx3.c. */
-extern atomic_int do_exit;
 
 //-----------------------------------------------------------------------------
 // Constants
@@ -50,6 +53,9 @@ extern atomic_int do_exit;
 static rtlsdr_dev_t *s_rtlsdr_dev = NULL;
 static atomic_bool s_rtlsdr_running = false;
 static void *s_rtlsdr_thread = NULL;
+static uint32_t s_rtlsdr_rate_hz;
+static uint32_t s_rtlsdr_center_hz;
+static bool s_rtlsdr_source_valid;
 
 //-----------------------------------------------------------------------------
 // Raw format encoding (mirrors gui_playback.c / extract.c decoding)
@@ -103,6 +109,8 @@ int gui_rtlsdr_enumerate(rtlsdr_device_info_t *devices, int max_devices) {
 
 int gui_rtlsdr_open(gui_app_t *app, int device_index) {
     if (!app) return -1;
+    s_rtlsdr_source_valid = false;
+    s_rtlsdr_rate_hz = s_rtlsdr_center_hz = 0;
     if (s_rtlsdr_dev) {
         rtlsdr_close(s_rtlsdr_dev);
         s_rtlsdr_dev = NULL;
@@ -117,14 +125,29 @@ int gui_rtlsdr_open(gui_app_t *app, int device_index) {
 
     uint32_t rate = app->settings.rtlsdr_sample_rate_hz;
     if (rate == 0) rate = RTL_DEFAULT_RATE_HZ;
-    if (rtlsdr_set_sample_rate(s_rtlsdr_dev, rate) < 0) {
+    bool rate_ok = rtlsdr_set_sample_rate(s_rtlsdr_dev, rate) == 0;
+    if (!rate_ok) {
         fprintf(stderr, "[RTL-SDR] Warning: set_sample_rate(%u) failed\n", rate);
     }
 
-    if (rtlsdr_set_center_freq(s_rtlsdr_dev, (uint32_t)app->settings.rtlsdr_freq_hz) < 0) {
+    // Low-frequency reception may require a board's direct I or Q input.
+    // Leave the normal tuner path unchanged unless the user selects otherwise.
+    int direct = app->settings.rtlsdr_direct_sampling;
+    bool input_ok = direct >= 0 && direct <= 2;
+    if (input_ok && direct != 0) {
+        input_ok = rtlsdr_set_direct_sampling(s_rtlsdr_dev, direct) == 0;
+    }
+    input_ok = input_ok && rtlsdr_get_direct_sampling(s_rtlsdr_dev) == direct;
+    bool freq_ok = app->settings.rtlsdr_freq_hz <= UINT32_MAX &&
+        rtlsdr_set_center_freq(s_rtlsdr_dev, (uint32_t)app->settings.rtlsdr_freq_hz) == 0;
+    if (!freq_ok) {
         fprintf(stderr, "[RTL-SDR] Warning: set_center_freq(%llu) failed\n",
                 (unsigned long long)app->settings.rtlsdr_freq_hz);
     }
+    s_rtlsdr_rate_hz = rtlsdr_get_sample_rate(s_rtlsdr_dev);
+    s_rtlsdr_center_hz = rtlsdr_get_center_freq(s_rtlsdr_dev);
+    s_rtlsdr_source_valid = rate_ok && freq_ok && input_ok && s_rtlsdr_rate_hz > 0 &&
+        s_rtlsdr_center_hz == app->settings.rtlsdr_freq_hz;
 
     // AGC: rtlsdr_set_agc_mode(1=on,0=off). Gain mode: 0=auto,1=manual.
     rtlsdr_set_agc_mode(s_rtlsdr_dev, app->settings.rtlsdr_agc ? 1 : 0);
@@ -136,7 +159,13 @@ int gui_rtlsdr_open(gui_app_t *app, int device_index) {
     }
 
     rtlsdr_set_offset_tuning(s_rtlsdr_dev, app->settings.rtlsdr_offset_corr ? 1 : 0);
-    rtlsdr_reset_buffer(s_rtlsdr_dev);
+    if (rtlsdr_reset_buffer(s_rtlsdr_dev) < 0) s_rtlsdr_source_valid = false;
+
+    if (app->settings.rtlsdr_record_mode == 1 && !s_rtlsdr_source_valid) {
+        gui_app_set_status(app, "RTL-SDR Hi-Fi RF setup failed; check rate, frequency and input path");
+        gui_rtlsdr_close(app);
+        return -1;
+    }
 
     fprintf(stderr, "[RTL-SDR] Opened device %d: %u Hz, freq %llu Hz, agc=%d, gain_mode=%d\n",
             device_index, rate, (unsigned long long)app->settings.rtlsdr_freq_hz,
@@ -146,6 +175,8 @@ int gui_rtlsdr_open(gui_app_t *app, int device_index) {
 
 void gui_rtlsdr_close(gui_app_t *app) {
     (void)app;
+    s_rtlsdr_source_valid = false;
+    s_rtlsdr_rate_hz = s_rtlsdr_center_hz = 0;
     if (s_rtlsdr_dev) {
         rtlsdr_close(s_rtlsdr_dev);
         s_rtlsdr_dev = NULL;
@@ -156,6 +187,28 @@ void gui_rtlsdr_close(gui_app_t *app) {
 // Capture thread
 //-----------------------------------------------------------------------------
 
+static void rtl_report_capture_error(gui_app_t *app, const char *message,
+                                     gui_dropout_reason_t reason,
+                                     uint64_t event_count) {
+    // Count every event, but limit repeated messages on a failing USB link or
+    // a full queue. The recording logger also updates the common Errors total.
+    if (event_count <= 5 || event_count % 1000 == 0) {
+        fprintf(stderr, "[RTL-SDR] %s\n", message);
+        gui_record_log_capture_event(app, "ERROR", message, GUI_ERROR_CLASS_SYSTEM, 1);
+    } else {
+        gui_app_count_system_errors(app, 1);
+    }
+    gui_capture_request_dropout_stop(app, reason);
+#if LIBSOXR_ENABLED
+    // A dropped display/native queue block does not break the separate RF
+    // recorder, which already accepted the original I/Q block above packing.
+    if (reason != GUI_DROPOUT_BACKPRESSURE) gui_rtlsdr_record_capture_error(app, message);
+#endif
+    if (app->settings.stop_on_dropout) {
+        atomic_store(&s_rtlsdr_running, false);
+    }
+}
+
 static int rtlsdr_capture_thread(void *ctx) {
     gui_app_t *app = (gui_app_t *)ctx;
     thrd_set_priority(THRD_PRIORITY_CRITICAL);
@@ -163,22 +216,36 @@ static int rtlsdr_capture_thread(void *ctx) {
     uint8_t *in = (uint8_t *)malloc(RTL_READ_BYTES);
     uint32_t *packed = (uint32_t *)malloc(RTL_WRITE_BYTES);
     if (!in || !packed) {
-        fprintf(stderr, "[RTL-SDR] Failed to allocate capture buffers\n");
+        rtl_report_capture_error(app, "RTL-SDR failed to allocate capture buffers",
+                                 GUI_DROPOUT_DEVICE_ERROR, 1);
+        // There is no usable capture thread in this case, even if the user
+        // allows recoverable dropouts. Let the UI perform the normal cleanup.
+        atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_DEVICE_ERROR);
+        atomic_store(&app->dropout_stop_requested, true);
         free(in); free(packed);
         atomic_store(&s_rtlsdr_running, false);
         return -1;
     }
 
     fprintf(stderr, "[RTL-SDR] Capture thread started\n");
-    atomic_store(&app->stream_synced, true);
     atomic_store(&app->last_callback_time_ms, get_time_ms());
 
     uint64_t batch_count = 0;
+    uint64_t read_errors = 0;
+    uint64_t dropped_batches = 0;
+    uint64_t dropped_pairs = 0;
     while (atomic_load(&s_rtlsdr_running) && !atomic_load(&do_exit)) {
         int n_read = 0;
         int r = rtlsdr_read_sync(s_rtlsdr_dev, in, RTL_READ_BYTES, &n_read);
+        if (!atomic_load(&s_rtlsdr_running) || atomic_load(&do_exit)) break;
         if (r < 0) {
-            fprintf(stderr, "[RTL-SDR] read_sync error %d\n", r);
+            char message[192];
+            atomic_store(&app->stream_synced, false);
+            snprintf(message, sizeof(message),
+                     "RTL-SDR USB read failed (error %d, read failures=%" PRIu64
+                     "; hardware sample loss unknown)", r, ++read_errors);
+            rtl_report_capture_error(app, message, GUI_DROPOUT_DEVICE_ERROR, read_errors);
+            if (!atomic_load(&s_rtlsdr_running)) break;
             thrd_sleep_ms(10);
             continue;
         }
@@ -187,8 +254,21 @@ static int rtlsdr_capture_thread(void *ctx) {
             continue;
         }
 
+#if LIBSOXR_ENABLED
+        // Record true paired I/Q before display packing, padding or A/B mapping.
+        // Malformed reads cannot be repaired by padding a continuous RF file.
+        if (n_read > RTL_READ_BYTES || (n_read & 1)) {
+            rtl_report_capture_error(app, "RTL-SDR malformed I/Q read",
+                                     GUI_DROPOUT_DEVICE_ERROR, ++read_errors);
+            if (!atomic_load(&s_rtlsdr_running)) break;
+        } else {
+            gui_rtlsdr_record_push(app, in, (size_t)n_read);
+        }
+#endif
+
         size_t pairs = (size_t)n_read / 2;
         if (pairs > RTL_PAIRS_PER_READ) pairs = RTL_PAIRS_PER_READ;
+        atomic_store(&app->stream_synced, true);
 
         for (size_t i = 0; i < pairs; i++) {
             int8_t i_s = (int8_t)in[i * 2] - 128;      // I: centered to signed
@@ -210,10 +290,15 @@ static int rtlsdr_capture_thread(void *ctx) {
             bufmgr_write_end(&app->buffers, BUF_CAPTURE_RF, RTL_WRITE_BYTES);
             bufmgr_signal_data(&app->buffers, BUF_CAPTURE_RF);
         } else {
+            char message[224];
             atomic_fetch_add(&app->rb_drop_count, 1);
-            if (atomic_load(&app->rb_drop_count) <= 5) {
-                fprintf(stderr, "[RTL-SDR] Warning: BUF_CAPTURE_RF full, data dropped\n");
-            }
+            dropped_batches++;
+            dropped_pairs += pairs;
+            snprintf(message, sizeof(message),
+                     "RTL-SDR RF capture queue full: dropped %zu I/Q pairs "
+                     "(software queue totals: %" PRIu64 " blocks, %" PRIu64 " I/Q pairs)",
+                     pairs, dropped_batches, dropped_pairs);
+            rtl_report_capture_error(app, message, GUI_DROPOUT_BACKPRESSURE, dropped_batches);
         }
 
         atomic_fetch_add(&app->total_samples, (uint64_t)pairs);
@@ -223,8 +308,16 @@ static int rtlsdr_capture_thread(void *ctx) {
         batch_count++;
     }
 
-    fprintf(stderr, "[RTL-SDR] Capture thread exiting after %llu batches\n",
-            (unsigned long long)batch_count);
+    char summary[256];
+    snprintf(summary, sizeof(summary),
+             "RTL-SDR capture ended: %" PRIu64 " batches, %" PRIu64
+             " USB read failures, software RF queue dropped %" PRIu64
+             " blocks / %" PRIu64 " I/Q pairs; hardware sample loss unknown",
+             batch_count, read_errors, dropped_batches, dropped_pairs);
+    fprintf(stderr, "[RTL-SDR] %s\n", summary);
+    gui_record_log_capture_event(app, "INFO", summary, GUI_ERROR_CLASS_NONE, 0);
+    atomic_store(&s_rtlsdr_running, false);
+    atomic_store(&app->stream_synced, false);
     free(in);
     free(packed);
     return 0;
@@ -261,8 +354,10 @@ int gui_rtlsdr_start(gui_app_t *app) {
     atomic_store(&app->rb_wait_count, 0);
     atomic_store(&app->rb_drop_count, 0);
     atomic_store(&app->stream_synced, false);
+    atomic_store(&app->dropout_stop_requested, false);
+    atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_NONE);
 
-    uint32_t rate = app->settings.rtlsdr_sample_rate_hz;
+    uint32_t rate = s_rtlsdr_rate_hz ? s_rtlsdr_rate_hz : app->settings.rtlsdr_sample_rate_hz;
     if (rate == 0) rate = RTL_DEFAULT_RATE_HZ;
     atomic_store(&app->sample_rate, rate);
 
@@ -315,7 +410,9 @@ int gui_rtlsdr_start(gui_app_t *app) {
 }
 
 void gui_rtlsdr_stop(gui_app_t *app) {
-    if (!atomic_load(&s_rtlsdr_running)) return;
+    // A failed worker may already have cleared running. Its join/close and
+    // extraction cleanup must still happen on the UI thread.
+    if (!app || (!s_rtlsdr_thread && !s_rtlsdr_dev)) return;
     fprintf(stderr, "[RTL-SDR] Stopping capture\n");
 
     app->is_capturing = false;
@@ -342,6 +439,10 @@ bool gui_rtlsdr_is_running(gui_app_t *app) {
 
 int gui_rtlsdr_set_frequency(gui_app_t *app, uint64_t hz) {
     if (!app) return -1;
+    if (hz == 0 || hz > UINT32_MAX) return -1;
+    // A frequency change would corrupt the mapping of the continuous RF export.
+    if (app->settings.rtlsdr_record_mode == 1 &&
+        (app->is_recording || gui_record_is_finalizing())) return -1;
     // Persist so the next capture start uses the new frequency even if not live.
     app->settings.rtlsdr_freq_hz = hz;
     gui_settings_save(&app->settings);
@@ -349,13 +450,24 @@ int gui_rtlsdr_set_frequency(gui_app_t *app, uint64_t hz) {
     if (s_rtlsdr_dev && atomic_load(&s_rtlsdr_running)) {
         int r = rtlsdr_set_center_freq(s_rtlsdr_dev, (uint32_t)hz);
         if (r < 0) {
+            s_rtlsdr_source_valid = false;
             fprintf(stderr, "[RTL-SDR] live retune to %llu Hz failed (err %d)\n",
                     (unsigned long long)hz, r);
             return -1;
         }
+        s_rtlsdr_center_hz = rtlsdr_get_center_freq(s_rtlsdr_dev);
+        if (s_rtlsdr_center_hz != hz) s_rtlsdr_source_valid = false;
         fprintf(stderr, "[RTL-SDR] live retune to %llu Hz\n", (unsigned long long)hz);
     }
     return 0;
+}
+
+bool gui_rtlsdr_get_rf_source(gui_app_t *app, uint32_t *rate_hz, uint32_t *center_hz) {
+    if (!app || !rate_hz || !center_hz || !s_rtlsdr_dev || !s_rtlsdr_source_valid ||
+        !atomic_load(&s_rtlsdr_running)) return false;
+    *rate_hz = s_rtlsdr_rate_hz;
+    *center_hz = s_rtlsdr_center_hz;
+    return true;
 }
 
 #endif // ENABLE_RTLSDR

@@ -8,11 +8,15 @@
  */
 
 #include "gui_record.h"
+#include "gui_rtlsdr_record.h"
 #include "../core/gui_app.h"
 #include "../processing/gui_extract.h"
 #include "../ui/gui_popup.h"
 #include "gui_audio.h"
 #include "../input/gui_capture.h"
+#ifdef ENABLE_RTLSDR
+#include "../input/gui_rtlsdr.h"
+#endif
 
 #include "../../common/ringbuffer.h"
 #include "../../common/rb_event.h"
@@ -454,6 +458,20 @@ static void gui_record_log_writef(const char *level, const char *format, ...) {
 
 // Global app pointer for threads
 static gui_app_t *s_recording_app = NULL;
+static bool s_rtl_rf_session = false;
+static bool s_rtl_rf_flac = false;
+static uint32_t s_rtl_rf_source_rate = 0;
+static uint32_t s_rtl_rf_source_center = 0;
+
+static bool gui_record_is_rtlsdr(const gui_app_t *app) {
+#ifdef ENABLE_RTLSDR
+    return app && app->selected_device >= 0 && app->selected_device < app->device_count &&
+           app->devices[app->selected_device].type == DEVICE_TYPE_RTLSDR;
+#else
+    (void)app;
+    return false;
+#endif
+}
 
 // Overwrite confirmation pending state
 static bool s_overwrite_pending = false;
@@ -1568,6 +1586,7 @@ bool gui_record_is_active(void) {
 
 // Check if any recording channel has a persistent output-file write error.
 bool gui_record_has_write_error(void) {
+    if (s_rtl_rf_session && gui_rtlsdr_record_has_write_error()) return true;
     for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) {
         if (atomic_load(&s_record_write_error[i])) {
             return true;
@@ -1839,6 +1858,16 @@ static void gui_record_finalize_flac_metadata(gui_app_t *app,
                 gui_record_flac_append_comment(vc_block, "RF_TOTAL_SAMPLES", total_samples_str) &&
                 gui_record_flac_append_comment(vc_block, "RF_SAMPLE_RATE", sample_rate_str) &&
                 gui_record_flac_append_comment(vc_block, "RF_SAMPLE_RATE_KHZ", sample_rate_khz_str);
+            if (ok && s_rtl_rf_session) {
+                char source_rate[32], source_center[32];
+                snprintf(source_rate, sizeof(source_rate), "%u", s_rtl_rf_source_rate);
+                snprintf(source_center, sizeof(source_center), "%u", s_rtl_rf_source_center);
+                ok = gui_record_flac_append_comment(vc_block, "SOURCE_SAMPLE_RATE", source_rate) &&
+                     gui_record_flac_append_comment(vc_block, "SOURCE_CENTER_FREQUENCY", source_center) &&
+                     gui_record_flac_append_comment(vc_block, "SOURCE_SAMPLE_FORMAT", "unsigned 8-bit I/Q") &&
+                     gui_record_flac_append_comment(vc_block, "RF_SAMPLE_FORMAT", "signed 16-bit real RF") &&
+                     gui_record_flac_append_comment(vc_block, "RF_CONVERSION_GAIN", "0.5");
+            }
             if (ok) {
                 if (!FLAC__metadata_simple_iterator_set_block(it, vc_block, /*use_padding=*/true)) {
                     if (app) {
@@ -1937,7 +1966,7 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
     char date_tag[32];
     date_tag[0] = '\0';
     bool have_date_tag = false;
-    if (app->settings.capture_a && path_a && path_a[0]) {
+    if ((s_rtl_rf_session || app->settings.capture_a) && path_a && path_a[0]) {
         have_date_tag = gui_record_extract_timestamp_token(path_a, date_tag, sizeof(date_tag));
     }
     if (!have_date_tag && app->settings.capture_b && path_b && path_b[0]) {
@@ -2018,7 +2047,7 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
     snprintf(msg, sizeof(msg), "capture_format: %s", app->settings.use_flac ? "FLAC" : "RAW");
     gui_record_log_write_line_locked("INFO", msg);
 
-    snprintf(msg, sizeof(msg), "Capture channels: A=%s B=%s", app->settings.capture_a ? "on" : "off", app->settings.capture_b ? "on" : "off");
+    snprintf(msg, sizeof(msg), "Capture channels: A=%s B=%s", (s_rtl_rf_session || app->settings.capture_a) ? "on" : "off", (!s_rtl_rf_session && app->settings.capture_b) ? "on" : "off");
     gui_record_log_write_line_locked("INFO", msg);
     snprintf(msg, sizeof(msg), "CVBS preview state: A=%s B=%s",
              cvbs_preview_a ? "on" : "off",
@@ -2027,10 +2056,15 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
 
     uint8_t bits_a = app->settings.use_flac ? clamp_rf_bits_flac(app->settings.rf_bits_a) : rf_bits_for_raw(app->settings.rf_bits_a);
     uint8_t bits_b = app->settings.use_flac ? clamp_rf_bits_flac(app->settings.rf_bits_b) : rf_bits_for_raw(app->settings.rf_bits_b);
-    snprintf(msg, sizeof(msg), "RF settings: bitsA=%u bitsB=%u resampleA=%s(%.1f kHz) resampleB=%s(%.1f kHz)",
-             (unsigned)bits_a, (unsigned)bits_b,
-             app->settings.enable_resample_a ? "on" : "off", app->settings.resample_rate_a,
-             app->settings.enable_resample_b ? "on" : "off", app->settings.resample_rate_b);
+    if (s_rtl_rf_session) {
+        snprintf(msg, sizeof(msg), "RTL-SDR Hi-Fi RF: source=%u I/Q pairs/s center=%u Hz, mono signed 16-bit output=8000000 samples/s, gain=0.5; source values are driver-reported, not measured",
+                 s_rtl_rf_source_rate, s_rtl_rf_source_center);
+    } else {
+        snprintf(msg, sizeof(msg), "RF settings: bitsA=%u bitsB=%u resampleA=%s(%.1f kHz) resampleB=%s(%.1f kHz)",
+                 (unsigned)bits_a, (unsigned)bits_b,
+                 (app->settings.enable_resample_a && !gui_record_is_rtlsdr(app)) ? "on" : "off", app->settings.resample_rate_a,
+                 (app->settings.enable_resample_b && !gui_record_is_rtlsdr(app)) ? "on" : "off", app->settings.resample_rate_b);
+    }
     gui_record_log_write_line_locked("INFO", msg);
     snprintf(msg, sizeof(msg), "Capture limits: capture_limit_seconds=%u record_limit_seconds=%u (%s)",
              (unsigned)app->settings.capture_limit_seconds,
@@ -2089,13 +2123,23 @@ static void gui_record_open_session_log(gui_app_t *app, const char *path_a, cons
         gui_record_log_write_line_locked("INFO", msg);
     }
 
-    if (app->settings.capture_a && path_a && path_a[0]) {
+    if ((s_rtl_rf_session || app->settings.capture_a) && path_a && path_a[0]) {
         snprintf(msg, sizeof(msg), "FILE_PATH_A: %s", path_a);
         gui_record_log_write_line_locked("INFO", msg);
     }
-    if (app->settings.capture_b && path_b && path_b[0]) {
+    if (!s_rtl_rf_session && app->settings.capture_b && path_b && path_b[0]) {
         snprintf(msg, sizeof(msg), "FILE_PATH_B: %s", path_b);
         gui_record_log_write_line_locked("INFO", msg);
+    }
+
+    if (s_rtl_rf_session) {
+        snprintf(msg, sizeof(msg), "RTL-SDR sampling path: %s",
+                 app->settings.rtlsdr_direct_sampling == 2 ? "direct Q" :
+                 app->settings.rtlsdr_direct_sampling == 1 ? "direct I" : "tuner");
+        gui_record_log_write_line_locked("INFO", msg);
+        gui_record_log_write_line_locked("INFO", "Audio outputs: none (real-RF export; monitor unchanged)");
+        gui_record_log_unlock();
+        return;
     }
 
     snprintf(msg, sizeof(msg), "Audio outputs: 4ch=%s 2ch12=%s 2ch34=%s",
@@ -2148,6 +2192,14 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
         }
     }
 
+    // The converted RTL stream is one real-RF file, not either native I/Q
+    // channel. Leave stored channel, bit-depth and resample choices alone.
+    if (gui_rtlsdr_record_requested(app)) {
+        snprintf(app->settings.output_filename_a, MAX_FILENAME_LEN, "%s_hifi_rf_16-bit_8msps.%s",
+                 base, app->settings.use_flac ? "flac" : "s16");
+        return;
+    }
+
     // RF filenames
     if (app->settings.use_flac) {
         uint8_t bits_a = clamp_rf_bits_flac(app->settings.rf_bits_a);
@@ -2156,8 +2208,8 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
         char rate_tag_b[32] = {0};
         char rf_tag_a[40] = {0};
         char rf_tag_b[40] = {0};
-        if (app->settings.enable_resample_a) format_msps_from_khz(rate_tag_a, sizeof(rate_tag_a), app->settings.resample_rate_a);
-        if (app->settings.enable_resample_b) format_msps_from_khz(rate_tag_b, sizeof(rate_tag_b), app->settings.resample_rate_b);
+        if (app->settings.enable_resample_a && !gui_record_is_rtlsdr(app)) format_msps_from_khz(rate_tag_a, sizeof(rate_tag_a), app->settings.resample_rate_a);
+        if (app->settings.enable_resample_b && !gui_record_is_rtlsdr(app)) format_msps_from_khz(rate_tag_b, sizeof(rate_tag_b), app->settings.resample_rate_b);
         sanitize_tag(rf_tag_a, sizeof(rf_tag_a), app->settings.rf_channel_tags[0]);
         sanitize_tag(rf_tag_b, sizeof(rf_tag_b), app->settings.rf_channel_tags[1]);
 
@@ -2187,8 +2239,8 @@ static void gui_record_apply_auto_names(gui_app_t *app) {
         char rate_tag_b[32] = {0};
         char rf_tag_a[40] = {0};
         char rf_tag_b[40] = {0};
-        if (app->settings.enable_resample_a) format_msps_from_khz(rate_tag_a, sizeof(rate_tag_a), app->settings.resample_rate_a);
-        if (app->settings.enable_resample_b) format_msps_from_khz(rate_tag_b, sizeof(rate_tag_b), app->settings.resample_rate_b);
+        if (app->settings.enable_resample_a && !gui_record_is_rtlsdr(app)) format_msps_from_khz(rate_tag_a, sizeof(rate_tag_a), app->settings.resample_rate_a);
+        if (app->settings.enable_resample_b && !gui_record_is_rtlsdr(app)) format_msps_from_khz(rate_tag_b, sizeof(rate_tag_b), app->settings.resample_rate_b);
         sanitize_tag(rf_tag_a, sizeof(rf_tag_a), app->settings.rf_channel_tags[0]);
         sanitize_tag(rf_tag_b, sizeof(rf_tag_b), app->settings.rf_channel_tags[1]);
 
@@ -2271,6 +2323,15 @@ int gui_record_start(gui_app_t *app) {
         return RECORD_PENDING;
     }
 
+    bool rtl_rf = gui_rtlsdr_record_requested(app);
+    if (rtl_rf) {
+        char error[256] = {0};
+        if (!gui_rtlsdr_record_validate(app, error, sizeof(error))) {
+            gui_app_set_status(app, error);
+            return RECORD_ERROR;
+        }
+    }
+
     // Apply auto naming (must happen before overwrite checks)
     gui_record_apply_auto_names(app);
 
@@ -2282,8 +2343,8 @@ int gui_record_start(gui_app_t *app) {
 
     // Check if output files already exist
     struct stat stat_a, stat_b;
-    bool file_a_exists = app->settings.capture_a && (stat(path_a, &stat_a) == 0);
-    bool file_b_exists = app->settings.capture_b && (stat(path_b, &stat_b) == 0);
+    bool file_a_exists = (rtl_rf || app->settings.capture_a) && (stat(path_a, &stat_a) == 0);
+    bool file_b_exists = !rtl_rf && app->settings.capture_b && (stat(path_b, &stat_b) == 0);
 
     if (file_a_exists || file_b_exists) {
         // Build detailed message with file info
@@ -2351,6 +2412,14 @@ void gui_record_check_popup(gui_app_t *app) {
 // Internal: Start recording after confirmation
 static int gui_record_start_confirmed(gui_app_t *app) {
     gui_record_reset_disk_guard_state();
+    bool rtl_rf = gui_rtlsdr_record_requested(app);
+    if (rtl_rf) {
+        char error[256] = {0};
+        if (!app->is_capturing || !gui_rtlsdr_record_validate(app, error, sizeof(error))) {
+            gui_app_set_status(app, error[0] ? error : "Start capture first");
+            return RECORD_ERROR;
+        }
+    }
 
     // Build full output paths (output_path + filenames)
     char path_a[512];
@@ -2363,10 +2432,10 @@ static int gui_record_start_confirmed(gui_app_t *app) {
     s_record_sample_rate_a = 0;
     s_record_sample_rate_b = 0;
 #endif
-    if (app->settings.capture_a) {
+    if (rtl_rf || app->settings.capture_a) {
         snprintf(s_record_path_a, sizeof(s_record_path_a), "%s", path_a);
     }
-    if (app->settings.capture_b) {
+    if (!rtl_rf && app->settings.capture_b) {
         snprintf(s_record_path_b, sizeof(s_record_path_b), "%s", path_b);
     }
 
@@ -2380,6 +2449,44 @@ static int gui_record_start_confirmed(gui_app_t *app) {
     if (!gui_extract_is_running() && !is_simulated) {
         gui_app_set_status(app, "Extraction not running");
         return RECORD_ERROR;
+    }
+
+    if (rtl_rf) {
+#ifdef ENABLE_RTLSDR
+        if (!gui_rtlsdr_get_rf_source(app, &s_rtl_rf_source_rate, &s_rtl_rf_source_center)) {
+            gui_app_set_status(app, "RTL-SDR source changed before recording started");
+            return RECORD_ERROR;
+        }
+#endif
+        atomic_store(&app->recording_bytes, 0);
+        atomic_store(&app->recording_raw_a, 0);
+        atomic_store(&app->recording_raw_b, 0);
+        atomic_store(&app->recording_compressed_a, 0);
+        atomic_store(&app->recording_compressed_b, 0);
+        for (int i = 0; i < GUI_RECORD_SPILL_CHANNELS; i++) atomic_store(&s_record_write_error[i], false);
+        char error[256] = {0};
+        if (!gui_rtlsdr_record_start(app, path_a, error, sizeof(error))) {
+            gui_app_set_status(app, error);
+            return RECORD_ERROR;
+        }
+        s_rtl_rf_session = true;
+        s_rtl_rf_flac = app->settings.use_flac;
+        s_recording_app = app;
+        s_start_rec_a_wait_count = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_waits);
+        s_start_rec_a_drop_count = atomic_load(&app->buffers.stats[BUF_RECORD_A].write_drops);
+        s_start_rec_b_wait_count = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_waits);
+        s_start_rec_b_drop_count = atomic_load(&app->buffers.stats[BUF_RECORD_B].write_drops);
+#if LIBFLAC_ENABLED == 1
+        s_record_sample_rate_a = 8000;
+#endif
+        app->last_recording_duration_s = 0.0;
+        app->recording_start_time = GetTime();
+        app->is_recording = true;
+        gui_record_open_session_log(app, path_a, NULL);
+        proc_set_priority(PROC_PRIORITY_ABOVE);
+        gui_rtlsdr_record_begin(app);
+        gui_app_set_status(app, "Recording RTL-SDR Hi-Fi RF (8 MSPS, mono 16-bit)...");
+        return RECORD_OK;
     }
 
     // For simulated capture, ensure record buffers are initialized
@@ -2478,7 +2585,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         s_ctx_a.flac_bits_per_sample = bits_a;
         s_ctx_a.rf_bits = bits_a;
         s_ctx_a.raw_bytes_per_sample = 2;  // input blocks are int16
-        s_ctx_a.enable_resample = app->settings.enable_resample_a;
+        s_ctx_a.enable_resample = app->settings.enable_resample_a && !gui_record_is_rtlsdr(app);
         s_ctx_a.input_sample_rate_khz = capture_rate_khz_f;
         s_ctx_a.resample_rate_khz = app->settings.resample_rate_a;
         s_ctx_a.resample_quality = app->settings.resample_quality_a;
@@ -2497,7 +2604,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         s_ctx_b.flac_bits_per_sample = bits_b;
         s_ctx_b.rf_bits = bits_b;
         s_ctx_b.raw_bytes_per_sample = 2;  // input blocks are int16
-        s_ctx_b.enable_resample = app->settings.enable_resample_b;
+        s_ctx_b.enable_resample = app->settings.enable_resample_b && !gui_record_is_rtlsdr(app);
         s_ctx_b.input_sample_rate_khz = capture_rate_khz_f;
         s_ctx_b.resample_rate_khz = app->settings.resample_rate_b;
         s_ctx_b.resample_quality = app->settings.resample_quality_b;
@@ -2513,10 +2620,10 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         flac_writer_config_t config_b = flac_writer_default_config();
 
         // Sample rate is stored in kHz for RF capture.
-        bool use_resample_a = app->settings.enable_resample_a &&
+        bool use_resample_a = s_ctx_a.enable_resample &&
                               app->settings.resample_rate_a > 0.0f &&
                               app->settings.resample_rate_a < capture_rate_khz_f;
-        bool use_resample_b = app->settings.enable_resample_b &&
+        bool use_resample_b = s_ctx_b.enable_resample &&
                               app->settings.resample_rate_b > 0.0f &&
                               app->settings.resample_rate_b < capture_rate_khz_f;
         config_a.sample_rate = use_resample_a
@@ -2707,7 +2814,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         s_ctx_a.channel = 0;
         s_ctx_a.rf_bits = bits_a;
         s_ctx_a.raw_bytes_per_sample = (bits_a == 8) ? 1 : 2;
-        s_ctx_a.enable_resample = app->settings.enable_resample_a;
+        s_ctx_a.enable_resample = app->settings.enable_resample_a && !gui_record_is_rtlsdr(app);
         s_ctx_a.input_sample_rate_khz = capture_rate_khz_f;
         s_ctx_a.resample_rate_khz = app->settings.resample_rate_a;
         s_ctx_a.resample_quality = app->settings.resample_quality_a;
@@ -2723,7 +2830,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         s_ctx_b.channel = 1;
         s_ctx_b.rf_bits = bits_b;
         s_ctx_b.raw_bytes_per_sample = (bits_b == 8) ? 1 : 2;
-        s_ctx_b.enable_resample = app->settings.enable_resample_b;
+        s_ctx_b.enable_resample = app->settings.enable_resample_b && !gui_record_is_rtlsdr(app);
         s_ctx_b.input_sample_rate_khz = capture_rate_khz_f;
         s_ctx_b.resample_rate_khz = app->settings.resample_rate_b;
         s_ctx_b.resample_quality = app->settings.resample_quality_b;
@@ -2808,6 +2915,11 @@ static int gui_record_start_confirmed(gui_app_t *app) {
 
 // Stop recording - heavy finalization runs in background thread to keep UI responsive
 static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_time) {
+    uint64_t rtl_rf_samples = s_rtl_rf_session ? gui_rtlsdr_record_finish(app) : 0;
+    if (s_rtl_rf_session && gui_rtlsdr_record_has_write_error()) atomic_store(&s_record_write_error[0], true);
+#if LIBFLAC_ENABLED != 1
+    (void)rtl_rf_samples;
+#endif
     // Wait for writer threads to drain and exit
     if (s_writer_threads_running) {
         if (app->settings.capture_a) thrd_join(s_writer_thread_a, NULL);
@@ -2828,7 +2940,7 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
     }
 
 #if LIBFLAC_ENABLED == 1
-    uint64_t flac_samples_a = 0;
+    uint64_t flac_samples_a = rtl_rf_samples;
     uint64_t flac_samples_b = 0;
     if (s_flac_writer_a) {
         flac_samples_a = flac_writer_get_samples_written(s_flac_writer_a);
@@ -2861,12 +2973,12 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
     // Finalize RF FLAC metadata in a single in-place pass: STREAMINFO duration
     // (kHz-scaled total_samples) + Vorbis comment duration tags. Both are
     // written in place via the simple iterator — no full-file temp copy.
-    if (app->settings.use_flac) {
-        if (app->settings.capture_a && s_record_path_a[0]) {
+    if (s_rtl_rf_session ? s_rtl_rf_flac : app->settings.use_flac) {
+        if ((s_rtl_rf_session || app->settings.capture_a) && s_record_path_a[0]) {
             gui_record_finalize_flac_metadata(app, s_record_path_a, "CH A",
                                               flac_samples_a, s_record_sample_rate_a);
         }
-        if (app->settings.capture_b && s_record_path_b[0]) {
+        if (!s_rtl_rf_session && app->settings.capture_b && s_record_path_b[0]) {
             gui_record_finalize_flac_metadata(app, s_record_path_b, "CH B",
                                               flac_samples_b, s_record_sample_rate_b);
         }
@@ -2952,6 +3064,7 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
 #endif
 
     s_recording_app = NULL;
+    s_rtl_rf_session = false;
 }
 
 static int gui_record_finalize_thread(void *arg) {
@@ -2980,6 +3093,8 @@ void gui_record_stop(gui_app_t *app) {
     gui_record_reset_disk_guard_state();
     double stop_request_time = GetTime();
 
+    if (s_rtl_rf_session) gui_rtlsdr_record_request_stop(app);
+
     // Disable recording in extraction thread first.
     gui_extract_set_recording(false, false, 16, 16);
 
@@ -2987,9 +3102,11 @@ void gui_record_stop(gui_app_t *app) {
     app->is_recording = false;
 
     // Stop audio output/monitoring and restart monitor-only path if still capturing.
-    gui_audio_stop(app);
-    if (app->is_capturing) {
-        (void)gui_audio_start(app, &app->buffers);
+    if (!s_rtl_rf_session) {
+        gui_audio_stop(app);
+        if (app->is_capturing) {
+            (void)gui_audio_start(app, &app->buffers);
+        }
     }
 
     // Restore normal process priority

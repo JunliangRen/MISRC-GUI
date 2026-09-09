@@ -650,6 +650,7 @@ int main(int argc, char **argv) {
         }
         float dt = GetFrameTime();
         Vector2 wheel_delta = GetMouseWheelMoveV();
+        bool modal_was_open = gui_ui_modal_is_open(&app);
         bool primary_modifier_down = gui_primary_modifier_down();
         gui_ui_zoom_result_t ui_zoom_result =
             gui_ui_zoom_process(&ui_zoom_state,
@@ -777,7 +778,8 @@ int main(int argc, char **argv) {
         Vector2 mouse_pos = gui_ui_get_mouse_position();
         Clay_SetPointerState((Clay_Vector2){ mouse_pos.x, mouse_pos.y },
                              IsMouseButtonDown(MOUSE_LEFT_BUTTON));
-        Clay_UpdateScrollContainers(true, (Clay_Vector2){
+        // Finish the old drag before an anchored mode change moves the content.
+        Clay_UpdateScrollContainers(!gui_ui_settings_scroll_is_anchoring(), (Clay_Vector2){
             ui_zoom_result.passthrough_x * 20.0f,
             ui_zoom_result.passthrough_y * 20.0f
         }, dt);
@@ -1004,9 +1006,17 @@ int main(int argc, char **argv) {
         // Each panel type (waveform, histogram, FFT) receives raw samples via vtable->process()
 
         // Build UI layout
+        gui_ui_prepare_settings_scroll(&app);
         Clay_BeginLayout();
         gui_render_layout(&app);
         Clay_RenderCommandArray render_commands = Clay_EndLayout();
+        if (gui_ui_restore_settings_scroll(&app)) {
+            Clay_BeginLayout();
+            gui_render_layout(&app);
+            render_commands = Clay_EndLayout();
+            Clay_SetPointerState((Clay_Vector2){ mouse_pos.x, mouse_pos.y },
+                                 IsMouseButtonDown(MOUSE_LEFT_BUTTON));
+        }
 
         // Handle Clay interactions
         gui_handle_interactions(&app);
@@ -1020,7 +1030,9 @@ int main(int argc, char **argv) {
                               fabsf(ui_zoom_result.passthrough_y)
                           ? ui_zoom_result.passthrough_x
                           : ui_zoom_result.passthrough_y;
-        if (wheel != 0.0f) {
+        // Retain modal ownership for the whole frame, including a dismissal.
+        // Clay scrolling and explicit Ctrl/Cmd UI zoom retain their own routing.
+        if (wheel != 0.0f && !modal_was_open && !gui_ui_modal_is_open(&app)) {
             panel_handle_all_scrolls(&app, wheel);
         }
 

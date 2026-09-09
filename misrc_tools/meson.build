@@ -445,6 +445,7 @@ if raylib_dep.found()
   endif
 
   # Add RTL-SDR support to GUI if available
+  sources_gui += 'misrc_gui/output/gui_rtlsdr_record.c'
   if rtlsdr_enabled
     sources_gui += 'misrc_gui/input/gui_rtlsdr.c'
   endif
@@ -526,6 +527,17 @@ if raylib_dep.found()
   # this TU before version.h exists (the standalone misrc_capture gets this via
   # version_target in sources_capture).
   gui_extra_link_with = []
+  if rtlsdr_enabled and soxr_dep.found()
+    # Preserve the converter's finite-value checks without changing the
+    # existing GUI fast-math settings or other devices' signal processing.
+    sdr_rf_lib = static_library('gui_sdr_rf',
+      'misrc_gui/processing/gui_sdr_rf.c',
+      dependencies: soxr_dep,
+      c_args: cflags + ['-fno-fast-math'],
+      pic: true,
+    )
+    gui_extra_link_with += [sdr_rf_lib]
+  endif
   if host_system != 'android'
     misrc_capture_cli_lib = static_library('misrc_capture_cli',
                 'misrc_capture/misrc_capture.c',
@@ -548,6 +560,7 @@ if raylib_dep.found()
                 include_directories: gui_includes,
                 link_args: gui_ldflags,
                 c_args: gui_cflags,
+                link_with: gui_extra_link_with,
                 install: true)
   else
     executable('misrc_gui',
@@ -588,6 +601,81 @@ if raylib_dep.found()
     )
     test('gui_fft_label', fft_label_test)
 
+    modal_input_test = executable('gui_modal_input_test',
+      ['test/gui_modal_input_harness.c', 'misrc_gui/ui/gui_popup.c', version_target],
+      dependencies: overlay_test_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_modal_input', modal_input_test)
+
+    settings_scroll_test = executable('gui_settings_scroll_test',
+      ['test/gui_settings_scroll_harness.c', version_target],
+      dependencies: overlay_test_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_settings_scroll', settings_scroll_test)
+
+    # Exercise RTL-SDR error handling with scripted USB/queue failures.
+    if rtlsdr_enabled
+      sdr_settings_test = executable('gui_sdr_settings_test',
+        ['test/gui_sdr_settings_harness.c', version_target],
+        dependencies: overlay_test_deps,
+        include_directories: gui_includes,
+        c_args: gui_cflags,
+        override_options: ['b_lto=true', 'optimization=2'],
+      )
+      test('gui_sdr_settings', sdr_settings_test)
+
+      sdr_settings_persistence_test = executable('gui_sdr_settings_persistence_test',
+        ['test/gui_sdr_settings_persistence_harness.c', 'misrc_gui/ui/gui_ui_scale.c', 'common/ddd_protocol.c'],
+        dependencies: overlay_test_deps,
+        include_directories: gui_includes,
+        c_args: gui_cflags,
+        override_options: ['b_lto=true', 'optimization=2'],
+      )
+      test('gui_sdr_settings_persistence', sdr_settings_persistence_test)
+
+      sdr_settings_no_soxr_test = executable('gui_sdr_settings_no_soxr_test',
+        ['test/gui_sdr_settings_harness.c', version_target],
+        dependencies: overlay_test_deps,
+        include_directories: gui_includes,
+        c_args: gui_cflags + ['-ULIBSOXR_ENABLED', '-DLIBSOXR_ENABLED=0'],
+        override_options: ['b_lto=true', 'optimization=2'],
+      )
+      test('gui_sdr_settings_no_soxr', sdr_settings_no_soxr_test)
+
+      if soxr_dep.found()
+        sdr_rf_test = executable('gui_sdr_rf_test',
+          'test/gui_sdr_rf_harness.c',
+          dependencies: [soxr_dep, meson.get_compiler('c').find_library('m', required: false)],
+          c_args: cflags,
+          link_args: ldflags,
+        )
+        test('gui_sdr_rf', sdr_rf_test)
+        rtlsdr_record_test = executable('gui_rtlsdr_record_test',
+          ['test/gui_rtlsdr_record_harness.c', 'misrc_gui/processing/gui_sdr_rf.c', 'common/flac_writer.c'],
+          dependencies: overlay_test_deps + [soxr_dep, flac_dep],
+          include_directories: gui_includes,
+          c_args: cflags,
+          link_args: ldflags,
+        )
+        test('gui_rtlsdr_record', rtlsdr_record_test)
+      endif
+
+      rtlsdr_diag_test = executable('gui_rtlsdr_diag_test',
+        'test/gui_rtlsdr_diag_harness.c',
+        dependencies: overlay_test_deps,
+        include_directories: gui_includes,
+        c_args: gui_cflags,
+        override_options: ['b_lto=true', 'optimization=2'],
+      )
+      test('gui_rtlsdr_diag', rtlsdr_diag_test)
+    endif
+
     # Exercise the production stats sizing with deterministic font metrics.
     # As above, LTO drops unrelated UI/backend code from the included source.
     stats_layout_test = executable('gui_stats_layout_test',
@@ -617,6 +705,18 @@ if raylib_dep.found()
       override_options: ['b_lto=true', 'optimization=2'],
     )
     test('gui_viewport_layout', viewport_layout_test)
+
+    # Exercise real sample statistics without opening a device.
+    # LTO discards unrelated capture/rendering code.
+    extract_stats_test = executable('gui_extract_stats_test',
+      'test/gui_extract_stats_harness.c',
+      dependencies: overlay_test_deps,
+      include_directories: gui_includes,
+      c_args: gui_cflags,
+      override_options: ['b_lto=true', 'optimization=2'],
+    )
+    test('gui_extract_stats', extract_stats_test)
+
   endif
 
   message('raylib found, building GUI application')

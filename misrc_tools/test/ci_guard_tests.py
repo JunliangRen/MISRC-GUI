@@ -124,7 +124,7 @@ def check_macos_brew_install_policy(workflow_path: Path) -> int:
         if snippet in workflow_text:
             return fail(f"Workflow contains non-conditional brew install that emits warning annotations: {snippet}")
     required_snippets = [
-        "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do",
+        "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr librtlsdr; do",
         "if ! brew list --versions \"$formula\" >/dev/null 2>&1; then",
         "brew install \"$formula\"",
     ]
@@ -138,7 +138,7 @@ def check_workflow_fft_dependency_policy(workflow_path: Path) -> int:
         "libfftw3-dev",
         "mingw-w64-x86_64-fftw",
         "mingw-w64-clang-aarch64-fftw",
-        "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do",
+        "for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr librtlsdr; do",
     ]
     for snippet in required_snippets:
         if snippet not in workflow_text:
@@ -148,6 +148,65 @@ def check_workflow_fft_dependency_policy(workflow_path: Path) -> int:
     fft_probe_count = workflow_text.count(fft_probe)
     if fft_probe_count != 4:
         return fail(f"Workflow must probe fftw3f exactly 4 times (linux/windows x86/windows arm64/macos), found {fft_probe_count}")
+    return 0
+
+
+def check_workflow_rtlsdr_policy(workflow_path: Path) -> int:
+    """Release jobs opt in to RTL-SDR; other builds keep the optional backend."""
+    jobs = dict(re.findall(r"^  ([\w-]+):\n(.*?)(?=^  [\w-]+:|\Z)",
+                           read_text(workflow_path), re.M | re.S))
+    for job, prefix in [("windows-exe", "mingw-w64-x86_64"),
+                        ("windows-exe-arm64", "mingw-w64-clang-aarch64")]:
+        installs = re.findall(r"^          install: >-\n((?:^            [^\n]*\n)+)",
+                              jobs.get(job, ""), re.M)
+        if len(installs) != 2:
+            return fail(f"{job} must install RTL-SDR in both MSYS2 setup paths")
+        packages = [f"{prefix}-rtl-sdr"]
+        if job == "windows-exe":
+            packages.append(f"{prefix}-libsoxr")
+        for install in installs:
+            for package in packages:
+                if package not in install.split():
+                    return fail(f"{job} MSYS2 setup is missing {package}")
+
+    for job in ("windows-exe", "windows-exe-arm64", "macos-app-build"):
+        body = jobs.get(job, "")
+        # ARM64 keeps its existing no-soxr build: that static archive requires
+        # an OpenMP runtime not linked by the current CLANGARM64 configuration.
+        probe = "pkg-config --modversion librtlsdr"
+        if job != "windows-exe-arm64":
+            probe += " soxr"
+        for snippet in (probe,
+                        "ci_guard_tests.py --post-build --require-rtlsdr --gui-path"):
+            if snippet not in body:
+                return fail(f"{job} is missing RTL-SDR release check: {snippet}")
+
+    macos = jobs.get("macos-app-build", "")
+    for snippet in ("libsoxr librtlsdr; do", 'test -n "$RTLSDR_DYLIB"',
+                    'test -f "$FW_DIR/${RTLSDR_DYLIB#@rpath/}"'):
+        if snippet not in macos:
+            return fail(f"macos-app-build is missing RTL-SDR dependency/bundle check: {snippet}")
+    universal = jobs.get("macos-app-universal", "")
+    if ("dist/MISRC.app/Contents/Frameworks/librtlsdr*.dylib" not in universal or
+            'lipo -verify_arch arm64 x86_64 "$DYLIB"' not in universal):
+        return fail("macos-app-universal must verify both RTL-SDR dylib architectures")
+    return 0
+
+
+def check_built_gui_has_rtlsdr_backend(gui_path: Path) -> int:
+    """Inspect backend-only diagnostics, also available in stripped/LTO builds.
+
+    Generic device labels exist without the backend, so they are not evidence.
+    Reading bytes avoids executing a GUI or requiring host-specific binutils.
+    Windows' existing DLL whitelist separately enforces static RTL-SDR linkage.
+    """
+    try:
+        binary = gui_path.read_bytes()
+    except OSError as exc:
+        return fail(f"Cannot inspect RTL-SDR backend in {gui_path}: {exc}")
+    for marker in (b"[RTL-SDR] Opened device ", b"[RTL-SDR] Starting capture"):
+        if marker not in binary:
+            return fail("misrc_gui has no RTL-SDR capture backend — librtlsdr missing or ENABLE_RTLSDR not set")
     return 0
 
 
@@ -1467,6 +1526,33 @@ def check_ui_scale_integration_contract(repo_root: Path, gui_c_path: Path,
     if any(pos < 0 for pos in ordered) or ordered != sorted(ordered):
         return fail("UI scale wheel routing must occur before Clay and panel consumers")
 
+    modal_snapshot = re.search(
+        r"bool\s+modal_was_open\s*=\s*gui_ui_modal_is_open\(&app\)\s*;", gui_c)
+    keyboard_handling = gui_c.find("// Handle keyboard shortcuts")
+    if not modal_snapshot or not (
+        ordered[0] < modal_snapshot.start() < keyboard_handling < ordered[2]
+    ):
+        return fail("Modal wheel ownership must be captured before keyboard dismissal")
+    if not re.search(
+        r"if\s*\(wheel\s*!=\s*0\.0f\s*&&\s*!modal_was_open\s*&&\s*"
+        r"!gui_ui_modal_is_open\(&app\)\s*\)\s*\{\s*"
+        r"panel_handle_all_scrolls\(&app,\s*wheel\);", gui_c
+    ):
+        return fail("Panel wheel routing must check both initial and current modal ownership")
+
+    scroll_layout_order = [
+        gui_c.find("Clay_UpdateScrollContainers(!gui_ui_settings_scroll_is_anchoring()"),
+        gui_c.find("gui_ui_prepare_settings_scroll(&app)"),
+        gui_c.find("Clay_BeginLayout()"),
+        gui_c.find("Clay_EndLayout()"),
+        gui_c.find("if (gui_ui_restore_settings_scroll(&app))"),
+        gui_c.find("gui_handle_interactions(&app)"),
+    ]
+    if any(pos < 0 for pos in scroll_layout_order) or scroll_layout_order != sorted(scroll_layout_order):
+        return fail("Settings scroll must be captured before layout and anchored before interactions")
+    if ".childOffset = s_settings_scroll_offset" not in gui_ui_c:
+        return fail("Settings must render with the pre-layout scroll snapshot")
+
     modifier_snippets = [
         "KEY_LEFT_CONTROL", "KEY_RIGHT_CONTROL",
         "KEY_LEFT_SUPER", "KEY_RIGHT_SUPER",
@@ -1505,12 +1591,20 @@ def main() -> int:
              "FX3 symbols) against --gui-path. Used by CI build jobs after misrc_gui is built.",
     )
     parser.add_argument(
+        "--require-rtlsdr",
+        action="store_true",
+        help="With --post-build, fail if the RTL-SDR capture backend is absent. "
+             "Used by Windows/macOS release jobs; other builds keep RTL-SDR optional.",
+    )
+    parser.add_argument(
         "--gui-path",
         type=Path,
         default=None,
         help="Path to the built misrc_gui binary for --post-build binary-introspection checks.",
     )
     args = parser.parse_args()
+    if args.require_rtlsdr and not args.post_build:
+        return fail("--require-rtlsdr requires --post-build and --gui-path")
 
     repo_root = Path(__file__).resolve().parents[2]
     workflow_path = repo_root / ".github/workflows/build.yml"
@@ -1530,6 +1624,7 @@ def main() -> int:
         ("actions runtime policy", lambda: check_actions_runtime_policy(workflow_path)),
         ("macOS brew install policy", lambda: check_macos_brew_install_policy(workflow_path)),
         ("workflow FFT dependency policy", lambda: check_workflow_fft_dependency_policy(workflow_path)),
+        ("workflow RTL-SDR dependency policy", lambda: check_workflow_rtlsdr_policy(workflow_path)),
         ("meson FFT policy", lambda: check_meson_fft_policy(meson_path)),
         ("meson vendored hsdaoh policy", lambda: check_meson_vendored_hsdaoh_policy(meson_path)),
         ("meson FX3 native-build policy", lambda: check_meson_fx3_policy(meson_path)),
@@ -1577,6 +1672,8 @@ def main() -> int:
             return fail(f"--post-build --gui-path does not exist (build did not produce misrc_gui?): {args.gui_path}")
         checks.append(("built GUI links vendored hsdaoh (post-build)", lambda: check_built_gui_links_vendored_hsdaoh(repo_root, args.gui_path)))
         checks.append(("built GUI has FX3 symbols (post-build)", lambda: check_built_gui_has_fx3_symbols(repo_root, args.gui_path)))
+        if args.require_rtlsdr:
+            checks.append(("built GUI has RTL-SDR backend (post-build)", lambda: check_built_gui_has_rtlsdr_backend(args.gui_path)))
 
     for name, check in checks:
         rc = check()

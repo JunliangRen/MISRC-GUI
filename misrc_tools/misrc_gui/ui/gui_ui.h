@@ -45,6 +45,10 @@
 // UI Layout functions
 void gui_render_layout(gui_app_t *app);
 void gui_handle_interactions(gui_app_t *app);
+// Preserve Settings scroll state around a layout rebuild after a mode switch.
+bool gui_ui_settings_scroll_is_anchoring(void);
+void gui_ui_prepare_settings_scroll(const gui_app_t *app);
+bool gui_ui_restore_settings_scroll(const gui_app_t *app);
 // Reconcile mode/device constraints immediately after device selection changes.
 void gui_ui_sync_capture_mode_state(gui_app_t *app);
 void gui_ui_sync_android_keyboard_state(void);
@@ -63,6 +67,10 @@ Vector2 gui_ui_get_mouse_position(void);
 
 // Check if UI consumed the current frame's click (prevents click-through to oscilloscope)
 bool gui_ui_click_consumed(void);
+
+// True while a modal owns input over the background visualization panels.
+// Wheel routing checks this before and after interactions to cover closing frames.
+bool gui_ui_modal_is_open(const gui_app_t *app);
 
 // Text measurement function (from clay_renderer_raylib.c)
 Clay_Dimensions Raylib_MeasureText(Clay_StringSlice text, Clay_TextElementConfig *config, void *userData);

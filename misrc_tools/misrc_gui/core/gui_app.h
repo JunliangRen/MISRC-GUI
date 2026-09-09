@@ -337,6 +337,8 @@ typedef struct {
 
     // RTL-SDR settings (only relevant when an RTL-SDR device is selected)
     uint64_t rtlsdr_freq_hz;              // Center frequency (Hz), default 100.0 MHz
+    int rtlsdr_record_mode;              // 0 = native I/Q, 1 = 8 MSPS real RF (Hi-Fi)
+    int rtlsdr_direct_sampling;          // 0 = tuner, 1 = direct I input, 2 = direct Q input
     int     rtlsdr_gain_mode;             // 0 = auto, 1 = manual
     int     rtlsdr_gain_tenths_db;        // Manual gain in tenths of dB (0 = auto when auto mode)
     uint32_t rtlsdr_sample_rate_hz;       // Sample rate (Hz), default 2400000 (2.4 MSPS)

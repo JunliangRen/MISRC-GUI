@@ -40,6 +40,7 @@ jobs:
       - name: Run CI guard tests
         run: |
           set -eux
+          python3 -m unittest discover -s misrc_tools/test -p 'test_ci_guards.py'
           python3 misrc_tools/test/ci_guard_tests.py
   preflight-cross-platform-guards:
     name: Cross-platform guard tests (${{ matrix.runner }})
@@ -584,6 +585,7 @@ jobs:
             mingw-w64-x86_64-nasm
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-rtl-sdr
 
       - name: Setup MSYS2 (retry no cache)
         if: steps.setup_msys2_cached.outcome == 'failure'
@@ -605,6 +607,7 @@ jobs:
             mingw-w64-x86_64-nasm
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-rtl-sdr
 
       - name: Resolve build version
         id: version
@@ -691,6 +694,7 @@ jobs:
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CMAKE_PREFIX_PATH="$DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
           pkg-config --modversion fftw3f
+          pkg-config --modversion librtlsdr soxr
           meson setup "$BUILD_DIR" misrc_tools --buildtype release
           meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui
 
@@ -729,8 +733,8 @@ jobs:
 
           # Post-build CI guard tests: assert no stale hsdaoh DLL dependency
           # (Windows statically links the vendored .deps/install libhsdaoh.a)
-          # and that FX3 symbols compiled in. Uses MSYS2 python + objdump.
-          python misrc_tools/test/ci_guard_tests.py --post-build --gui-path "$BUILD_DIR/misrc_gui.exe"
+          # and that FX3/RTL-SDR compiled in. Uses MSYS2 python + objdump.
+          python misrc_tools/test/ci_guard_tests.py --post-build --require-rtlsdr --gui-path "$BUILD_DIR/misrc_gui.exe"
 
       - name: Create ZIP artifact
         shell: pwsh
@@ -795,6 +799,7 @@ jobs:
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
             mingw-w64-clang-aarch64-pkgconf
+            mingw-w64-clang-aarch64-rtl-sdr
 
       - name: Setup MSYS2 (retry no cache)
         if: steps.setup_msys2_cached.outcome == 'failure'
@@ -815,6 +820,7 @@ jobs:
             mingw-w64-clang-aarch64-meson
             mingw-w64-clang-aarch64-ninja
             mingw-w64-clang-aarch64-pkgconf
+            mingw-w64-clang-aarch64-rtl-sdr
 
       - name: Resolve build version
         id: version
@@ -901,6 +907,7 @@ jobs:
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CMAKE_PREFIX_PATH="$DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
           pkg-config --modversion fftw3f
+          pkg-config --modversion librtlsdr
           meson setup "$BUILD_DIR" misrc_tools --buildtype release
           meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui
 
@@ -928,8 +935,8 @@ jobs:
           assert_no_nonsystem_dlls "dist/MISRC.exe"
           # Windows ARM64 binaries cannot be executed on windows-2022 x64 runners.
           # Post-build CI guard tests still run (binary introspection only, no exec):
-          # assert no stale hsdaoh DLL dependency (static link expected) + FX3 symbols.
-          python misrc_tools/test/ci_guard_tests.py --post-build --gui-path "$BUILD_DIR/misrc_gui.exe"
+          # assert no stale hsdaoh DLL dependency (static link expected) + FX3/RTL-SDR.
+          python misrc_tools/test/ci_guard_tests.py --post-build --require-rtlsdr --gui-path "$BUILD_DIR/misrc_gui.exe"
 
       - name: Create ZIP artifact
         shell: pwsh
@@ -1014,7 +1021,7 @@ jobs:
             /usr/local/Homebrew/Library/Taps/hashicorp/homebrew-tap; do
             rm -rf "$tap_dir"
           done
-          for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr; do
+          for formula in cmake fftw flac libusb libuvc meson nasm ninja pkgconf libsoxr librtlsdr; do
             if ! brew list --versions "$formula" >/dev/null 2>&1; then
               brew install "$formula"
             fi
@@ -1071,6 +1078,7 @@ jobs:
           export PKG_CONFIG_PATH="$DEPS_PREFIX/lib/pkgconfig:$DEPS_PREFIX/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
           export CMAKE_PREFIX_PATH="$DEPS_PREFIX:${CMAKE_PREFIX_PATH:-}"
           pkg-config --modversion fftw3f
+          pkg-config --modversion librtlsdr soxr
           meson setup "$BUILD_DIR" misrc_tools --buildtype release
           meson compile -C "$BUILD_DIR" misrc_capture misrc_extract misrc_gui
 
@@ -1087,8 +1095,8 @@ jobs:
           grep -qi "Usage" /tmp/macos_extract_help.txt
 
           # Post-build CI guard tests: assert no stale Homebrew hsdaoh linkage
-          # (macOS must use the vendored .deps/install hsdaoh via @rpath) + FX3 symbols.
-          python3 misrc_tools/test/ci_guard_tests.py --post-build --gui-path "$BUILD_DIR/misrc_gui"
+          # (macOS must use the vendored .deps/install hsdaoh via @rpath) + FX3/RTL-SDR.
+          python3 misrc_tools/test/ci_guard_tests.py --post-build --require-rtlsdr --gui-path "$BUILD_DIR/misrc_gui"
 
           APP_ROOT="dist/MISRC.app/Contents"
           FW_DIR="$APP_ROOT/Frameworks"
@@ -1228,6 +1236,11 @@ jobs:
             patch_macho_refs "$DYLIB"
           done
 
+          # RTL-SDR must be bundled, not loaded from the build runner's Homebrew.
+          RTLSDR_DYLIB="$(otool -L "$APP_ROOT/MacOS/MISRC" | awk '/@rpath\/librtlsdr.*\.dylib/ {print $1; exit}')"
+          test -n "$RTLSDR_DYLIB"
+          test -f "$FW_DIR/${RTLSDR_DYLIB#@rpath/}"
+
           if otool -L "$APP_ROOT/MacOS/MISRC" | grep -E '/opt/homebrew|/usr/local/opt'; then
             echo "Found non-portable Homebrew dylib path in MISRC binary" >&2
             exit 1
@@ -1308,6 +1321,10 @@ jobs:
           LIPO_ARCHS="$(lipo -archs dist/MISRC.app/Contents/MacOS/MISRC)"
           echo "$LIPO_ARCHS" | grep -q 'arm64'
           echo "$LIPO_ARCHS" | grep -q 'x86_64'
+
+          for DYLIB in dist/MISRC.app/Contents/Frameworks/librtlsdr*.dylib; do
+            lipo -verify_arch arm64 x86_64 "$DYLIB"
+          done
 
           dist/MISRC.app/Contents/MacOS/MISRC --smoke-test
           set +e

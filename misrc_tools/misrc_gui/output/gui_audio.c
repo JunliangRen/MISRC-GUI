@@ -1,4 +1,5 @@
 #include "gui_audio.h"
+#include "gui_rtlsdr_record.h"
 
 #include "raylib.h"
 
@@ -367,7 +368,7 @@ skip_monitoring:
 #endif
 
         // Check if recording state changed
-        bool is_recording = a->app && a->app->is_recording;
+        bool is_recording = a->app && a->app->is_recording && !gui_rtlsdr_record_requested(a->app);
         
         // RECORDING JUST STARTED - open files dynamically
         if (!was_recording && is_recording) {
@@ -542,7 +543,7 @@ int gui_audio_start(gui_app_t *app, buffer_manager_t *bufmgr)
 
     // Decide if audio outputs should be written to files.
     // Audio capture is always-on during capture for monitoring/draining.
-    const bool write_files = app->is_recording;
+    const bool write_files = app->is_recording && !gui_rtlsdr_record_requested(app);
 
     bool want_4ch = write_files && app->settings.enable_audio_4ch;
     bool want_2ch_12 = write_files && app->settings.enable_audio_2ch_12;

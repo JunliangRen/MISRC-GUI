@@ -160,6 +160,21 @@ Level Autostop, this allows for you to set a overall % level alongside a timer t
 - Resampling Control for A/B (VHS config 20msps video 10msps hifi shown)
 - Playback Input Files
 
+### RTL-SDR recording
+
+RTL-SDR settings distinguish the **hardware sample rate** from the **recording output**:
+
+- **Native I/Q** keeps the hardware rate and existing A/B recording controls. It does not apply the ordinary RF resampling settings saved for other devices.
+- **8 MSPS Hi-Fi RF** converts paired I/Q into one signed 16-bit real-RF file, using output file A and the selected RAW (`.s16` with auto naming) or FLAC format. This is RF for subsequent Hi-Fi decoding, not decoded audio or an 8 MSPS hardware capture.
+
+For Hi-Fi RF, use a dedicated Hi-Fi tap, a hardware rate between 1.024 and 2.4 MSPS, and a suitable low-frequency input path. The PAL and NTSC buttons set the center frequency to 1.6 and 1.5 MHz respectively; they do not change the hardware rate or input path. Select Tuner, Direct I or Direct Q according to the receiver's actual wiring and capabilities. Stop capture before changing these settings. A successful driver configuration cannot verify the analog input path or the quality of the received signal.
+
+The converter uses band-limited complex interpolation, shifts the captured band back to its configured RF frequency, and takes the real component. It maintains filter and oscillator state across blocks, with 0.5 gain for headroom. The input band must fit strictly between 0 and 4 MHz; interpolation cannot restore missing bandwidth. Narrow input rates also leave less room for the FM sidebands.
+
+Known USB loss or overflow of the dedicated RF recording queue stops this export even with **Stop on dropout** disabled. The file retains the accepted prefix; no replacement samples are invented. Display-queue pressure alone does not break the separate RF export. RAW is little-endian signed 16-bit at 8 MSPS. FLAC follows the project's kHz-scaled RF header convention and includes actual RF sample-rate and source-frequency tags; use `-f 8` when selecting the input rate in HiFi-Decode.
+
+8 MSPS output requires libsoxr. Other devices retain their existing recording and resampling controls.
+
 
 ## Scopes & Plugins
 

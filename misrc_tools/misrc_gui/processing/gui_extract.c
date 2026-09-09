@@ -592,6 +592,14 @@ uint8_t *gui_extract_get_buf_aux(void) {
 
 void gui_extract_update_stats(gui_app_t *app, const int16_t *buf_a,
                               const int16_t *buf_b, size_t num_samples) {
+    int16_t positive_clip = 2047;
+#ifdef ENABLE_RTLSDR
+    if (app->selected_device >= 0 && app->selected_device < app->device_count &&
+        app->devices[app->selected_device].type == DEVICE_TYPE_RTLSDR) {
+        // RTL-SDR's unsigned 8-bit samples are mapped to (sample - 128) * 16.
+        positive_clip = 2032;
+    }
+#endif
     size_t clip_a_pos = 0, clip_a_neg = 0;
     size_t clip_b_pos = 0, clip_b_neg = 0;
     uint16_t peak_a_pos = 0, peak_a_neg = 0;
@@ -603,8 +611,8 @@ void gui_extract_update_stats(gui_app_t *app, const int16_t *buf_a,
      for (size_t i = 0; i < num_samples; i++) {
         int16_t sa = buf_a[i];
 
-        // Clipping detection (12-bit ADC: +2047 is positive clip, -2048 is negative clip)
-        if (sa >= 2047) clip_a_pos++;
+        // Digital rail detection; both input mappings share the -2048 rail.
+        if (sa >= positive_clip) clip_a_pos++;
         else if (sa <= -2048) clip_a_neg++;
 
         // Peak detection (first N samples only) - A
@@ -617,7 +625,7 @@ void gui_extract_update_stats(gui_app_t *app, const int16_t *buf_a,
         if (have_b) {
             int16_t sb = buf_b[i];
 
-            if (sb >= 2047) clip_b_pos++;
+            if (sb >= positive_clip) clip_b_pos++;
             else if (sb <= -2048) clip_b_neg++;
 
             if (i < peak_samples) {

@@ -509,6 +509,8 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
 
     // RTL-SDR defaults (only relevant when an RTL-SDR device is selected)
     settings->rtlsdr_freq_hz = 100000000ULL;   // 100.0 MHz (FM broadcast band)
+    settings->rtlsdr_record_mode = 0;
+    settings->rtlsdr_direct_sampling = 0;
     settings->rtlsdr_gain_mode = 0;             // 0 = auto, 1 = manual
     settings->rtlsdr_gain_tenths_db = 0;        // manual gain (tenths dB); unused in auto mode
     settings->rtlsdr_sample_rate_hz = 2400000U;  // 2.4 MSPS (highest widely-stable)
@@ -659,6 +661,8 @@ void gui_settings_save(const gui_settings_t *settings) {
     fprintf(f, "  \"update_available_cached\": %s,\n", settings->update_available_cached ? "true" : "false");
     fprintf(f, "  \"rtlsdr_freq_hz\": %llu,\n", (unsigned long long)settings->rtlsdr_freq_hz);
     fprintf(f, "  \"rtlsdr_gain_mode\": %d,\n", settings->rtlsdr_gain_mode);
+    fprintf(f, "  \"rtlsdr_record_mode\": %d,\n", settings->rtlsdr_record_mode);
+    fprintf(f, "  \"rtlsdr_direct_sampling\": %d,\n", settings->rtlsdr_direct_sampling);
     fprintf(f, "  \"rtlsdr_gain_tenths_db\": %d,\n", settings->rtlsdr_gain_tenths_db);
     fprintf(f, "  \"rtlsdr_sample_rate_hz\": %u,\n", (unsigned)settings->rtlsdr_sample_rate_hz);
     fprintf(f, "  \"rtlsdr_agc\": %s,\n", settings->rtlsdr_agc ? "true" : "false");
@@ -1340,6 +1344,13 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "rtlsdr_gain_mode")) != NULL) {
         settings->rtlsdr_gain_mode = atoi(value);
+    }
+    if ((value = find_value(content, "rtlsdr_record_mode")) != NULL) {
+        settings->rtlsdr_record_mode = atoi(value) == 1 ? 1 : 0;
+    }
+    if ((value = find_value(content, "rtlsdr_direct_sampling")) != NULL) {
+        int mode = atoi(value);
+        settings->rtlsdr_direct_sampling = mode >= 0 && mode <= 2 ? mode : 0;
     }
     if ((value = find_value(content, "rtlsdr_gain_tenths_db")) != NULL) {
         settings->rtlsdr_gain_tenths_db = atoi(value);

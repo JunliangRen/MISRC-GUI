@@ -62,6 +62,10 @@ bool gui_rtlsdr_is_running(gui_app_t *app);
 // Safe to call whether or not capture is running; returns 0 on success.
 int gui_rtlsdr_set_frequency(gui_app_t *app, uint64_t hz);
 
+// Driver-reported configuration, not a measurement of the physical sample clock.
+// Only valid for a running capture whose rate/frequency/input setup succeeded.
+bool gui_rtlsdr_get_rf_source(gui_app_t *app, uint32_t *rate_hz, uint32_t *center_hz);
+
 #endif // ENABLE_RTLSDR
 
 #endif // GUI_RTLSDR_H

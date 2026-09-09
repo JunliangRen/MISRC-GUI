@@ -544,18 +544,31 @@ static void gui_ui_level_autostop_reconcile_vpp(gui_app_t *app)
     gui_settings_save(&app->settings);
 }
 
-#ifdef ENABLE_RTLSDR
 // Generic SDR device check. True for any I/Q-providing SDR backend (today
 // only RTL-SDR; add future SDR backends here so the SDR controls show for
 // them too). This keeps the Settings/Demod SDR controls SDR-generic, not
 // tied to the RTL-SDR backend specifically.
 static bool gui_ui_selected_device_is_sdr(const gui_app_t *app)
 {
+#ifdef ENABLE_RTLSDR
     if (!app) return false;
     if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
     return app->devices[app->selected_device].type == DEVICE_TYPE_RTLSDR;
-}
+#else
+    (void)app;
+    return false;
 #endif
+}
+
+static bool gui_ui_rtlsdr_rf_mode(const gui_app_t *app)
+{
+#ifdef ENABLE_RTLSDR
+    return gui_ui_selected_device_is_sdr(app) && app->settings.rtlsdr_record_mode == 1;
+#else
+    (void)app;
+    return false;
+#endif
+}
 
 static void gui_ui_trace_capture_mode_state(gui_app_t *app, const char *source, bool force) {
     if (!app) return;
@@ -674,6 +687,62 @@ static double s_active_text_backspace_repeat_at = 0.0;
 // RTL-SDR frequency text field mirrors settings.rtlsdr_freq_hz (a uint64).
 // Synced in render_settings_panel: format Hz->str when not editing, parse str->Hz when editing.
 static char s_rtlsdr_freq_str[32] = {0};
+
+#ifdef ENABLE_RTLSDR
+// Clay retains text pointers until rendering, after the settings builder returns.
+static const char *gui_ui_rtlsdr_sample_rate_label(uint32_t rate_hz)
+{
+    static char text[24];
+    snprintf(text, sizeof(text), "%.3f MSPS", (double)rate_hz / 1.0e6);
+    return text;
+}
+
+static uint32_t gui_ui_rtlsdr_next_sample_rate(uint32_t rate_hz, bool hifi_rf)
+{
+    static const uint32_t rates[] = { 250000, 1024000, 1200000, 1536000, 2048000, 2400000 };
+    const int count = (int)(sizeof(rates) / sizeof(rates[0]));
+    const int first = hifi_rf ? 1 : 0;
+    for (int i = first; i < count; i++) {
+        if (rates[i] == rate_hz) return rates[i + 1 < count ? i + 1 : first];
+    }
+    // Preserve the native cycle fallback; recommend 2.4 MSPS for unknown RF rates.
+    return hifi_rf ? 2400000 : 1024000;
+}
+
+static bool gui_ui_toggle_rtlsdr_output(gui_app_t *app)
+{
+#if LIBSOXR_ENABLED
+    app->settings.rtlsdr_record_mode = app->settings.rtlsdr_record_mode == 1 ? 0 : 1;
+    bool adjusted_rate = app->settings.rtlsdr_record_mode == 1 &&
+        (app->settings.rtlsdr_sample_rate_hz < 1024000 ||
+         app->settings.rtlsdr_sample_rate_hz > 2400000);
+    if (adjusted_rate) app->settings.rtlsdr_sample_rate_hz = 2400000;
+    gui_settings_save(&app->settings);
+    gui_app_set_status(app, app->settings.rtlsdr_record_mode == 1
+        ? (adjusted_rate
+            ? "8 MSPS Hi-Fi RF: hardware rate changed to recommended 2.4 MSPS; set the RF center and input path"
+            : "8 MSPS Hi-Fi RF: set the low RF center frequency and a suitable input path before connecting")
+        : "Native I/Q recording at the hardware sample rate");
+    return true;
+#else
+    if (app->settings.rtlsdr_record_mode == 1) {
+        app->settings.rtlsdr_record_mode = 0;
+        gui_settings_save(&app->settings);
+        gui_app_set_status(app, "Native I/Q recording selected");
+        return true;
+    }
+    gui_app_set_status(app, "8 MSPS Hi-Fi RF requires libsoxr");
+    return false;
+#endif
+}
+
+static const char *gui_ui_rtlsdr_gain_label(int gain_tenths_db)
+{
+    static char text[24];
+    snprintf(text, sizeof(text), "Gain: %.1f dB", (double)gain_tenths_db / 10.0);
+    return text;
+}
+#endif
 
 // Record-limit popup state (toolbar clock button)
 static bool s_record_limit_window_open = false;
@@ -1118,6 +1187,13 @@ void gui_ui_sync_android_keyboard_state(void) {
 bool gui_ui_click_consumed(void) {
     return s_ui_consumed_click;
 }
+
+bool gui_ui_modal_is_open(const gui_app_t *app) {
+    return (app && app->settings_panel_open) ||
+           s_record_limit_window_open || s_version_info_window_open ||
+           s_metadata_window_open || gui_popup_is_open();
+}
+
 static void format_record_limit_timecode(char *dst, size_t dst_len, uint32_t total_seconds);
 static bool parse_record_limit_timecode(const char *src, uint32_t *out_seconds);
 static bool record_limit_is_digit_char_index(int idx)
@@ -2159,6 +2235,21 @@ static void gui_ui_clear_text_edit(void)
     s_active_text_backspace_repeat_at = 0.0;
 }
 
+#ifdef ENABLE_RTLSDR
+static void gui_ui_apply_rtlsdr_hifi_preset(gui_app_t *app, bool pal)
+{
+    // The edit buffer is authoritative while focused. End that edit before
+    // applying a preset so it cannot restore the previous frequency next frame.
+    if (s_active_text_field == UI_TEXT_FIELD_RTLSDR_FREQ) gui_ui_clear_text_edit();
+    app->settings.rtlsdr_freq_hz = pal ? 1600000 : 1500000;
+    snprintf(s_rtlsdr_freq_str, sizeof(s_rtlsdr_freq_str), "%llu",
+             (unsigned long long)app->settings.rtlsdr_freq_hz);
+    gui_settings_save(&app->settings);
+    gui_app_set_status(app, pal ? "PAL center preset applied: 1.6 MHz"
+                               : "NTSC center preset applied: 1.5 MHz");
+}
+#endif
+
 static bool gui_ui_settings_locked(const gui_app_t *app)
 {
     return app && app->is_recording;
@@ -2205,6 +2296,10 @@ static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, 
         case UI_TEXT_FIELD_OUTPUT_PATH:
             *dst = app->settings.output_path;
             *cap = sizeof(app->settings.output_path);
+            return true;
+        case UI_TEXT_FIELD_RTLSDR_FREQ:
+            *dst = s_rtlsdr_freq_str;
+            *cap = sizeof(s_rtlsdr_freq_str);
             return true;
         case UI_TEXT_FIELD_FLAC_AFFINITY:
             *dst = app->settings.flac_affinity_cpu_list;
@@ -2358,7 +2453,7 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
             return app->settings.auto_names_enabled;
         case UI_TEXT_FIELD_RTLSDR_FREQ: {
 #ifdef ENABLE_RTLSDR
-            return gui_ui_selected_device_is_sdr(app);
+            return gui_ui_selected_device_is_sdr(app) && !app->is_capturing && !gui_record_is_finalizing();
 #else
             return false;
 #endif
@@ -2430,6 +2525,7 @@ static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *f
             size = FONT_SIZE_STATS;
             id = 0;
             break;
+        case UI_TEXT_FIELD_RTLSDR_FREQ:
         case UI_TEXT_FIELD_RF_TAG_A:
         case UI_TEXT_FIELD_RF_TAG_B:
         case UI_TEXT_FIELD_AUDIO_TAG_4CH:
@@ -2802,6 +2898,14 @@ static bool gui_ui_text_delete(char *dst, int *cursor)
     return true;
 }
 
+static void gui_ui_sync_rtlsdr_frequency(gui_app_t *app)
+{
+    if (s_active_text_field == UI_TEXT_FIELD_RTLSDR_FREQ && s_rtlsdr_freq_str[0]) {
+        unsigned long long parsed = strtoull(s_rtlsdr_freq_str, NULL, 10);
+        if (parsed > 0) app->settings.rtlsdr_freq_hz = (uint64_t)parsed;
+    }
+}
+
 static void gui_ui_handle_active_text_edit(gui_app_t *app)
 {
     if (s_active_text_field == UI_TEXT_FIELD_NONE) return;
@@ -2815,13 +2919,6 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     }
     gui_ui_text_clamp_state(dst);
 
-    // RTL-SDR frequency text field mirrors settings.rtlsdr_freq_hz (a uint64).
-    // Sync string -> uint64 here so every gui_settings_save() below commits the
-    // current value (including on Enter/Esc). Non-digits parse to 0 and are ignored.
-    if (s_active_text_field == UI_TEXT_FIELD_RTLSDR_FREQ && s_rtlsdr_freq_str[0]) {
-        unsigned long long parsed = strtoull(s_rtlsdr_freq_str, NULL, 10);
-        if (parsed > 0) app->settings.rtlsdr_freq_hz = (uint64_t)parsed;
-    }
     // Level-autostop level text field: clamp the edited 0.X into 0.1-0.8 on commit.
     // The live string is allowed to be partial while typing; final clamping happens
     // here so the saved value is always in range.
@@ -2908,6 +3005,7 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
         }
         if (finish_edit_requested) {
             gui_ui_text_clamp_state(dst);
+            gui_ui_sync_rtlsdr_frequency(app);
             gui_settings_save(&app->settings);
             gui_ui_clear_text_edit();
             return;
@@ -2964,6 +3062,9 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     }
 
     gui_ui_text_clamp_state(dst);
+    // Commit after processing this frame's text, including a final keypress
+    // followed by Enter. Other fields edit their settings buffers directly.
+    gui_ui_sync_rtlsdr_frequency(app);
     if (changed) {
         gui_settings_save(&app->settings);
     }
@@ -2985,6 +3086,54 @@ static CustomLayoutElement s_version_icon_element;
 static CustomLayoutElement s_metadata_icon_element;
 
 // Render settings panel (floating modal)
+static Clay_Vector2 s_settings_scroll_offset;
+static bool s_settings_scroll_anchor_pending;
+static float s_settings_scroll_anchor_y;
+
+bool gui_ui_settings_scroll_is_anchoring(void)
+{
+    return s_settings_scroll_anchor_pending;
+}
+
+void gui_ui_prepare_settings_scroll(const gui_app_t *app)
+{
+    // Read before BeginLayout: Clay_GetScrollOffset() compares array slots,
+    // which can move when the main UI adds/removes elements ahead of Settings.
+    s_settings_scroll_offset = (Clay_Vector2){0};
+    if (!app->settings_panel_open) {
+        s_settings_scroll_anchor_pending = false;
+        return;
+    }
+    Clay_ScrollContainerData scroll = Clay_GetScrollContainerData(CLAY_ID("SettingsScroll"));
+    if (scroll.found) s_settings_scroll_offset = *scroll.scrollPosition;
+}
+
+static void gui_ui_anchor_settings_scroll(void)
+{
+    Clay_ElementData anchor = Clay_GetElementData(CLAY_ID("RtlsdrOutputBox"));
+    Clay_ScrollContainerData scroll = Clay_GetScrollContainerData(CLAY_ID("SettingsScroll"));
+    s_settings_scroll_anchor_pending = anchor.found && scroll.found && scroll.scrollPosition->y < 0;
+    if (s_settings_scroll_anchor_pending) s_settings_scroll_anchor_y = anchor.boundingBox.y;
+}
+
+bool gui_ui_restore_settings_scroll(const gui_app_t *app)
+{
+    // Resolve once against the new content sizes after EndLayout. The caller
+    // rebuilds only if the offset changed, before rendering or hit testing.
+    if (!s_settings_scroll_anchor_pending) return false;
+    s_settings_scroll_anchor_pending = false;
+    if (!app->settings_panel_open) return false;
+    Clay_ElementData anchor = Clay_GetElementData(CLAY_ID("RtlsdrOutputBox"));
+    Clay_ScrollContainerData scroll = Clay_GetScrollContainerData(CLAY_ID("SettingsScroll"));
+    if (!anchor.found || !scroll.found) return false;
+    float min_y = -fmaxf(0, scroll.contentDimensions.height - scroll.scrollContainerDimensions.height);
+    float y = fmaxf(min_y, fminf(0, s_settings_scroll_offset.y + s_settings_scroll_anchor_y - anchor.boundingBox.y));
+    bool changed = fabsf(y - s_settings_scroll_offset.y) > 0.01f;
+    scroll.scrollPosition->y = y;
+    s_settings_scroll_offset.y = y;
+    return changed;
+}
+
 static void render_settings_panel(gui_app_t *app) {
     if (!app->settings_panel_open) return;
     int settings_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 1080);
@@ -2992,6 +3141,8 @@ static void render_settings_panel(gui_app_t *app) {
     int settings_min_width = gui_ui_clamp_int(settings_max_width, 1, 620);
     int settings_min_height = gui_ui_clamp_int(settings_max_height, 1, 420);
     bool settings_cxadc_has_channel_b = false;
+    bool settings_sdr_mode = gui_ui_selected_device_is_sdr(app);
+    bool settings_sdr_rf_mode = gui_ui_rtlsdr_rf_mode(app);
     bool settings_cxadc_mode = gui_ui_selected_device_is_cxadc(app, &settings_cxadc_has_channel_b);
 #ifdef ENABLE_DDD
     bool settings_ddd_mode = gui_ui_selected_device_is_ddd(app);
@@ -3185,7 +3336,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
             .clip = {
                 .vertical = true,
                 .horizontal = true,
-                .childOffset = Clay_GetScrollOffset()
+                .childOffset = s_settings_scroll_offset
             }
         }) {
             // Two-column layout to reduce vertical overflow
@@ -3216,6 +3367,9 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         CLAY_TEXT(CLAY_STRING("SDR:"),
                             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
+                        if (app->is_capturing || gui_record_is_finalizing()) {
+                            CLAY_TEXT(CLAY_STRING("Stop capture to change SDR settings."), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        }
                         // Frequency (Hz) row
                         CLAY(CLAY_ID("RtlsdrFreqRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                             CLAY_TEXT(CLAY_STRING("Frequency (Hz):"),
@@ -3232,11 +3386,17 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             }
                         }
 
+                        CLAY(CLAY_ID("RtlsdrInputRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                            CLAY_TEXT(CLAY_STRING("Input path:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                            CLAY(CLAY_ID("RtlsdrInputBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(app->is_capturing ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                                CLAY_TEXT(app->settings.rtlsdr_direct_sampling == 2 ? CLAY_STRING("Direct Q") : app->settings.rtlsdr_direct_sampling == 1 ? CLAY_STRING("Direct I") : CLAY_STRING("Tuner"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                            }
+                        }
+
                         // Sample rate row (cycle box)
                         CLAY(CLAY_ID("RtlsdrSampleRateRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                             CLAY_TEXT(CLAY_STRING("Sample rate:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
-                            char sr_buf[24];
-                            snprintf(sr_buf, sizeof(sr_buf), "%.2f MSPS", (double)app->settings.rtlsdr_sample_rate_hz / 1.0e6);
+                            const char *sr_buf = gui_ui_rtlsdr_sample_rate_label(app->settings.rtlsdr_sample_rate_hz);
                             CLAY(CLAY_ID("RtlsdrSampleRateBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                                 CLAY_TEXT(make_string(sr_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
                             }
@@ -3254,8 +3414,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         // Gain stepper row
                         CLAY(CLAY_ID("RtlsdrGainRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                             CLAY(CLAY_ID("RtlsdrGainMinus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(CLAY_STRING("-"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
-                            char gain_buf[24];
-                            snprintf(gain_buf, sizeof(gain_buf), "Gain: %.1f dB", (double)app->settings.rtlsdr_gain_tenths_db / 10.0);
+                            const char *gain_buf = gui_ui_rtlsdr_gain_label(app->settings.rtlsdr_gain_tenths_db);
                             CLAY(CLAY_ID("RtlsdrGainValue"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER }, .padding = { 8, 8, 0, 0 } }, .backgroundColor = to_clay_color((Color){25,25,30,255}), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(make_string(gain_buf), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
                             CLAY(CLAY_ID("RtlsdrGainPlus"), { .layout = { .sizing = { CLAY_SIZING_FIXED(28), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) { CLAY_TEXT(CLAY_STRING("+"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) })); }
                         }
@@ -3282,6 +3441,9 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     CLAY_TEXT(CLAY_STRING("Capture:"),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
+                    if (settings_sdr_rf_mode) {
+                        CLAY_TEXT(CLAY_STRING("Hi-Fi RF: mono, 16-bit, output file A"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                    } else {
                     CLAY(CLAY_ID("ToggleRowCaptureA"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                         CLAY(CLAY_ID("ToggleCaptureA"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(app->settings.capture_a ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(app->settings.capture_a ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
@@ -3337,6 +3499,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                     }
 
 
+                    }
                     CLAY(CLAY_ID("ToggleRowFlac"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                         CLAY(CLAY_ID("ToggleUseFlac"), { .layout = { .sizing = { CLAY_SIZING_FIXED(80), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(app->settings.use_flac ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(app->settings.use_flac ? CLAY_STRING("ON") : CLAY_STRING("OFF"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
@@ -3417,7 +3580,40 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                     }
 
-                    if (settings_ddd_v1_mode) {
+                    if (settings_sdr_mode) {
+                        CLAY_TEXT(CLAY_STRING("SDR recording output:"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        bool output_locked = app->is_capturing || gui_record_is_finalizing();
+#if !LIBSOXR_ENABLED
+                        output_locked = output_locked || !settings_sdr_rf_mode;
+#endif
+                        CLAY(CLAY_ID("RtlsdrOutputBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(210), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(output_locked ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
+                            CLAY_TEXT(settings_sdr_rf_mode ? CLAY_STRING("8 MSPS Hi-Fi RF") : CLAY_STRING("Native I/Q"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(output_locked ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT) }));
+                        }
+                        CLAY_TEXT(settings_sdr_rf_mode ? CLAY_STRING("I/Q -> filtered 8 MSPS real RF; not decoded audio.") : CLAY_STRING("Original hardware rate; no software resampling."), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        if (settings_sdr_rf_mode) {
+                            // Restored and manually entered frequencies use the same selection.
+                            // Custom frequencies leave both presets unselected.
+                            bool pal_selected = app->settings.rtlsdr_freq_hz == 1600000;
+                            bool ntsc_selected = app->settings.rtlsdr_freq_hz == 1500000;
+                            Color pal_bg = pal_selected ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                            Color ntsc_bg = ntsc_selected ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                            Color preset_fg = output_locked ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                            uint16_t pal_border = pal_selected ? 2 : 0;
+                            uint16_t ntsc_border = ntsc_selected ? 2 : 0;
+                            CLAY(CLAY_ID("RtlsdrHifiPresetRow"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
+                                CLAY(CLAY_ID("RtlsdrHifiPal"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(output_locked ? ui_disabled_color(pal_bg) : pal_bg), .cornerRadius = CLAY_CORNER_RADIUS(4), .border = { .width = { pal_border, pal_border, pal_border, pal_border }, .color = to_clay_color(preset_fg) } }) {
+                                    CLAY_TEXT(CLAY_STRING("PAL: 1.6 MHz"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(preset_fg) }));
+                                }
+                                CLAY(CLAY_ID("RtlsdrHifiNtsc"), { .layout = { .sizing = { CLAY_SIZING_FIXED(140), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(output_locked ? ui_disabled_color(ntsc_bg) : ntsc_bg), .cornerRadius = CLAY_CORNER_RADIUS(4), .border = { .width = { ntsc_border, ntsc_border, ntsc_border, ntsc_border }, .color = to_clay_color(preset_fg) } }) {
+                                    CLAY_TEXT(CLAY_STRING("NTSC: 1.5 MHz"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(preset_fg) }));
+                                }
+                            }
+                            CLAY_TEXT(CLAY_STRING("Use a Hi-Fi tap and a low-frequency-capable input path.\n1.024-2.4 MSPS (2.4 recommended). No added bandwidth."), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                        }
+#if !LIBSOXR_ENABLED
+                        CLAY_TEXT(CLAY_STRING("8 MSPS RF requires a build with libsoxr."), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+#endif
+                    } else if (settings_ddd_v1_mode) {
                         CLAY_TEXT(CLAY_STRING("RF sample rate:"),
                             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 #ifdef ENABLE_DDD
@@ -3478,6 +3674,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                     }
 
+                    if (!settings_sdr_mode) {
                     CLAY(CLAY_ID("ToggleRowResampleB"), { .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(28) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 } }) {
                         Color resample_b_toggle_bg = settings_b_controls_disabled
                             ? ui_disabled_color(COLOR_BUTTON)
@@ -3500,6 +3697,8 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         CLAY(CLAY_ID("ResampleRateBBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rate_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(make_string(settings_resample_b_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rate_fg) }));
                         }
+                    }
+
                     }
 
                 }
@@ -9082,18 +9281,40 @@ void gui_handle_interactions(gui_app_t *app) {
             // SDR controls (shown for any SDR backend; today only RTL-SDR).
 #ifdef ENABLE_RTLSDR
             if (gui_ui_selected_device_is_sdr(app)) {
+                bool sdr_control_hit = Clay_PointerOver(CLAY_ID("RtlsdrFreqField")) ||
+                    Clay_PointerOver(CLAY_ID("RtlsdrInputBox")) ||
+                    Clay_PointerOver(CLAY_ID("RtlsdrOutputBox")) ||
+                    Clay_PointerOver(CLAY_ID("RtlsdrHifiPal")) ||
+                    Clay_PointerOver(CLAY_ID("RtlsdrHifiNtsc")) ||
+                    Clay_PointerOver(CLAY_ID("RtlsdrSampleRateBox")) ||
+                    Clay_PointerOver(CLAY_ID("RtlsdrGainModeToggle")) ||
+                    Clay_PointerOver(CLAY_ID("RtlsdrGainMinus")) ||
+                    Clay_PointerOver(CLAY_ID("RtlsdrGainPlus")) ||
+                    Clay_PointerOver(CLAY_ID("RtlsdrAgcToggle")) ||
+                    Clay_PointerOver(CLAY_ID("RtlsdrOffsetToggle"));
+                if (sdr_control_hit && (app->is_capturing || gui_record_is_finalizing())) {
+                    gui_app_set_status(app, "Stop capture before changing SDR settings");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+                if (Clay_PointerOver(CLAY_ID("RtlsdrInputBox"))) {
+                    app->settings.rtlsdr_direct_sampling = (app->settings.rtlsdr_direct_sampling + 1) % 3;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, "SDR input path changed; select the input supported by your hardware");
+                }
+                if (Clay_PointerOver(CLAY_ID("RtlsdrOutputBox"))) {
+                    if (gui_ui_toggle_rtlsdr_output(app)) gui_ui_anchor_settings_scroll();
+                }
+                if (Clay_PointerOver(CLAY_ID("RtlsdrHifiPal")) || Clay_PointerOver(CLAY_ID("RtlsdrHifiNtsc"))) {
+                    gui_ui_apply_rtlsdr_hifi_preset(app, Clay_PointerOver(CLAY_ID("RtlsdrHifiPal")));
+                }
                 if (Clay_PointerOver(CLAY_ID("RtlsdrFreqField")) && !gui_ui_click_consumed()) {
                     gui_ui_begin_text_edit(app, UI_TEXT_FIELD_RTLSDR_FREQ, CLAY_ID("RtlsdrFreqField"), 8.0f, 8.0f);
                     gui_ui_set_click_consumed();
                 }
                 if (Clay_PointerOver(CLAY_ID("RtlsdrSampleRateBox"))) {
-                    // Cycle through known-stable RTL sample rates (Hz).
-                    static const uint32_t rtlsdr_rates[] = { 250000, 1024000, 1200000, 1536000, 2048000, 2400000 };
-                    static const int n = (int)(sizeof(rtlsdr_rates)/sizeof(rtlsdr_rates[0]));
-                    uint32_t cur = app->settings.rtlsdr_sample_rate_hz;
-                    int idx = 0;
-                    for (int i = 0; i < n; i++) { if (rtlsdr_rates[i] == cur) { idx = i; break; } }
-                    app->settings.rtlsdr_sample_rate_hz = rtlsdr_rates[(idx + 1) % n];
+                    app->settings.rtlsdr_sample_rate_hz = gui_ui_rtlsdr_next_sample_rate(
+                        app->settings.rtlsdr_sample_rate_hz, gui_ui_rtlsdr_rf_mode(app));
                     gui_settings_save(&app->settings);
                     char msg[80];
                     snprintf(msg, sizeof(msg), "SDR sample rate set to %.2f MSPS (applies on next capture start)",
