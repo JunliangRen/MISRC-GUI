@@ -135,7 +135,7 @@ static const char *gui_dropout_reason_status(gui_dropout_reason_t reason) {
         case GUI_DROPOUT_DISK_SPACE:
             return "Capture stopped: low disk space (dynamic guard)";
         case GUI_DROPOUT_LOW_SIGNAL:
-            return "Capture stopped: sustained low/no signal (tape end)";
+            return "Recording stopped: sustained low/no signal (tape end)";
         case GUI_DROPOUT_NONE:
         default:
             return "Capture stopped: dropout detected";
@@ -799,11 +799,13 @@ int main(int argc, char **argv) {
             continue;
         }
 
-        // Level autostop: stop capture when the RF signal level stays below a
-        // configurable normalized level (0.1-0.8) for a configurable duration
-        // (tape-end detection). This is independent from the digital dropout
-        // (frame error/missed frame) logic above, which is unchanged. Gated
-        // only by level_autostop_enabled.
+        // Level autostop: stop RECORDING (not capture) when the RF signal level
+        // stays below a configurable normalized level (0.1-0.8) for a
+        // configurable duration (tape-end detection). The device stays connected
+        // and streaming so the user can start a new recording without
+        // reconnecting — unlike the digital-dropout path above, which tears down
+        // capture because the stream itself is broken. Gated only by
+        // level_autostop_enabled.
         //
         // The threshold is a normalized 0.X magnitude applied to the larger of
         // channel A's positive/negative peak. Peak atomics are NOT on a common
@@ -842,9 +844,14 @@ int main(int argc, char **argv) {
                 if (peak < threshold) {
                     app.low_signal_time += dt;
                     if (app.low_signal_time >= sustain_s) {
-                        gui_app_stop_capture(&app);
-                        app.reconnect_pending = false;
-                        app.reconnect_attempts = 0;
+                        // Stop recording only — keep the capture/device
+                        // connection alive (tape end != device disconnect).
+                        // Reset low_signal state so a future recording re-arms
+                        // only after a real signal is seen again.
+                        gui_record_log_capture_event(&app, "INFO",
+                            "Level autostop: sustained low signal (tape end); stopping recording",
+                            GUI_ERROR_CLASS_NONE, 0);
+                        gui_app_stop_recording(&app);
                         app.low_signal_time = 0.0f;
                         app.low_signal_armed = false;
                         gui_app_set_status(&app, gui_dropout_reason_status(GUI_DROPOUT_LOW_SIGNAL));
