@@ -2024,10 +2024,13 @@ static void gui_ui_warn_low_rate(gui_app_t *app, float rate_khz)
     s_low_rate_warned_khz = rate_khz;
     char rate_label[24];
     format_msps_label(rate_label, sizeof(rate_label), rate_khz);
-    char msg[192];
+    char msg[256];
     snprintf(msg, sizeof(msg),
-        "RF rate set to %s — below the recommended 17.9 MSPS minimum.\n"
-        "Low bandwidth may cause decode artifacts. Allowed, but not recommended.",
+        "RF rate set to %s — below 17.9 MSPS.\n\n"
+        "Minimum bandwidths for reliable decode:\n"
+        "  20 MSPS — VHS\n"
+        "  24 MSPS+ — S-VHS\n\n"
+        "Lower rates are allowed but may cause decode artifacts.",
         rate_label);
     gui_dropdown_close_all();
     gui_ui_clear_text_edit();
