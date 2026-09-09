@@ -458,6 +458,76 @@ int gui_cxadc_set_tenbit(int card_idx, bool enabled)
 #endif
 }
 
+// --- Hardware sample-rate detection ---
+// cxadc has no sample_rate sysfs param; the rate is derived from crystal +
+// tenxfsc + tenbit. We present rates per the cxadc card reality:
+//   - 8-bit + tenxfsc=1 (crystal*10/8 = 35.8 on stock) is just upsampling the
+//     crystal, so it is NOT presented: report the crystal rate (28.6) instead.
+//   - 10-bit + tenxfsc=1 (crystal*5/8 = 17.9 on stock) IS exposed as a real
+//     rate (the one useful tier above the 14.3 stock-10-bit floor).
+//   - tenxfsc=2 forces 40 MSPS; tenxfsc=3 is broken in HW but the driver maps
+//     it to 40 MSPS, so treat both as 40 (20 in 10-bit).
+//   - A 54 MHz crystal mod with tenxfsc=0 yields 54 MSPS (27 in 10-bit).
+// crystal + tenxfsc are tenbit-independent, so they're cached per card with a
+// short TTL; the caller passes its intended tenbit so a just-toggled mode is
+// reflected immediately.
+#define CXADC_RATE_CACHE_TTL_S 1.0
+#define CXADC_DEFAULT_CRYSTAL_HZ 28636363U
+static uint32_t s_cxadc_crystal_cache_hz[CXADC_MAX_CARDS] = { 0, 0 };
+static int s_cxadc_tenxfsc_cache[CXADC_MAX_CARDS] = { -1, -1 };
+static bool s_cxadc_param_cache_valid[CXADC_MAX_CARDS] = { false, false };
+static double s_cxadc_param_cache_time_s = 0.0;
+
+bool gui_cxadc_get_sample_rate_hz(int card_idx, bool tenbit, uint32_t *rate_hz_out)
+{
+    if (!rate_hz_out) return false;
+    *rate_hz_out = 0;
+    if (card_idx < 0 || card_idx >= CXADC_MAX_CARDS) return false;
+#if defined(_WIN32)
+    // CxadcWin PowerShell config doesn't expose tenxfsc/crystal; callers use
+    // the 40/20 MSPS clockgen baseline.
+    return false;
+#else
+    double now = GetTime();
+    if (!s_cxadc_param_cache_valid[card_idx] ||
+        (now - s_cxadc_param_cache_time_s) >= CXADC_RATE_CACHE_TTL_S) {
+        int tenxfsc = 0, crystal = 0;
+        bool have_tenxfsc = (cxadc_sysfs_read_int_param(card_idx, "tenxfsc", &tenxfsc) == 0);
+        bool have_crystal = (cxadc_sysfs_read_int_param(card_idx, "crystal", &crystal) == 0);
+        if (!have_tenxfsc && !have_crystal) {
+            return false;  // no cxadcN node / sysfs missing
+        }
+        if (!have_tenxfsc) tenxfsc = 0;
+        if (!have_crystal || crystal <= 0) crystal = (int)CXADC_DEFAULT_CRYSTAL_HZ;
+        s_cxadc_crystal_cache_hz[card_idx] = (uint32_t)crystal;
+        s_cxadc_tenxfsc_cache[card_idx] = tenxfsc;
+        s_cxadc_param_cache_valid[card_idx] = true;
+        s_cxadc_param_cache_time_s = now;
+    }
+
+    uint32_t crystal_hz = s_cxadc_crystal_cache_hz[card_idx];
+    int tenxfsc = s_cxadc_tenxfsc_cache[card_idx];
+    uint32_t rate_hz;
+
+    if (tenxfsc == 2 || tenxfsc == 3) {
+        rate_hz = 40000000U;
+        if (tenbit) rate_hz /= 2;
+    } else if (tenxfsc == 1) {
+        if (tenbit) {
+            rate_hz = (crystal_hz * 5U) / 8U;  // 17.9 on stock — expose
+        } else {
+            rate_hz = crystal_hz;  // 8-bit: 35.8 is upsampled → present crystal
+        }
+    } else {
+        rate_hz = crystal_hz;  // tenxfsc=0: crystal (28.6 stock / 40 mod / 54 mod)
+        if (tenbit) rate_hz /= 2;
+    }
+
+    *rate_hz_out = rate_hz;
+    return true;
+#endif
+}
+
 static int cxadc_apply_tenbit_modes(int card_count, const bool enabled[CXADC_MAX_CARDS])
 {
     if (card_count < 1) card_count = 1;
@@ -1814,9 +1884,15 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
             mode = false;
         }
         s_cxadc.tenbit_mode[i] = mode;
-        s_cxadc.card_sample_rate_hz[i] = mode
-            ? CXADC_SAMPLE_RATE_TENBIT_HZ
-            : CXADC_SAMPLE_RATE_8BIT_HZ;
+        // Detect the card's real hardware rate (crystal + tenxfsc + the
+        // intended tenbit); fall back to the 40/20 MSPS baseline when
+        // undetectable (Windows, clockgen-audio-only, missing sysfs) so the
+        // live sample-rate readout matches the card instead of always 40.
+        uint32_t detected_hz = 0;
+        if (!gui_cxadc_get_sample_rate_hz(i, mode, &detected_hz) || detected_hz == 0) {
+            detected_hz = mode ? CXADC_SAMPLE_RATE_TENBIT_HZ : CXADC_SAMPLE_RATE_8BIT_HZ;
+        }
+        s_cxadc.card_sample_rate_hz[i] = detected_hz;
     }
     s_cxadc.rf_sample_rate_hz = s_cxadc.card_sample_rate_hz[0];
 #if defined(_WIN32)

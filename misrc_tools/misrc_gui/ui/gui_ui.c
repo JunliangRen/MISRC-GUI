@@ -213,6 +213,16 @@ static float gui_ui_cxadc_base_rate_khz(const gui_app_t *app, int card_idx)
 {
     if (!app) return 40000.0f;
     if (card_idx < 0 || card_idx > 1) card_idx = 0;
+    // Detect the card's real hardware rate (crystal + tenxfsc + tenbit); fall
+    // back to the 40/20 MSPS clockgen baseline when undetectable (Windows,
+    // clockgen-audio-only, missing sysfs). Makes a stock 28.6 MSPS card show
+    // 28.6 instead of 40, and a 54 MHz mod show 54.
+    uint32_t detected_hz = 0;
+    if (gui_cxadc_get_sample_rate_hz(card_idx,
+            app->settings.cxadc_tenbit_mode_card[card_idx], &detected_hz) &&
+        detected_hz > 0) {
+        return (float)detected_hz / 1000.0f;
+    }
     return app->settings.cxadc_tenbit_mode_card[card_idx] ? 20000.0f : 40000.0f;
 }
 static uint8_t gui_ui_cxadc_rf_bits(const gui_app_t *app, int card_idx)
@@ -1870,8 +1880,12 @@ static void format_live_msps_label(char *dst, size_t dst_len, uint32_t sample_ra
 
 
 static float cycle_resample_khz(float current_khz, float max_khz) {
-    // User-facing presets (stored as kHz), including 40 MSPS passthrough base.
-    static const float presets_khz[] = { 5000.0f, 10000.0f, 14300.0f, 17900.0f, 20000.0f, 40000.0f };
+    // User-facing presets (stored as kHz). Real cxadc hardware rates up to
+    // 54 MSPS (crystal mod): 5, 10, 14.3, 17.9, 20, 28.6, 40, 54. 17.9 is kept
+    // as a useful 10-bit tier even though its 8-bit 35.8 is upsampled (not
+    // presented). The per-card max_khz filter below hides rates above the
+    // detected card's base, so a 40 MSPS card won't offer 54, etc.
+    static const float presets_khz[] = { 5000.0f, 10000.0f, 14300.0f, 17900.0f, 20000.0f, 28636.0f, 40000.0f, 54000.0f };
     const int n = (int)(sizeof(presets_khz) / sizeof(presets_khz[0]));
     if (max_khz < 5000.0f) max_khz = 5000.0f;
 
@@ -1990,6 +2004,34 @@ static void gui_ui_clear_text_edit(void)
 static bool gui_ui_settings_locked(const gui_app_t *app)
 {
     return app && app->is_recording;
+}
+
+// One-time low-rate warning: pops a dismissible info dialog when a resample
+// rate cycle lands below the 17.9 MSPS recommended floor. Allowed but flagged.
+// Debounced per-rate so repeated clicks at the same low rate don't re-spam;
+// resets when the rate returns above the floor so a future drop re-warns.
+#define CXADC_LOW_RATE_FLOOR_KHZ 17900.0f
+static float s_low_rate_warned_khz = -1.0f;
+
+static void gui_ui_warn_low_rate(gui_app_t *app, float rate_khz)
+{
+    if (!app) return;
+    if (rate_khz >= CXADC_LOW_RATE_FLOOR_KHZ) {
+        s_low_rate_warned_khz = -1.0f;
+        return;
+    }
+    if (fabsf(rate_khz - s_low_rate_warned_khz) < 1.0f) return;
+    s_low_rate_warned_khz = rate_khz;
+    char rate_label[24];
+    format_msps_label(rate_label, sizeof(rate_label), rate_khz);
+    char msg[192];
+    snprintf(msg, sizeof(msg),
+        "RF rate set to %s — below the recommended 17.9 MSPS minimum.\n"
+        "Low bandwidth may cause decode artifacts. Allowed, but not recommended.",
+        rate_label);
+    gui_dropdown_close_all();
+    gui_ui_clear_text_edit();
+    gui_popup_info("Low RF sample rate", msg);
 }
 
 
@@ -8817,6 +8859,7 @@ void gui_handle_interactions(gui_app_t *app) {
                 {
                     app->settings.resample_rate_a = cycle_resample_khz(app->settings.resample_rate_a, settings_base_rate_a_khz);
                     gui_settings_save(&app->settings);
+                    gui_ui_warn_low_rate(app, app->settings.resample_rate_a);
                 }
             }
             if (Clay_PointerOver(CLAY_ID("ToggleResampleB"))) {
@@ -8853,6 +8896,7 @@ void gui_handle_interactions(gui_app_t *app) {
                 } else {
                     app->settings.resample_rate_b = cycle_resample_khz(app->settings.resample_rate_b, settings_base_rate_b_khz);
                     gui_settings_save(&app->settings);
+                    gui_ui_warn_low_rate(app, app->settings.resample_rate_b);
                 }
             }
 
