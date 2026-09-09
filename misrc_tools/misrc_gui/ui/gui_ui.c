@@ -2006,33 +2006,29 @@ static bool gui_ui_settings_locked(const gui_app_t *app)
     return app && app->is_recording;
 }
 
-// One-time low-rate warning: pops a dismissible info dialog when a resample
-// rate cycle lands below the 17.9 MSPS recommended floor. Allowed but flagged.
-// Debounced per-rate so repeated clicks at the same low rate don't re-spam;
-// resets when the rate returns above the floor so a future drop re-warns.
-#define CXADC_LOW_RATE_FLOOR_KHZ 17900.0f
-static float s_low_rate_warned_khz = -1.0f;
+// One-time per-session low-rate warning: pops a dismissible info dialog
+// only when the resample cycle lands on the 14.3 MSPS stock 10-bit CXADC
+// rate. 5/10 MSPS are intentional SW-resample targets for HiFi audio-only
+// capture and don't trigger the warning.
+#define CXADC_LOW_RATE_WARN_KHZ 14300.0f
+static bool s_low_rate_warned_this_session = false;
 
 static void gui_ui_warn_low_rate(gui_app_t *app, float rate_khz)
 {
     if (!app) return;
-    if (rate_khz >= CXADC_LOW_RATE_FLOOR_KHZ) {
-        s_low_rate_warned_khz = -1.0f;
-        return;
-    }
-    if (fabsf(rate_khz - s_low_rate_warned_khz) < 1.0f) return;
-    s_low_rate_warned_khz = rate_khz;
-    char rate_label[24];
-    format_msps_label(rate_label, sizeof(rate_label), rate_khz);
-    char msg[320];
+    if (s_low_rate_warned_this_session) return;
+    if (fabsf(rate_khz - CXADC_LOW_RATE_WARN_KHZ) > 50.0f) return;
+    s_low_rate_warned_this_session = true;
+    char msg[384];
     snprintf(msg, sizeof(msg),
-        "RF rate set to %s - below 17.9 MSPS.\n\n"
-        "Minimum bandwidths for reliable decode:\n"
+        "RF rate set to 14.3 MSPS - stock 10-bit CXADC rate.\n\n"
+        "Minimum bandwidths for reliable video decode:\n"
         "  20 MSPS  - VHS / Video8 / Betamax\n"
         "  24 MSPS+ - S-VHS / Hi8 / U-matic\n"
         "  40 MSPS  - LaserDisc / 1\" SMPTE / 2\" Quad\n\n"
-        "Below these is not viable for archival capture.",
-        rate_label);
+        "HW rates: 14.3 / 17.9 / 20 / 28.6 / 40 / 54 MSPS (5/10 are SW-resample).\n"
+        "5/10 MSPS is for HiFi audio-only capture.\n\n"
+        "Below 20 MSPS is not viable for archival video capture.");
     gui_dropdown_close_all();
     gui_ui_clear_text_edit();
     gui_popup_info("Low RF sample rate", msg);
