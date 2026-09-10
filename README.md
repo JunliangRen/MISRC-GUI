@@ -9,11 +9,11 @@ A universal cross platform GUI tool for interfacing with and visualizing monitor
 
 ### Current Supported Hardware
 
-- [MISRC](www.misrc.org) (v1.0-v1.5a / native v2.5)
+- [MISRC](https://misrc.org) (v1.0-v1.5a / native v2.5)
 - CXADC (single cards and Clockgen Mod with sound)
 - HSDAOH
 - FX3 (Generic tinkering firmware support)
-- DdD (DomesDay Duplicator)
+- DdD (Domesday Duplicator)
 - FX3ADC (100mhz MUSE capture device)
 
 ## Downloads
@@ -342,3 +342,4 @@ Log Example:
 - August 9th 2026 - Official public pushing for adoption and edge case bug finding! 
 - August 13th 2026 - Official release!
 - August 24th 2026 - SDR Update (RTLSDR support + Waterfall/Spectro view modes) 
+- September 10th 2026 - CXADC refresh, Capture server/client/local modes integrated. 
