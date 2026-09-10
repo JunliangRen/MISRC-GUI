@@ -250,6 +250,11 @@ extern volatile atomic_int do_exit;
 #define CXADC_MAX_CARDS 2
 #define CXADC_SAMPLE_RATE_8BIT_HZ 40000000U
 #define CXADC_SAMPLE_RATE_TENBIT_HZ 20000000U
+// Stock CXADC card crystal is 28.636 MHz (8-bit 28.6 MSPS / 10-bit 14.3 MSPS).
+// Used as the fallback when the real rate can't be detected (Windows, no
+// sysfs). The 40/20 MSPS constants above are the CXADC Clockgen Mod baseline.
+#define CXADC_STOCK_RATE_8BIT_HZ 28636363U
+#define CXADC_STOCK_RATE_TENBIT_HZ 14318181U
 #define CXADC_READ_CHUNK_BYTES 65536
 #define CXADC_AUDIO_SAMPLE_RATE_HZ 46875U
 #define CXADC_AUDIO_CHANNEL_COUNT 3
@@ -1884,13 +1889,18 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
             mode = false;
         }
         s_cxadc.tenbit_mode[i] = mode;
-        // Detect the card's real hardware rate (crystal + tenxfsc + the
-        // intended tenbit); fall back to the 40/20 MSPS baseline when
-        // undetectable (Windows, clockgen-audio-only, missing sysfs) so the
-        // live sample-rate readout matches the card instead of always 40.
+        // Resolve the card's real hardware rate. The CXADC Clockgen Mod
+        // (card_count > 1) drives the cards at a true 40 MHz base regardless
+        // of the sysfs crystal param, so force 40/20 for it. A single stock
+        // card (card_count == 1) runs at 28.6 MHz; detect the real rate from
+        // sysfs and fall back to the stock 28.6/14.3 baseline when
+        // undetectable (Windows, missing sysfs) so the live sample-rate
+        // readout matches the card instead of always 40.
         uint32_t detected_hz = 0;
-        if (!gui_cxadc_get_sample_rate_hz(i, mode, &detected_hz) || detected_hz == 0) {
+        if (card_count > 1) {
             detected_hz = mode ? CXADC_SAMPLE_RATE_TENBIT_HZ : CXADC_SAMPLE_RATE_8BIT_HZ;
+        } else if (!gui_cxadc_get_sample_rate_hz(i, mode, &detected_hz) || detected_hz == 0) {
+            detected_hz = mode ? CXADC_STOCK_RATE_TENBIT_HZ : CXADC_STOCK_RATE_8BIT_HZ;
         }
         s_cxadc.card_sample_rate_hz[i] = detected_hz;
     }

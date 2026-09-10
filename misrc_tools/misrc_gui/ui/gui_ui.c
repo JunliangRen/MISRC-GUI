@@ -211,19 +211,25 @@ static bool gui_ui_selected_device_is_misrc_clockgen(const gui_app_t *app)
 
 static float gui_ui_cxadc_base_rate_khz(const gui_app_t *app, int card_idx)
 {
-    if (!app) return 40000.0f;
+    if (!app) return 28636.0f;
     if (card_idx < 0 || card_idx > 1) card_idx = 0;
-    // Detect the card's real hardware rate (crystal + tenxfsc + tenbit); fall
-    // back to the 40/20 MSPS clockgen baseline when undetectable (Windows,
-    // clockgen-audio-only, missing sysfs). Makes a stock 28.6 MSPS card show
-    // 28.6 instead of 40, and a 54 MHz mod show 54.
+    bool tenbit = app->settings.cxadc_tenbit_mode_card[card_idx];
+    // The CXADC Clockgen Mod (2-card entry, index > 1) runs the cards at a
+    // true 40 MHz base rate regardless of the sysfs crystal param, so force
+    // 40/20 for it. A single stock card runs at 28.6 MHz; detect the real
+    // rate from sysfs and fall back to the stock 28.6/14.3 baseline when
+    // undetectable (Windows, missing sysfs). 10-bit is never assumed; the
+    // tenbit flag comes from the user's settings (default 8-bit).
+    bool clockgen = false;
+    if (gui_ui_selected_device_is_cxadc(app, &clockgen) && clockgen) {
+        return tenbit ? 20000.0f : 40000.0f;
+    }
     uint32_t detected_hz = 0;
-    if (gui_cxadc_get_sample_rate_hz(card_idx,
-            app->settings.cxadc_tenbit_mode_card[card_idx], &detected_hz) &&
+    if (gui_cxadc_get_sample_rate_hz(card_idx, tenbit, &detected_hz) &&
         detected_hz > 0) {
         return (float)detected_hz / 1000.0f;
     }
-    return app->settings.cxadc_tenbit_mode_card[card_idx] ? 20000.0f : 40000.0f;
+    return tenbit ? 14318.0f : 28636.0f;
 }
 static uint8_t gui_ui_cxadc_rf_bits(const gui_app_t *app, int card_idx)
 {
@@ -1880,20 +1886,33 @@ static void format_live_msps_label(char *dst, size_t dst_len, uint32_t sample_ra
 
 
 static float cycle_resample_khz(float current_khz, float max_khz) {
-    // User-facing presets (stored as kHz). Real cxadc hardware rates up to
-    // 54 MSPS (crystal mod): 5, 10, 14.3, 17.9, 20, 28.6, 40, 54. 17.9 is kept
-    // as a useful 10-bit tier even though its 8-bit 35.8 is upsampled (not
-    // presented). The per-card max_khz filter below hides rates above the
-    // detected card's base, so a 40 MSPS card won't offer 54, etc.
-    static const float presets_khz[] = { 5000.0f, 10000.0f, 14300.0f, 17900.0f, 20000.0f, 28636.0f, 40000.0f, 54000.0f };
-    const int n = (int)(sizeof(presets_khz) / sizeof(presets_khz[0]));
+    // User-facing presets (stored as kHz). The set depends on the card's
+    // detected base rate (max_khz):
+    //   5 = HiFi audio SW-resample (always available)
+    //   14.3 / 17.9 / 28.6 = stock 28.6-base CXADC rates (base >= 28.6)
+    //   10 / 20 / 40 = clockgen 40-base rates, ONLY when the CXADC Clockgen
+    //     Mod is setup so the cards run at a true 40 MHz base (base >= 40 MHz)
+    //   27 / 54 = 54 MHz crystal-mod rates (base >= 54 MHz)
+    // 35.8 (upsampled 28.6) is never offered. 10-bit is not assumed; the
+    // cycle lists resample targets, independent of the capture bit depth.
+    float presets[16];
+    int n = 0;
+    presets[n++] = 5000.0f;
+    if (max_khz >= 40000.0f - 0.5f) presets[n++] = 10000.0f;
+    presets[n++] = 14300.0f;
+    presets[n++] = 17900.0f;
+    if (max_khz >= 40000.0f - 0.5f) presets[n++] = 20000.0f;
+    if (max_khz >= 54000.0f - 0.5f) presets[n++] = 27000.0f;
+    presets[n++] = 28636.0f;
+    if (max_khz >= 40000.0f - 0.5f) presets[n++] = 40000.0f;
+    if (max_khz >= 54000.0f - 0.5f) presets[n++] = 54000.0f;
     if (max_khz < 5000.0f) max_khz = 5000.0f;
 
-    float allowed[n];
+    float allowed[16];
     int allowed_count = 0;
     for (int i = 0; i < n; i++) {
-        if (presets_khz[i] <= max_khz + 0.5f) {
-            allowed[allowed_count++] = presets_khz[i];
+        if (presets[i] <= max_khz + 0.5f) {
+            allowed[allowed_count++] = presets[i];
         }
     }
     if (allowed_count <= 0) {
