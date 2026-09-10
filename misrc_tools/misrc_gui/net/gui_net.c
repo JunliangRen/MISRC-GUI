@@ -1245,8 +1245,10 @@ static void client_start_ingest(gui_app_t *app, net_client_t *cli) {
      * if the buffer isn't initialized yet (lazy init), so ensure_init first. */
     (void)bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_RF);
     (void)bufmgr_ensure_init(&app->buffers, BUF_CAPTURE_AUDIO);
+    (void)bufmgr_ensure_init(&app->buffers, BUF_DISPLAY);
     bufmgr_reset(&app->buffers, BUF_CAPTURE_RF);
     bufmgr_reset(&app->buffers, BUF_CAPTURE_AUDIO);
+    bufmgr_reset(&app->buffers, BUF_DISPLAY);
     bufmgr_reset_stats(&app->buffers, BUF_COUNT);
     atomic_store(&app->total_samples, 0);
     atomic_store(&app->samples_a, 0);
@@ -1899,7 +1901,11 @@ void gui_net_poll_mirror(gui_app_t *app) {
         } else if (!want && active) {
             client_stop_ingest(app, s_client);
         }
-        /* Mirror peer sample rate into app for display. */
+        /* Mirror peer sample rate into app for display. The local capture
+         * path updates app->sample_rate from stream metadata every frame;
+         * the network client only gets the rate from /stats, so update it
+         * every mirror poll (not just at ingest start) so the display time
+         * axis stays 1:1 with the server when the server's feed rate changes. */
         int psr = atomic_load(&s_client->peer_sample_rate);
         if (psr > 0) atomic_store(&app->sample_rate, (uint32_t)psr);
     }
