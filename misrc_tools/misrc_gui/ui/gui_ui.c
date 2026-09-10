@@ -214,22 +214,22 @@ static float gui_ui_cxadc_base_rate_khz(const gui_app_t *app, int card_idx)
     if (!app) return 28636.0f;
     if (card_idx < 0 || card_idx > 1) card_idx = 0;
     bool tenbit = app->settings.cxadc_tenbit_mode_card[card_idx];
-    // The CXADC Clockgen Mod (2-card entry, index > 1) runs the cards at a
-    // true 40 MHz base rate regardless of the sysfs crystal param, so force
-    // 40/20 for it. A single stock card runs at 28.6 MHz; detect the real
-    // rate from sysfs and fall back to the stock 28.6/14.3 baseline when
-    // undetectable (Windows, missing sysfs). 10-bit is never assumed; the
-    // tenbit flag comes from the user's settings (default 8-bit).
+    // CXADC Clockgen Mod (2-card entry, index > 1): always 40/20 MSPS
+    // (40 8-bit, 20 10-bit) — the clockgen drives a true 40 MHz base.
+    // Stock single card: always 28.6 MSPS base (the 8-bit crystal rate),
+    // NOT halved to 14.3 for 10-bit. 8-bit is the assumed stock default.
     bool clockgen = false;
     if (gui_ui_selected_device_is_cxadc(app, &clockgen) && clockgen) {
         return tenbit ? 20000.0f : 40000.0f;
     }
+    // Stock: detect the card's 8-bit rate; fall back to 28.6 MHz. Never
+    // return 14.3 (the 10-bit half) as the base — stock is always 28.6.
     uint32_t detected_hz = 0;
-    if (gui_cxadc_get_sample_rate_hz(card_idx, tenbit, &detected_hz) &&
+    if (gui_cxadc_get_sample_rate_hz(card_idx, false, &detected_hz) &&
         detected_hz > 0) {
         return (float)detected_hz / 1000.0f;
     }
-    return tenbit ? 14318.0f : 28636.0f;
+    return 28636.0f;
 }
 static uint8_t gui_ui_cxadc_rf_bits(const gui_app_t *app, int card_idx)
 {
@@ -1886,27 +1886,31 @@ static void format_live_msps_label(char *dst, size_t dst_len, uint32_t sample_ra
 
 
 static float cycle_resample_khz(float current_khz, float max_khz) {
-    // User-facing presets (stored as kHz). The set depends on the card's
-    // detected base rate (max_khz):
-    //   5 = HiFi audio SW-resample (always available)
-    //   14.3 / 17.9 / 28.6 = stock 28.6-base CXADC rates (base >= 28.6)
-    //   10 / 20 / 40 = clockgen 40-base rates, ONLY when the CXADC Clockgen
-    //     Mod is setup so the cards run at a true 40 MHz base (base >= 40 MHz)
-    //   27 / 54 = 54 MHz crystal-mod rates (base >= 54 MHz)
-    // 35.8 (upsampled 28.6) is never offered. 10-bit is not assumed; the
-    // cycle lists resample targets, independent of the capture bit depth.
+    // User-facing presets (stored as kHz). The set depends on whether the
+    // card is stock (28.6 MHz base) or clockgen/modded (40+ MHz base):
+    //   Stock (base ~28.6): 5, 14.3, 17.9, 28.6
+    //   Clockgen/40-mod (base ~40): 5, 10, 20, 40  (no 14.3/17.9/28.6)
+    //   54-mod (base ~54): 5, 10, 20, 27, 40, 54  (no 14.3/17.9/28.6)
+    // 14.3/17.9 are stock-28.6 software modes, hidden when clockgen (40+)
+    // is detected. 5 = HiFi audio SW-resample (always available). 35.8
+    // (upsampled 28.6) is never offered. 8-bit is the assumed stock default.
+    if (max_khz < 5000.0f) max_khz = 5000.0f;
+    bool stock_base = (max_khz < 40000.0f - 0.5f);
+
     float presets[16];
     int n = 0;
     presets[n++] = 5000.0f;
-    if (max_khz >= 40000.0f - 0.5f) presets[n++] = 10000.0f;
-    presets[n++] = 14300.0f;
-    presets[n++] = 17900.0f;
-    if (max_khz >= 40000.0f - 0.5f) presets[n++] = 20000.0f;
-    if (max_khz >= 54000.0f - 0.5f) presets[n++] = 27000.0f;
-    presets[n++] = 28636.0f;
-    if (max_khz >= 40000.0f - 0.5f) presets[n++] = 40000.0f;
-    if (max_khz >= 54000.0f - 0.5f) presets[n++] = 54000.0f;
-    if (max_khz < 5000.0f) max_khz = 5000.0f;
+    if (stock_base) {
+        presets[n++] = 14300.0f;
+        presets[n++] = 17900.0f;
+        presets[n++] = 28636.0f;
+    } else {
+        presets[n++] = 10000.0f;
+        presets[n++] = 20000.0f;
+        if (max_khz >= 54000.0f - 0.5f) presets[n++] = 27000.0f;
+        presets[n++] = 40000.0f;
+        if (max_khz >= 54000.0f - 0.5f) presets[n++] = 54000.0f;
+    }
 
     float allowed[16];
     int allowed_count = 0;
