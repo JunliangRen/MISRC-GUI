@@ -559,8 +559,24 @@ static void gui_capture_apply_cxadc_profile(gui_app_t *app, int card_count)
     const bool tenbit_mode_b = app->settings.cxadc_tenbit_mode_card[(card_count > 1) ? 1 : 0];
     const uint8_t cxadc_rf_bits_a = tenbit_mode_a ? 16 : 8;
     const uint8_t cxadc_rf_bits_b = tenbit_mode_b ? 16 : 8;
-    const float cxadc_base_rate_a_khz = tenbit_mode_a ? 20000.0f : 40000.0f;
-    const float cxadc_base_rate_b_khz = tenbit_mode_b ? 20000.0f : 40000.0f;
+    // Hardware rate for the card's tenbit mode. Clockgen mod (card_count > 1)
+    // drives 40/20 MSPS; stock single card runs at 28.6/14.3 MSPS (or the
+    // sysfs-detected rate). 10-bit uses the hardware 10-bit rate, not SW
+    // resampling, by default (the user can long-press the rate box to enable
+    // software resampling in the UI).
+    float cxadc_base_rate_a_khz, cxadc_base_rate_b_khz;
+    if (card_count > 1) {
+        cxadc_base_rate_a_khz = tenbit_mode_a ? 20000.0f : 40000.0f;
+        cxadc_base_rate_b_khz = tenbit_mode_b ? 20000.0f : 40000.0f;
+    } else {
+        uint32_t hz_a = 0, hz_b = 0;
+        if (!gui_cxadc_get_sample_rate_hz(0, tenbit_mode_a, &hz_a) || hz_a == 0)
+            hz_a = tenbit_mode_a ? 14318181U : 28636363U;
+        if (!gui_cxadc_get_sample_rate_hz(1, tenbit_mode_b, &hz_b) || hz_b == 0)
+            hz_b = tenbit_mode_b ? 14318181U : 28636363U;
+        cxadc_base_rate_a_khz = (float)hz_a / 1000.0f;
+        cxadc_base_rate_b_khz = (float)hz_b / 1000.0f;
+    }
 
     // Fixed RF assumptions for CXADC mode depend on driver tenbit mode.
     if (app->settings.rf_bits_a != cxadc_rf_bits_a) {
