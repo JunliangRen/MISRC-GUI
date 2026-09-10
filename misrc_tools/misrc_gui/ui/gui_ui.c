@@ -341,9 +341,12 @@ static void gui_ui_cxadc_cycle_rate(gui_app_t *app, int card_idx)
         *rate_field = hw_10bit;
         *bits_field = 16;
     } else {
+        // SW resample modes always use 8-bit (tenbit=false) so the
+        // downsample operates on the 8-bit HW stream.
+        *tenbit_field = false;
+        *bits_field = 8;
         *resample_field = true;
         *rate_field = sw_presets[next_pos - 2];
-        // tenbit unchanged in SW mode
     }
     gui_settings_save(&app->settings);
 
