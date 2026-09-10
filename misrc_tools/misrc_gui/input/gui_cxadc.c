@@ -533,8 +533,9 @@ bool gui_cxadc_get_sample_rate_hz(int card_idx, bool tenbit, uint32_t *rate_hz_o
 #endif
 }
 
-static int cxadc_apply_tenbit_modes(int card_count, const bool enabled[CXADC_MAX_CARDS])
+static int cxadc_apply_tenbit_modes(gui_app_t *app, int card_count, const bool enabled[CXADC_MAX_CARDS])
 {
+    if (!app) return -1;
     if (card_count < 1) card_count = 1;
     if (card_count > CXADC_MAX_CARDS) card_count = CXADC_MAX_CARDS;
     for (int i = 0; i < card_count; i++) {
@@ -560,16 +561,21 @@ static int cxadc_apply_tenbit_modes(int card_count, const bool enabled[CXADC_MAX
             int saved_errno = errno;
             fprintf(stderr, "[CXADC] set_tenbit(card %d, %s) failed: %s (errno %d)\n",
                     i, mode ? "10-bit" : "8-bit", strerror(saved_errno), saved_errno);
-            // If the write was denied for permissions AND the requested mode
-            // is 8-bit (the driver default), don't abort the whole capture:
-            // the card is already in 8-bit (we either read it above or can't
-            // read it, in which case read-only capture is still better than
-            // refusing to start). Only abort when the user explicitly asked
-            // for 10-bit and we can't set it (sample rate/format would be
-            // wrong, so capture would be silently misconfigured).
-            if ((saved_errno == EACCES || saved_errno == EPERM) && !mode) {
-                fprintf(stderr, "[CXADC] 8-bit mode requested, sysfs write denied; "
-                                "continuing with card default (no chgrp setup needed for 8-bit)\n");
+            // If the write was denied for permissions, fall back to 8-bit
+            // (the driver default) instead of aborting the whole capture.
+            // 8-bit needs no sysfs write; 10-bit does, but degrading to
+            // 8-bit is better than refusing to start. Revert this card's
+            // tenbit flag so the live sample-rate readout matches reality.
+            if (saved_errno == EACCES || saved_errno == EPERM) {
+                fprintf(stderr, "[CXADC] sysfs write denied; falling back to 8-bit (run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/* for 10-bit)\n");
+                if (mode) {
+                    s_cxadc.tenbit_mode[i] = false;
+                    app->settings.cxadc_tenbit_mode_card[i] = false;
+                    if (i == 0) app->settings.rf_bits_a = 8;
+                    else app->settings.rf_bits_b = 8;
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app, "CXADC 10-bit permission denied - fell back to 8-bit (run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*)");
+                }
                 continue;
             }
 #else
@@ -1932,7 +1938,7 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     // Skip CXADC card programming/open when there are no RF cards (audio-only
     // MISRC Clockgen). tenbit/center-offset sysfs writes would fail and abort.
     if (card_count > 0) {
-        if (cxadc_apply_tenbit_modes(card_count, s_cxadc.tenbit_mode) != 0) {
+        if (cxadc_apply_tenbit_modes(app, card_count, s_cxadc.tenbit_mode) != 0) {
 #if !defined(_WIN32)
             int saved_errno = errno;
             fprintf(stderr, "[CXADC] failed to apply tenbit mode on %d card(s): %s (errno %d)\n",

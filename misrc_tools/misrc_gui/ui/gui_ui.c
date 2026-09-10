@@ -1484,23 +1484,21 @@ void gui_ui_sync_capture_mode_state(gui_app_t *app) {
             app->settings.rf_bits_b = cxadc_rf_bits_b;
             cxadc_settings_changed = true;
         }
+        // In HW mode (resample off), sync the rate to the HW rate.
+        // In SW mode (resample on), leave the user's downsample target
+        // alone - the cycle sets it explicitly and the sync must not
+        // override it back to the HW rate.
         if (!app->settings.enable_resample_a) {
             if (fabsf(app->settings.resample_rate_a - cxadc_base_rate_a_khz) > 0.5f) {
                 app->settings.resample_rate_a = cxadc_base_rate_a_khz;
                 cxadc_settings_changed = true;
             }
-        } else if (app->settings.resample_rate_a > cxadc_base_rate_a_khz) {
-            app->settings.resample_rate_a = cxadc_base_rate_a_khz;
-            cxadc_settings_changed = true;
         }
         if (!app->settings.enable_resample_b) {
             if (fabsf(app->settings.resample_rate_b - cxadc_base_rate_b_khz) > 0.5f) {
                 app->settings.resample_rate_b = cxadc_base_rate_b_khz;
                 cxadc_settings_changed = true;
             }
-        } else if (app->settings.resample_rate_b > cxadc_base_rate_b_khz) {
-            app->settings.resample_rate_b = cxadc_base_rate_b_khz;
-            cxadc_settings_changed = true;
         }
         if (cxadc_settings_changed) {
             gui_settings_save(&app->settings);
