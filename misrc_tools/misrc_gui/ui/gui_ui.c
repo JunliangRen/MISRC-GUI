@@ -258,21 +258,26 @@ static float gui_ui_cxadc_hw_rate_khz(const gui_app_t *app, int card_idx)
     return gui_ui_cxadc_hw_rate_for_tenbit(app, card_idx,
         app->settings.cxadc_tenbit_mode_card[card_idx]);
 }
-// Format a CXADC HW-mode rate label as "HW <number>" (no MSPS suffix).
+// Format a CXADC HW-mode rate label as "HW <number> MSPS".
 static void format_cxadc_hw_label(char *dst, size_t dst_len, float khz)
 {
     float msps = khz / 1000.0f;
     if (fabsf(msps - roundf(msps)) < 1e-3f)
-        snprintf(dst, dst_len, "HW %d", (int)lroundf(msps));
+        snprintf(dst, dst_len, "HW %d MSPS", (int)lroundf(msps));
     else
-        snprintf(dst, dst_len, "HW %.1f", msps);
+        snprintf(dst, dst_len, "HW %.1f MSPS", msps);
 }
 // CXADC rate-box cycle: dedicated HW and SW mode options.
 //   HW 8-bit (resample off, tenbit=false, rate=HW 8-bit rate)
 //   HW 10-bit (resample off, tenbit=true, rate=HW 10-bit rate)
 //   SW <rates> (resample on, tenbit unchanged, rate=downsample target)
-// The box is always clickable (never greyed). HW modes show "HW <rate>";
+// The box is always clickable (never greyed). HW modes show "HW <rate> MSPS";
 // SW modes show "<rate> MSPS" via format_msps_label.
+// Uses an explicit static position counter so the cycle can't break on
+// rate collisions (e.g. SW 20 == HW 10-bit rate on clockgen).
+static int s_cxadc_rate_pos[2] = { 0, 0 };
+static int s_cxadc_rate_total[2] = { 0, 0 };
+
 static void gui_ui_cxadc_cycle_rate(gui_app_t *app, int card_idx)
 {
     if (!app) return;
@@ -305,19 +310,24 @@ static void gui_ui_cxadc_cycle_rate(gui_app_t *app, int card_idx)
 
     int total = 2 + sw_count;
 
-    // Find current position in the cycle.
-    int cur_pos = -1;
-    if (!*resample_field) {
-        if (*tenbit_field && fabsf(*rate_field - hw_10bit) < 1.0f) cur_pos = 1;
-        else cur_pos = 0;
-    } else {
-        for (int i = 0; i < sw_count; i++) {
-            if (fabsf(*rate_field - sw_presets[i]) < 1.0f) { cur_pos = 2 + i; break; }
+    // If the option set changed (card type / crystal mod), re-sync the
+    // position to the current state instead of advancing.
+    if (s_cxadc_rate_total[card_idx] != total) {
+        s_cxadc_rate_total[card_idx] = total;
+        if (!*resample_field) {
+            s_cxadc_rate_pos[card_idx] = *tenbit_field ? 1 : 0;
+        } else {
+            int found = 2;
+            for (int i = 0; i < sw_count; i++) {
+                if (fabsf(*rate_field - sw_presets[i]) < 1.0f) { found = 2 + i; break; }
+            }
+            s_cxadc_rate_pos[card_idx] = found;
         }
-        if (cur_pos < 0) cur_pos = 2; // unknown SW rate -> first SW
+        return; // re-sync this frame; advance next click
     }
-    if (cur_pos < 0) cur_pos = 0;
-    int next_pos = (cur_pos + 1) % total;
+
+    int next_pos = (s_cxadc_rate_pos[card_idx] + 1) % total;
+    s_cxadc_rate_pos[card_idx] = next_pos;
 
     // Apply next option.
     if (next_pos == 0) {
@@ -341,12 +351,12 @@ static void gui_ui_cxadc_cycle_rate(gui_app_t *app, int card_idx)
     char label[24];
     if (!*resample_field) {
         format_cxadc_hw_label(label, sizeof(label), *rate_field);
-        char msg[112];
+        char msg[128];
         snprintf(msg, sizeof(msg), "CH %c: %s %s", ch, label, *tenbit_field ? "10-bit" : "8-bit");
         gui_app_set_status(app, msg);
     } else {
         format_msps_label(label, sizeof(label), *rate_field);
-        char msg[112];
+        char msg[128];
         snprintf(msg, sizeof(msg), "CH %c: %s SW", ch, label);
         gui_app_set_status(app, msg);
     }
