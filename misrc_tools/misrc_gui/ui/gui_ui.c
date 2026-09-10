@@ -210,6 +210,7 @@ static bool gui_ui_selected_device_is_misrc_clockgen(const gui_app_t *app)
 }
 
 static void format_msps_label(char *dst, size_t dst_len, float khz);
+static void gui_ui_warn_low_rate(gui_app_t *app, float rate_khz);
 static float gui_ui_cxadc_base_rate_khz(const gui_app_t *app, int card_idx)
 {
     if (!app) return 28636.0f;
@@ -235,11 +236,10 @@ static float gui_ui_cxadc_base_rate_khz(const gui_app_t *app, int card_idx)
 // Tenbit-aware hardware rate: the actual capture rate for the card's current
 // tenbit mode. Clockgen mod forces 40/20; stock detects or falls back to
 // 28.6 (8-bit) / 14.3 (10-bit). Used as the resample baseline and cycle max.
-static float gui_ui_cxadc_hw_rate_khz(const gui_app_t *app, int card_idx)
+static float gui_ui_cxadc_hw_rate_for_tenbit(const gui_app_t *app, int card_idx, bool tenbit)
 {
     if (!app) return 28636.0f;
     if (card_idx < 0 || card_idx > 1) card_idx = 0;
-    bool tenbit = app->settings.cxadc_tenbit_mode_card[card_idx];
     bool clockgen = false;
     if (gui_ui_selected_device_is_cxadc(app, &clockgen) && clockgen) {
         return tenbit ? 20000.0f : 40000.0f;
@@ -250,6 +250,107 @@ static float gui_ui_cxadc_hw_rate_khz(const gui_app_t *app, int card_idx)
         return (float)detected_hz / 1000.0f;
     }
     return tenbit ? 14318.0f : 28636.0f;
+}
+static float gui_ui_cxadc_hw_rate_khz(const gui_app_t *app, int card_idx)
+{
+    if (!app) return 28636.0f;
+    if (card_idx < 0 || card_idx > 1) card_idx = 0;
+    return gui_ui_cxadc_hw_rate_for_tenbit(app, card_idx,
+        app->settings.cxadc_tenbit_mode_card[card_idx]);
+}
+// Format a CXADC HW-mode rate label as "HW <number>" (no MSPS suffix).
+static void format_cxadc_hw_label(char *dst, size_t dst_len, float khz)
+{
+    float msps = khz / 1000.0f;
+    if (fabsf(msps - roundf(msps)) < 1e-3f)
+        snprintf(dst, dst_len, "HW %d", (int)lroundf(msps));
+    else
+        snprintf(dst, dst_len, "HW %.1f", msps);
+}
+// CXADC rate-box cycle: dedicated HW and SW mode options.
+//   HW 8-bit (resample off, tenbit=false, rate=HW 8-bit rate)
+//   HW 10-bit (resample off, tenbit=true, rate=HW 10-bit rate)
+//   SW <rates> (resample on, tenbit unchanged, rate=downsample target)
+// The box is always clickable (never greyed). HW modes show "HW <rate>";
+// SW modes show "<rate> MSPS" via format_msps_label.
+static void gui_ui_cxadc_cycle_rate(gui_app_t *app, int card_idx)
+{
+    if (!app) return;
+    if (card_idx < 0 || card_idx > 1) card_idx = 0;
+    bool *tenbit_field = &app->settings.cxadc_tenbit_mode_card[card_idx];
+    bool *resample_field = (card_idx == 0) ? &app->settings.enable_resample_a : &app->settings.enable_resample_b;
+    float *rate_field = (card_idx == 0) ? &app->settings.resample_rate_a : &app->settings.resample_rate_b;
+    uint8_t *bits_field = (card_idx == 0) ? &app->settings.rf_bits_a : &app->settings.rf_bits_b;
+
+    float hw_8bit = gui_ui_cxadc_hw_rate_for_tenbit(app, card_idx, false);
+    float hw_10bit = gui_ui_cxadc_hw_rate_for_tenbit(app, card_idx, true);
+
+    // SW downsample targets, filtered by card type.
+    float sw_presets[8];
+    int sw_count = 0;
+    bool stock_base = (hw_8bit < 40000.0f - 0.5f);
+    if (stock_base) {
+        sw_presets[sw_count++] = 5000.0f;
+        sw_presets[sw_count++] = 14300.0f;
+        sw_presets[sw_count++] = 17900.0f;
+        sw_presets[sw_count++] = 28636.0f;
+    } else {
+        sw_presets[sw_count++] = 5000.0f;
+        sw_presets[sw_count++] = 10000.0f;
+        sw_presets[sw_count++] = 20000.0f;
+        if (hw_8bit >= 54000.0f - 0.5f) sw_presets[sw_count++] = 27000.0f;
+        sw_presets[sw_count++] = 40000.0f;
+        if (hw_8bit >= 54000.0f - 0.5f) sw_presets[sw_count++] = 54000.0f;
+    }
+
+    int total = 2 + sw_count;
+
+    // Find current position in the cycle.
+    int cur_pos = -1;
+    if (!*resample_field) {
+        if (*tenbit_field && fabsf(*rate_field - hw_10bit) < 1.0f) cur_pos = 1;
+        else cur_pos = 0;
+    } else {
+        for (int i = 0; i < sw_count; i++) {
+            if (fabsf(*rate_field - sw_presets[i]) < 1.0f) { cur_pos = 2 + i; break; }
+        }
+        if (cur_pos < 0) cur_pos = 2; // unknown SW rate -> first SW
+    }
+    if (cur_pos < 0) cur_pos = 0;
+    int next_pos = (cur_pos + 1) % total;
+
+    // Apply next option.
+    if (next_pos == 0) {
+        *tenbit_field = false;
+        *resample_field = false;
+        *rate_field = hw_8bit;
+        *bits_field = 8;
+    } else if (next_pos == 1) {
+        *tenbit_field = true;
+        *resample_field = false;
+        *rate_field = hw_10bit;
+        *bits_field = 16;
+    } else {
+        *resample_field = true;
+        *rate_field = sw_presets[next_pos - 2];
+        // tenbit unchanged in SW mode
+    }
+    gui_settings_save(&app->settings);
+
+    const char *ch = (card_idx == 0) ? "A" : "B";
+    char label[24];
+    if (!*resample_field) {
+        format_cxadc_hw_label(label, sizeof(label), *rate_field);
+        char msg[112];
+        snprintf(msg, sizeof(msg), "CH %c: %s %s", ch, label, *tenbit_field ? "10-bit" : "8-bit");
+        gui_app_set_status(app, msg);
+    } else {
+        format_msps_label(label, sizeof(label), *rate_field);
+        char msg[112];
+        snprintf(msg, sizeof(msg), "CH %c: %s SW", ch, label);
+        gui_app_set_status(app, msg);
+    }
+    gui_ui_warn_low_rate(app, *rate_field);
 }
 static uint8_t gui_ui_cxadc_rf_bits(const gui_app_t *app, int card_idx)
 {
@@ -3350,10 +3451,16 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                             }
                             CLAY_TEXT(CLAY_STRING("Resample A"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(resample_a_toggle_fg) }));
 
-                            // Rate selector (kHz stored; display MSPS)
-                            format_msps_label(settings_resample_a_display, sizeof(settings_resample_a_display), app->settings.resample_rate_a);
-                            Color rate_bg = !app->settings.enable_resample_a ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
-                            Color rate_fg = !app->settings.enable_resample_a ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                            // Rate selector (kHz stored; display MSPS, or "HW <rate>" in HW mode)
+                            bool cxadc_hw_a = settings_cxadc_mode && !app->settings.enable_resample_a;
+                            if (cxadc_hw_a) {
+                                format_cxadc_hw_label(settings_resample_a_display,
+                                    sizeof(settings_resample_a_display), app->settings.resample_rate_a);
+                            } else {
+                                format_msps_label(settings_resample_a_display, sizeof(settings_resample_a_display), app->settings.resample_rate_a);
+                            }
+                            Color rate_bg = (settings_cxadc_mode || app->settings.enable_resample_a) ? COLOR_BUTTON : ui_disabled_color(COLOR_BUTTON);
+                            Color rate_fg = (settings_cxadc_mode || app->settings.enable_resample_a) ? COLOR_TEXT : ui_disabled_color(COLOR_TEXT);
                             CLAY(CLAY_ID("ResampleRateABox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rate_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                                 CLAY_TEXT(make_string(settings_resample_a_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rate_fg) }));
                             }
@@ -3370,9 +3477,15 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
                         }
                         CLAY_TEXT(settings_ddd_v1_mode ? CLAY_STRING("RF ChB") : CLAY_STRING("Resample B"), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(resample_b_toggle_fg) }));
 
-                        format_msps_label(settings_resample_b_display, sizeof(settings_resample_b_display), app->settings.resample_rate_b);
-                        Color rate_bg = (settings_b_controls_disabled || !app->settings.enable_resample_b) ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
-                        Color rate_fg = (settings_b_controls_disabled || !app->settings.enable_resample_b) ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
+                        bool cxadc_hw_b = (settings_cxadc_mode && !settings_b_controls_disabled) && !app->settings.enable_resample_b;
+                        if (cxadc_hw_b) {
+                            format_cxadc_hw_label(settings_resample_b_display,
+                                sizeof(settings_resample_b_display), app->settings.resample_rate_b);
+                        } else {
+                            format_msps_label(settings_resample_b_display, sizeof(settings_resample_b_display), app->settings.resample_rate_b);
+                        }
+                        Color rate_bg = (settings_b_controls_disabled || !(settings_cxadc_mode || app->settings.enable_resample_b)) ? ui_disabled_color(COLOR_BUTTON) : COLOR_BUTTON;
+                        Color rate_fg = (settings_b_controls_disabled || !(settings_cxadc_mode || app->settings.enable_resample_b)) ? ui_disabled_color(COLOR_TEXT) : COLOR_TEXT;
                         CLAY(CLAY_ID("ResampleRateBBox"), { .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIXED(28) }, .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER } }, .backgroundColor = to_clay_color(rate_bg), .cornerRadius = CLAY_CORNER_RADIUS(4) }) {
                             CLAY_TEXT(make_string(settings_resample_b_display), CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(rate_fg) }));
                         }
@@ -8904,21 +9017,7 @@ void gui_handle_interactions(gui_app_t *app) {
 #endif
                 {
                     if (settings_cxadc_mode) {
-                        // CXADC: hard cycle between the two HW rates only
-                        // (8-bit base <-> 10-bit). Flips tenbit and sets
-                        // rate = HW rate. No other rates.
-                        bool tenbit = app->settings.cxadc_tenbit_mode_card[0];
-                        app->settings.cxadc_tenbit_mode_card[0] = !tenbit;
-                        app->settings.rf_bits_a = !tenbit ? 16 : 8;
-                        app->settings.enable_resample_a = false;
-                        app->settings.resample_rate_a = gui_ui_cxadc_hw_rate_khz(app, 0);
-                        gui_settings_save(&app->settings);
-                        char label[24];
-                        format_msps_label(label, sizeof(label), app->settings.resample_rate_a);
-                        char msg[96];
-                        snprintf(msg, sizeof(msg), "CH A: %s %s", label, !tenbit ? "10-bit" : "8-bit");
-                        gui_app_set_status(app, msg);
-                        gui_ui_warn_low_rate(app, app->settings.resample_rate_a);
+                        gui_ui_cxadc_cycle_rate(app, 0);
                     } else {
                         app->settings.resample_rate_a = cycle_resample_khz(app->settings.resample_rate_a, settings_base_rate_a_khz);
                         gui_settings_save(&app->settings);
@@ -8960,18 +9059,7 @@ void gui_handle_interactions(gui_app_t *app) {
                 } else {
                     if (settings_cxadc_mode) {
                         int bcard = settings_cxadc_has_channel_b ? 1 : 0;
-                        bool tenbit = app->settings.cxadc_tenbit_mode_card[bcard];
-                        app->settings.cxadc_tenbit_mode_card[bcard] = !tenbit;
-                        app->settings.rf_bits_b = !tenbit ? 16 : 8;
-                        app->settings.enable_resample_b = false;
-                        app->settings.resample_rate_b = gui_ui_cxadc_hw_rate_khz(app, bcard);
-                        gui_settings_save(&app->settings);
-                        char label[24];
-                        format_msps_label(label, sizeof(label), app->settings.resample_rate_b);
-                        char msg[96];
-                        snprintf(msg, sizeof(msg), "CH B: %s %s", label, !tenbit ? "10-bit" : "8-bit");
-                        gui_app_set_status(app, msg);
-                        gui_ui_warn_low_rate(app, app->settings.resample_rate_b);
+                        gui_ui_cxadc_cycle_rate(app, bcard);
                     } else {
                         app->settings.resample_rate_b = cycle_resample_khz(app->settings.resample_rate_b, settings_base_rate_b_khz);
                         gui_settings_save(&app->settings);
