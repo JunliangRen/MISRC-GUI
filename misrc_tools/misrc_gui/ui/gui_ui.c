@@ -265,8 +265,7 @@ static void gui_ui_toggle_cxadc_bit_mode(gui_app_t *app, int card_idx)
     uint8_t cxadc_bits = gui_ui_cxadc_rf_bits(app, card_idx);
     // Switching bit depth changes the hardware rate; use the hardware rate
     // mode (resample OFF) by default so capture leverages native hardware
-    // processing. The user can long-press the rate box (3s) to re-enable
-    // software resampling afterwards.
+    // processing. The rate box hard-cycles between the two HW rates.
     float cxadc_hw_rate_khz = gui_ui_cxadc_hw_rate_khz(app, card_idx);
     if (card_idx == 0) {
         app->settings.rf_bits_a = cxadc_bits;
@@ -2073,96 +2072,13 @@ static void gui_ui_warn_low_rate(gui_app_t *app, float rate_khz)
         "  20 MSPS  - VHS / Video8 / Betamax\n"
         "  24 MSPS+ - S-VHS / Hi8 / U-matic\n"
         "  40 MSPS  - LaserDisc / 1\" SMPTE / 2\" Quad\n\n"
-        "HW rates: 14.3 / 17.9 / 20 / 28.6 / 40 / 54 MSPS (5/10 are SW-resample).\n"
-        "5/10 MSPS is for HiFi audio-only capture.\n\n"
+        "HW rates: 14.3 / 20 / 28.6 / 40 / 54 MSPS.\n\n"
         "Below 20 MSPS is not viable for archival video capture.");
     gui_dropdown_close_all();
     gui_ui_clear_text_edit();
     gui_popup_info("Low RF sample rate", msg);
 }
 
-// CXADC resample rate-box long-press: a 3-second hold toggles software
-// resampling on/off. Stock/default leverages native hardware processing
-// (resample OFF, rate = hardware rate); long-press switches to SW
-// downsample mode. Tracked every frame so the hold works across frames.
-#define CXADC_RATE_LONG_PRESS_S 3.0
-static double s_rate_longpress_start_a = -1.0;
-static double s_rate_longpress_start_b = -1.0;
-static bool s_rate_longpress_fired_a = false;
-static bool s_rate_longpress_fired_b = false;
-
-static void gui_ui_cxadc_rate_longpress_tick(gui_app_t *app)
-{
-    if (!app) return;
-    bool cxadc_active = gui_ui_selected_device_is_cxadc(app, NULL);
-#ifdef ENABLE_DDD
-    bool ddd_v1 = gui_ui_selected_device_is_ddd_v1(app);
-#else
-    bool ddd_v1 = false;
-#endif
-    if (!cxadc_active || ddd_v1 || !app->settings_panel_open || gui_popup_is_open()) {
-        s_rate_longpress_start_a = -1.0;
-        s_rate_longpress_start_b = -1.0;
-        return;
-    }
-    bool mouse_down = IsMouseButtonDown(MOUSE_LEFT_BUTTON);
-    bool over_a = Clay_PointerOver(CLAY_ID("ResampleRateABox"));
-    bool over_b = Clay_PointerOver(CLAY_ID("ResampleRateBBox"));
-    double now = GetTime();
-
-    if (mouse_down && over_a && !gui_ui_click_consumed()) {
-        if (s_rate_longpress_start_a < 0.0) {
-            s_rate_longpress_start_a = now;
-            s_rate_longpress_fired_a = false;
-        }
-        if (!s_rate_longpress_fired_a &&
-            (now - s_rate_longpress_start_a) >= CXADC_RATE_LONG_PRESS_S) {
-            s_rate_longpress_fired_a = true;
-            bool enable = !app->settings.enable_resample_a;
-            app->settings.enable_resample_a = enable;
-            if (!enable) {
-                app->settings.resample_rate_a = gui_ui_cxadc_hw_rate_khz(app, 0);
-            }
-            gui_settings_save(&app->settings);
-            gui_app_set_status(app, enable
-                ? "CH A: software resampling enabled - long-press to disable"
-                : "CH A: hardware rate mode - long-press (3s) for software resampling");
-            gui_ui_set_click_consumed();
-        }
-    } else if (!over_a) {
-        s_rate_longpress_start_a = -1.0;
-    }
-
-    // Channel B: only when the card has a channel B source.
-    bool cxadc_has_channel_b = false;
-    gui_ui_selected_device_is_cxadc(app, &cxadc_has_channel_b);
-    if (cxadc_has_channel_b) {
-        if (mouse_down && over_b && !gui_ui_click_consumed()) {
-            if (s_rate_longpress_start_b < 0.0) {
-                s_rate_longpress_start_b = now;
-                s_rate_longpress_fired_b = false;
-            }
-            if (!s_rate_longpress_fired_b &&
-                (now - s_rate_longpress_start_b) >= CXADC_RATE_LONG_PRESS_S) {
-                s_rate_longpress_fired_b = true;
-                bool enable = !app->settings.enable_resample_b;
-                app->settings.enable_resample_b = enable;
-                if (!enable) {
-                    app->settings.resample_rate_b = gui_ui_cxadc_hw_rate_khz(app, 1);
-                }
-                gui_settings_save(&app->settings);
-                gui_app_set_status(app, enable
-                    ? "CH B: software resampling enabled - long-press to disable"
-                    : "CH B: hardware rate mode - long-press (3s) for software resampling");
-                gui_ui_set_click_consumed();
-            }
-        } else if (!over_b) {
-            s_rate_longpress_start_b = -1.0;
-        }
-    } else {
-        s_rate_longpress_start_b = -1.0;
-    }
-}
 
 
 static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, char **dst, size_t *cap)
@@ -7969,10 +7885,6 @@ void gui_handle_interactions(gui_app_t *app) {
         return;  // Popup consumed the interaction
     }
 
-    // CXADC rate-box long-press tracker (runs every frame, before click
-    // handling, so a 3-second hold can toggle software resampling).
-    gui_ui_cxadc_rate_longpress_tick(app);
-
     // Handle clicks
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
         // Version info popup modal interactions (consume before toolbar underneath)
@@ -8991,15 +8903,26 @@ void gui_handle_interactions(gui_app_t *app) {
                 } else
 #endif
                 {
-                    if (s_rate_longpress_fired_a) {
-                        // Long-press already toggled resample; suppress click.
-                    } else if (app->settings.enable_resample_a) {
+                    if (settings_cxadc_mode) {
+                        // CXADC: hard cycle between the two HW rates only
+                        // (8-bit base <-> 10-bit). Flips tenbit and sets
+                        // rate = HW rate. No other rates.
+                        bool tenbit = app->settings.cxadc_tenbit_mode_card[0];
+                        app->settings.cxadc_tenbit_mode_card[0] = !tenbit;
+                        app->settings.rf_bits_a = !tenbit ? 16 : 8;
+                        app->settings.enable_resample_a = false;
+                        app->settings.resample_rate_a = gui_ui_cxadc_hw_rate_khz(app, 0);
+                        gui_settings_save(&app->settings);
+                        char label[24];
+                        format_msps_label(label, sizeof(label), app->settings.resample_rate_a);
+                        char msg[96];
+                        snprintf(msg, sizeof(msg), "CH A: %s %s", label, !tenbit ? "10-bit" : "8-bit");
+                        gui_app_set_status(app, msg);
+                        gui_ui_warn_low_rate(app, app->settings.resample_rate_a);
+                    } else {
                         app->settings.resample_rate_a = cycle_resample_khz(app->settings.resample_rate_a, settings_base_rate_a_khz);
                         gui_settings_save(&app->settings);
                         gui_ui_warn_low_rate(app, app->settings.resample_rate_a);
-                    } else {
-                        // HW mode: rate tracks the hardware rate.
-                        gui_app_set_status(app, "CH A: long-press rate box (3s) for software resampling");
                     }
                 }
             }
@@ -9035,15 +8958,24 @@ void gui_handle_interactions(gui_app_t *app) {
                         gui_app_set_status(app, "Enable RF channel B to edit CH B resample settings");
                     }
                 } else {
-                    if (s_rate_longpress_fired_b) {
-                        // Long-press already toggled resample; suppress click.
-                    } else if (app->settings.enable_resample_b) {
+                    if (settings_cxadc_mode) {
+                        int bcard = settings_cxadc_has_channel_b ? 1 : 0;
+                        bool tenbit = app->settings.cxadc_tenbit_mode_card[bcard];
+                        app->settings.cxadc_tenbit_mode_card[bcard] = !tenbit;
+                        app->settings.rf_bits_b = !tenbit ? 16 : 8;
+                        app->settings.enable_resample_b = false;
+                        app->settings.resample_rate_b = gui_ui_cxadc_hw_rate_khz(app, bcard);
+                        gui_settings_save(&app->settings);
+                        char label[24];
+                        format_msps_label(label, sizeof(label), app->settings.resample_rate_b);
+                        char msg[96];
+                        snprintf(msg, sizeof(msg), "CH B: %s %s", label, !tenbit ? "10-bit" : "8-bit");
+                        gui_app_set_status(app, msg);
+                        gui_ui_warn_low_rate(app, app->settings.resample_rate_b);
+                    } else {
                         app->settings.resample_rate_b = cycle_resample_khz(app->settings.resample_rate_b, settings_base_rate_b_khz);
                         gui_settings_save(&app->settings);
                         gui_ui_warn_low_rate(app, app->settings.resample_rate_b);
-                    } else {
-                        // HW mode: rate tracks the hardware rate.
-                        gui_app_set_status(app, "CH B: long-press rate box (3s) for software resampling");
                     }
                 }
             }
