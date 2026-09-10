@@ -2614,22 +2614,16 @@ void gui_app_stop_capture(gui_app_t *app) {
 
 // Recording wrappers - delegate to gui_record module
 int gui_app_start_recording(gui_app_t *app) {
-    // Client mode: forward record-on to the server (master controls recording).
-    if (gui_net_is_client(app)) {
-        gui_net_client_request_record(app, true);
-        gui_net_set_status(app, "Requested record start on server");
-        return 0;
-    }
+    // Client mode: record locally to the client's set storage directory.
+    // The client receives RF+audio from the server via the network pump
+    // threads, so local recording works the same as a local capture. Do NOT
+    // forward record-on to the remote server - the client records to its
+    // own output_path, not the server's.
     return gui_record_start(app);
 }
 
 void gui_app_stop_recording(gui_app_t *app) {
-    // Client mode: forward record-off to the server.
-    if (gui_net_is_client(app)) {
-        gui_net_client_request_record(app, false);
-        gui_net_set_status(app, "Requested record stop on server");
-        return;
-    }
+    // Client mode: stop local recording (not the remote server's).
     gui_record_stop(app);
 }
 
