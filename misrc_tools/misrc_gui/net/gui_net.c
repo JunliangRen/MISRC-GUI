@@ -741,8 +741,30 @@ static void server_handle_request(gui_app_t *app, net_sock_t fd, const char *met
             ssize_t n = net_fanout_read(&sub, buf, sizeof(buf), 1000);
             if (n < 0) break;
             if (n == 0) {
-                /* No data for 1s; check socket still alive with a zero-byte probe is
-                 * awkward cross-platform, so just keep going. */
+                /* No data for 1s; probe the socket so a disconnected client
+                 * is detected even when the server has no data to push
+                 * (standby/idle feed). select() for read-ready: if the peer
+                 * closed, recv would return 0 (read-ready, no data); if the
+                 * socket is still open and idle, select times out (not
+                 * read-ready). Without this the /rf thread lingered forever
+                 * holding the subscription until a hard app close. */
+                fd_set rset;
+                FD_ZERO(&rset);
+                FD_SET(fd, &rset);
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 0;
+                int sr = select((int)fd + 1, &rset, NULL, NULL, &tv);
+                if (sr > 0 && FD_ISSET(fd, &rset)) {
+                    char probe[1];
+#ifdef _WIN32
+                    int pn = recv(fd, probe, 1, 0 /* normal */);
+                    if (pn == 0 || pn == SOCKET_ERROR) break;
+#else
+                    ssize_t pn = recv(fd, probe, 1, MSG_PEEK);
+                    if (pn == 0 || (pn < 0 && errno != EINTR)) break;
+#endif
+                }
                 continue;
             }
             if (net_send_all(fd, buf, (size_t)n) != 0) break;
