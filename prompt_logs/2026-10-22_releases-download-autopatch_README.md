@@ -137,6 +137,32 @@
   6/6 live-manifest + 6/6 repo-manifest asset URLs HTTP 200 -> **the
   auto-patch mechanism is live and every URL it serves resolves.**
 
+## 2026-10-22 follow-up: CI on the push was RED (Windows), fixed + new hard rule
+
+- User report: "the test build failed" + request to add a GH Actions check
+  to the hard dev rules.
+- Hard data: `gh run list` -> runs 39789335139 + 39789161172 (both pushes)
+  X; failed jobs: Windows EXE build (x86_64) + (arm64), step "Build and
+  package EXE"; `gh run view --log-failed`: gui_updater.c lines 526-538:
+  `struct _stat` incomplete type, `_stat` implicit declaration,
+  `_S_IFDIR`/`_S_IFREG` undeclared (both MinGW toolchains; Linux/macOS/
+  Android jobs green).
+- Root cause: MSVC-only `_stat` API spellings in the Windows stat helpers
+  (MinGW does not expose them) AND `<sys/stat.h>` included only on the
+  POSIX branch.
+- Fix: shared unconditional `#include <sys/stat.h>` + portable
+  `stat`/`S_ISDIR`/`S_ISREG` forms in gui_updater.c (single impl, all
+  platforms). Local re-verify: compile 0 errors, 38/38 meson tests,
+  43/43 static guards. No MinGW cross-compiler on this machine — the CI
+  matrix is the compiler of record for Windows (which is the point of the
+  new rule below).
+- New hard rules (dev/ci_guard_local_build_gate.md, incident 5 + rules
+  6-7 + sharpened verification step 5): every push is NOT done until the
+  triggered GH Actions run is verified green (gh run list -> gh run watch
+  --exit-status -> gh run view --log-failed on red, fix, repeat);
+  cross-platform `#if` code uses the portable API forms; never report a
+  push done from local results alone, never start work on a red main.
+
 ## Not yet verified / follow-ups
 
 - Windows/macOS install code paths are implemented + guarded but only
@@ -145,10 +171,8 @@
 - GUI behaviour (Releases Page button, Install two-click confirm, capture
   gate) still needs a real-world confirmation run by the user (per rule:
   user-interactable elements need real-world confirmation).
-- The push-triggered CI run on GitHub (guard/build/release-link-check jobs
-  on 4b756b6) is expected green; if the release-link-check job raced the
-  raw CDN at push time, its built-in retries should cover it (worst case,
-  re-run the job).
+- The fix push's own CI run must be watched to green (new hard rule 6) -
+  recorded below once observed.
 
 ## Commands run (full list)
 

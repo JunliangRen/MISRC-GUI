@@ -11,11 +11,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <sys/stat.h> /* stat/S_ISDIR/S_ISREG: the portable forms; the _stat
+                           variants are MSVC-only and do NOT compile on MinGW
+                           (run 39789335139 broke both Windows jobs on them). */
 #if defined(_WIN32)
 #include <direct.h>   /* _mkdir */
 #include <windows.h>  /* GetModuleFileNameA */
 #else
-#include <sys/stat.h>
 #include <unistd.h>
 #endif
 #if defined(__APPLE__)
@@ -522,24 +524,14 @@ bool gui_updater_get_executable_path(char *out, size_t out_len)
 
 static bool gui_updater_path_is_dir(const char *path)
 {
-#if defined(_WIN32)
-    struct _stat st;
-    return path && _stat(path, &st) == 0 && (st.st_mode & _S_IFDIR);
-#else
     struct stat st;
     return path && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-#endif
 }
 
 static bool gui_updater_path_is_file(const char *path)
 {
-#if defined(_WIN32)
-    struct _stat st;
-    return path && _stat(path, &st) == 0 && (st.st_mode & _S_IFREG);
-#else
     struct stat st;
     return path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
-#endif
 }
 
 /* mkdir -p semantics, one component at a time, using only libc. */
