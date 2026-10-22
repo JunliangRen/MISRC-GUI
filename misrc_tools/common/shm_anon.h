@@ -25,8 +25,12 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifndef O_NOFOLLOW
-#define O_NOFOLLOW 0
+/* Darwin shm_open rejects O_NOFOLLOW with EINVAL; POSIX shared-memory
+ * names are a separate namespace and cannot traverse filesystem symlinks. */
+#if defined(__APPLE__) || !defined(O_NOFOLLOW)
+#define SHM_ANON_NOFOLLOW 0
+#else
+#define SHM_ANON_NOFOLLOW O_NOFOLLOW
 #endif
 
 #undef IMPL_MEMFD
@@ -94,7 +98,7 @@ memfd_create(const char SHM_ANON_UNUSED(*_name), unsigned int SHM_ANON_UNUSED(fl
 		for (fill = start; fill < limit; r /= 8)
 			*fill++ = '0' + (r % 8);
 		fd = shm_open(
-		  name, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+		  name, O_RDWR | O_CREAT | O_EXCL | SHM_ANON_NOFOLLOW, 0600);
 		if (fd != -1)
 			return shm_unlink_or_close(name, fd);
 		if (errno != EEXIST)
