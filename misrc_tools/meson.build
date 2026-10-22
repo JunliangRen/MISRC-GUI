@@ -420,6 +420,9 @@ if raylib_dep.found()
     # Core
     'misrc_gui/core/misrc_gui.c',
     'misrc_gui/core/gui_settings.c',
+    # Release updater (releases page button + auto-patch manifest + confirmed
+    # self-update; unit-tested by test/gui_updater_test.c)
+    'misrc_gui/core/gui_updater.c',
     # Input
     'misrc_gui/input/gui_capture.c',
     'misrc_gui/input/gui_cxadc.c',
@@ -681,6 +684,18 @@ if raylib_dep.found()
       c_args: gui_cflags + ['-fwhole-program'], link_args: settings_path_ldflags,
       override_options: ['b_lto=true', 'optimization=2'])
     test('gui_settings_paths', settings_paths_test)
+
+    # Release updater: manifest parse (flat JSON), {tag} asset URL building,
+    # semver compare + dev-tag fallback, tag extraction/safety, archive
+    # naming, and the no-network failure paths of the confirmed self-update
+    # pipeline (reserved-invalid host for the download step). Includes the
+    # production gui_updater.c directly (repo test pattern).
+    gui_updater_test = executable('gui_updater_test',
+      ['test/gui_updater_test.c'],
+      dependencies: overlay_test_deps, include_directories: gui_includes,
+      c_args: cflags, link_args: settings_path_ldflags,
+      override_options: ['b_lto=true', 'optimization=2'])
+    test('gui_updater', gui_updater_test)
     if flac_dep.found()
       record_paths_test = executable('gui_record_paths_test',
         ['test/gui_record_paths_test.c', 'common/file_utils.c', version_target],

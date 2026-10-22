@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import os
 import re
 import shutil
@@ -1565,68 +1566,170 @@ def check_release_artifact_naming_contract(repo_root: Path, workflow_path: Path)
 
 
 def check_release_download_link_contract(repo_root: Path, workflow_path: Path) -> int:
-    """Assert the in-app updater's asset filename mapping matches the release
-    artifact naming, and that the live link check is wired into CI.
+    """Assert the manifest-driven update pipeline wiring + contract.
 
-    Regression (user report, release v1.2.4): gui_ui.c built asset names
-    missing the "_GUI" infix (Windows_MISRC_%s_x86.zip) while the workflow
-    publishes Windows_MISRC_GUI_<tag>_x86.zip, so every platform's
-    update-check Download button 404'd for every release.
-    check_release_artifact_naming_contract only pinned the WORKFLOW side;
-    nothing cross-checked the APP side. This guard pins both sides to the
-    identical naming and requires the live release_link_check.py CI test
-    (HEAD-checks the exact URLs the app builds, against the latest
-    published release on every run and against the just-published tag in
-    the release job).
+    History: the updater built per-platform asset URLs from filename patterns
+    compiled INTO the binary. v1.2.4 shipped patterns missing the "_GUI"
+    infix while the workflow published <Platform>_MISRC_GUI_<tag>_<arch>.<ext>,
+    so every platform's Download button 404'd; the class recurred whenever a
+    compiled-in mapping drifted, and installed binaries could never be fixed
+    retroactively (every fix needed a new release).
+
+    The 2026-10-22 rework makes the failure class impossible by construction:
+    - the manual button opens the releases PAGE (a page URL cannot 404 per
+      platform),
+    - a remote auto-patch manifest (update_manifest.json at the repo root,
+      served from a fixed raw URL on main) defines the releases page, tag
+      lookup, download base and per-platform asset patterns for EVERY
+      installed app: a fix is a commit, not a release,
+    - confirmed self-update (two-click) downloads + installs, archiving the
+      old binary by RENAME (never deleted), gated off while capturing or
+      recording.
+
+    This guard pins: the manifest file + its structural contract, the
+    app-side wiring (include, page button, confirm gate, capture gate,
+    archive-not-delete rename), the absence of ANY compiled-in asset
+    filename pattern, the updater unit test + meson wiring, and the live
+    release_link_check.py CI test + its two workflow wirings.
     """
-    gui_c_path = repo_root / "misrc_tools" / "misrc_gui" / "ui" / "gui_ui.c"
-    if not gui_c_path.exists():
-        return fail(f"Missing gui_ui.c: {gui_c_path}")
-    gui_text = read_text(gui_c_path)
-
-    required_patterns = [
-        "Android_MISRC_GUI_%s_arm64.apk",
-        "macOS_MISRC_GUI_%s_universal.dmg",
-        "Windows_MISRC_GUI_%s_arm64.zip",
-        "Windows_MISRC_GUI_%s_x86.zip",
-        "Linux_MISRC_GUI_%s_arm64.zip",
-        "Linux_MISRC_GUI_%s_x86.zip",
-    ]
-    for pattern in required_patterns:
-        if pattern not in gui_text:
-            return fail(
-                f"gui_ui.c release asset mapping is missing the exact pattern: {pattern} "
-                "(must match the workflow's <Platform>_MISRC_GUI_<tag>_<arch>.<ext> naming)"
-            )
-    for pattern in [p.replace("MISRC_GUI_", "MISRC_") for p in required_patterns]:
-        if pattern in gui_text:
-            return fail(
-                f"gui_ui.c still contains the broken asset mapping (missing the _GUI "
-                f"infix) that 404'd the updater's Download button on every platform: {pattern}"
-            )
-
+    gui_ui_c = repo_root / "misrc_tools" / "misrc_gui" / "ui" / "gui_ui.c"
+    updater_h = repo_root / "misrc_tools" / "misrc_gui" / "core" / "gui_updater.h"
+    updater_c = repo_root / "misrc_tools" / "misrc_gui" / "core" / "gui_updater.c"
+    manifest_path = repo_root / "update_manifest.json"
     link_check = repo_root / "misrc_tools" / "test" / "release_link_check.py"
-    if not link_check.exists():
-        return fail(f"Missing release link check CI test: {link_check}")
+    updater_test = repo_root / "misrc_tools" / "test" / "gui_updater_test.c"
+    meson_path = repo_root / "misrc_tools" / "meson.build"
+
+    for path, label in [
+        (gui_ui_c, "gui_ui.c"),
+        (updater_h, "gui_updater.h"),
+        (updater_c, "gui_updater.c"),
+        (manifest_path, "update_manifest.json"),
+        (link_check, "release_link_check.py"),
+        (updater_test, "gui_updater_test.c"),
+    ]:
+        if not path.exists():
+            return fail(f"Missing {label}: {path}")
+
+    # 1. Repo manifest contract (full JSON parse; same acceptance rules as
+    #    the app's gui_updater_parse_manifest_text + the live link check).
+    try:
+        manifest = json.loads(read_text(manifest_path))
+    except json.JSONDecodeError as exc:
+        return fail(f"update_manifest.json is not valid JSON: {exc}")
+    if not isinstance(manifest, dict) or manifest.get("schema") != 1:
+        return fail("update_manifest.json schema must be 1")
+    for key in [
+        "releases_page", "tag_lookup_url", "download_base_url",
+        "asset_android", "asset_macos", "asset_windows_x86",
+        "asset_windows_arm64", "asset_linux_x86", "asset_linux_arm64",
+    ]:
+        value = manifest.get(key)
+        if not isinstance(value, str) or not value:
+            return fail(f"update_manifest.json missing or empty key: {key}")
+        if key in ("releases_page", "tag_lookup_url", "download_base_url"):
+            if not value.startswith("https://"):
+                return fail(f"update_manifest.json {key} must be https: {value}")
+    for key in ["asset_android", "asset_macos", "asset_windows_x86",
+                "asset_windows_arm64", "asset_linux_x86", "asset_linux_arm64"]:
+        pattern = manifest[key]
+        if "{tag}" not in pattern:
+            return fail(f"update_manifest.json asset pattern must contain {{tag}}: {key}={pattern}")
+
+    # 2. App-side constants + pipeline wiring.
+    gui_text = read_text(gui_ui_c)
+    updater_h_text = read_text(updater_h)
+    updater_c_text = read_text(updater_c)
+
+    for snippet, label in [
+        ('#include "../core/gui_updater.h"', "the updater module include"),
+        ("Releases Page", "the releases page button label"),
+        ("VersionInfoInstallButton", "the install button"),
+        ("s_update_install_armed", "the two-click confirm state"),
+        ("Confirm install", "the armed confirm label"),
+        ("gui_updater_fetch_manifest", "the manifest fetch in the check thread"),
+        ("gui_updater_build_asset_url", "manifest-driven asset URL building"),
+        ("gui_updater_install_asset", "the confirmed self-update install call"),
+        ("Stop capture/recording before installing an update", "the capture/record install gate"),
+    ]:
+        if snippet not in gui_text:
+            return fail(f"gui_ui.c update pipeline missing {label}: {snippet}")
+
+    for snippet, label in [
+        ("GUI_UPDATER_MANIFEST_URL", "the manifest URL macro"),
+        ("https://raw.githubusercontent.com/harrypm/MISRC-GUI/main/update_manifest.json",
+         "the fixed raw manifest URL"),
+        ("GUI_UPDATER_RELEASES_PAGE_URL", "the releases page fallback constant"),
+        ("https://github.com/harrypm/MISRC-GUI/releases/", "the releases page URL"),
+        ("GUI_UPDATER_ARCHIVE_SUFFIX", "the archive suffix constant"),
+        ("GUI_UPDATER_TAG_LOOKUP_URL", "the compiled tag-lookup fallback"),
+    ]:
+        if snippet not in updater_h_text:
+            return fail(f"gui_updater.h missing {label}: {snippet}")
+
+    for snippet, label in [
+        ("GUI_UPDATER_MANIFEST_URL", "the manifest URL use in the fetch"),
+        ("rename(target, archive_path)", "archive the old binary by rename"),
+        ("rename(archive_path, target)", "restore the archived old binary on failure"),
+        ("gui_updater_build_archive_path", "the archive path builder"),
+    ]:
+        if snippet not in updater_c_text:
+            return fail(f"gui_updater.c missing {label}: {snippet}")
+
+    # 3. Compiled-in asset filename patterns are FORBIDDEN anywhere in the
+    #    app: asset naming lives ONLY in the remotely-patchable manifest, so
+    #    the v1.2.4-class 404 bug is impossible by construction.
+    for text, label in [(gui_text, "gui_ui.c"), (updater_c_text, "gui_updater.c"),
+                        (updater_h_text, "gui_updater.h")]:
+        for pattern in ["_MISRC_GUI_%s_", "_MISRC_%s_", "%s_arm64.apk",
+                        "%s_universal.dmg", "%s_arm64.zip", "%s_x86.zip"]:
+            if pattern in text:
+                return fail(
+                    f"{label} still contains a compiled-in release asset filename "
+                    f"pattern ({pattern}) - asset naming must live ONLY in "
+                    "update_manifest.json (the remotely-patchable manifest); "
+                    "compiled-in patterns are the v1.2.4-class 404 bug"
+                )
+
+    # 4. Updater unit test + meson wiring.
+    updater_test_text = read_text(updater_test)
+    for snippet, label in [
+        ("gui_updater_parse_manifest_text", "the manifest parse coverage"),
+        ("gui_updater_compare_versions", "the version compare coverage"),
+        ("gui_updater_build_archive_path", "the archive path coverage"),
+        ("gui_updater_install_asset", "the install pipeline failure coverage"),
+    ]:
+        if snippet not in updater_test_text:
+            return fail(f"gui_updater_test.c missing {label}: {snippet}")
+    meson_text = read_text(meson_path)
+    for snippet, label in [
+        ("'misrc_gui/core/gui_updater.c'", "the updater module in the GUI build"),
+        ("test('gui_updater'", "the updater unit test registered as a meson test"),
+    ]:
+        if snippet not in meson_text:
+            return fail(f"misrc_tools/meson.build missing {label}: {snippet}")
+
+    # 5. Live link check CI test + both workflow wirings.
     link_text = read_text(link_check)
-    for snippet in [
-        "releases/latest",
-        "releases/download",
-        "gui_ui.c",
-        "gui_ui_build_release_asset_filename_for_platform",
-        "--tag",
+    for snippet, label in [
+        ("update_manifest.json", "the manifest file name"),
+        ("raw.githubusercontent.com", "the live raw manifest fetch"),
+        ("tag_lookup_url", "the manifest tag lookup"),
+        ("releases_page", "the releases page check"),
+        ("{tag}", "the {tag} placeholder"),
+        ("--tag", "the release-job tag override"),
     ]:
         if snippet not in link_text:
-            return fail(f"release_link_check.py is missing required snippet: {snippet}")
-
+            return fail(f"release_link_check.py missing {label}: {snippet}")
     workflow_text = read_text(workflow_path)
-    for snippet in [
-        "release-link-check:",
-        "python3 misrc_tools/test/release_link_check.py",
-        'release_link_check.py --tag "${{ steps.tag.outputs.tag }}"',
+    for snippet, label in [
+        ("release-link-check:", "the every-trigger link check job"),
+        ("python3 misrc_tools/test/release_link_check.py", "the job's command"),
+        ('release_link_check.py --tag "${{ steps.tag.outputs.tag }}"',
+         "the release job's post-publish verification step"),
     ]:
         if snippet not in workflow_text:
-            return fail(f"Workflow is missing release download link check wiring: {snippet}")
+            return fail(f"Workflow missing release download link check wiring ({label}): {snippet}")
     return 0
 
 

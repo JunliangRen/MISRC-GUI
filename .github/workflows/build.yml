@@ -89,16 +89,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      # End-to-end check of the in-app updater's Download button: the test
-      # extracts the per-platform asset filename patterns from gui_ui.c (the
-      # strings actually compiled into the app), resolves the latest release
-      # via the releases/latest redirect (same as the app), and HEAD-checks
-      # every URL it builds. Regression it prevents (v1.2.4): the app mapped
-      # Windows_MISRC_%s_x86.zip while the workflow publishes
-      # Windows_MISRC_GUI_<tag>_x86.zip, so every platform's Download button
-      # 404'd. Runs on every trigger against the latest published release;
-      # the release job re-runs it with --tag against the tag it just published.
-      - name: Verify the app updater's download URLs against the latest release
+      # End-to-end check of the manifest-driven update pipeline (the 2026-10-22
+      # rework): the updater (gui_updater.h/.c + gui_ui.c) pulls the auto-patch
+      # update_manifest.json from a fixed raw URL on main, the manual button
+      # opens the releases PAGE (a page cannot 404 per platform), and confirmed
+      # self-update downloads the manifest-named assets. This test fetches the
+      # LIVE manifest exactly as the app does, validates it, HEAD-checks the
+      # manifest's releases page, resolves the latest tag via the manifest's
+      # tag lookup, HEAD-checks all six manifest-built asset URLs (the exact
+      # URLs a confirmed self-update downloads), and cross-checks the repo
+      # manifest against the latest published release. The v1.2.4-class
+      # regression (asset naming drift -> every platform 404) is now caught
+      # here AND is remotely patchable: a fix is a commit to update_manifest.json
+      # on main, not a new release. The release job re-runs it with --tag
+      # against the tag it just publishes.
+      - name: Verify the manifest-driven update download pipeline
         run: |
           set -eux
           python3 misrc_tools/test/release_link_check.py
@@ -1473,11 +1478,12 @@ jobs:
             release-assets/**/macOS_MISRC_GUI_*_universal.dmg
             release-assets/**/Android_MISRC_GUI_*_arm64.apk
 
-      # Same-run verification of what the in-app updater will build for this
-      # tag: HEAD-check every per-platform URL the app's Download button
-      # opens. Fails the release job if the app mapping or the published asset
-      # names drift (the v1.2.4 bug shipped 404 links on every platform).
-      - name: Verify release download links (app updater mapping)
+      # Same-run verification of what every installed app will pull for this
+      # tag: the repo manifest (the commit being released) must name every
+      # platform asset correctly for the just-published tag, or a confirmed
+      # self-update would download a 404 (the v1.2.4-class bug). Live raw-main
+      # equality is not asserted here (the raw CDN can lag the push).
+      - name: Verify release download links (repo manifest)
         run: |
           set -eux
           python3 misrc_tools/test/release_link_check.py --tag "${{ steps.tag.outputs.tag }}"
