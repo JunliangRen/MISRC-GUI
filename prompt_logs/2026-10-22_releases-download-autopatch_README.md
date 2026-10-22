@@ -162,6 +162,14 @@
   --exit-status -> gh run view --log-failed on red, fix, repeat);
   cross-platform `#if` code uses the portable API forms; never report a
   push done from local results alone, never start work on a red main.
+- Fix pushed as **b3e326c** (gui_updater.c stat fix + hard rules + this
+  log); its GH Actions run **39793372186 watched to completion per the new
+  rule 6: CONCLUSION success, ALL 13 jobs green** - Preflight guards,
+  Cross-platform guards (ubuntu/windows/macos), Windows EXE x86_64 AND
+  arm64 (the broken pair; arm64's job record lagged in_progress with every
+  step already success until it finalized completed/success on re-poll),
+  Linux AppImage x86_64+arm64, macOS APP builds, Android APK, and the
+  Release download link check (the manifest pipeline in CI).
 
 ## Not yet verified / follow-ups
 
@@ -171,8 +179,8 @@
 - GUI behaviour (Releases Page button, Install two-click confirm, capture
   gate) still needs a real-world confirmation run by the user (per rule:
   user-interactable elements need real-world confirmation).
-- The fix push's own CI run must be watched to green (new hard rule 6) -
-  recorded below once observed.
+- The fix push's own CI run was watched to green (run 39793372186:
+  success, all jobs) - recorded above.
 
 ## Commands run (full list)
 
