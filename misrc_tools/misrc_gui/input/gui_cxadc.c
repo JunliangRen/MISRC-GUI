@@ -1,4 +1,5 @@
 #include "gui_cxadc.h"
+#include "gui_cxadc_macos.h"
 
 #include "../core/gui_app.h"
 #include "../processing/gui_extract.h"
@@ -407,7 +408,11 @@ int gui_cxadc_get_center_offset(int card_idx, int *value_out)
 #if defined(_WIN32)
     return cxadc_win_get_center_offset(card_idx, value_out);
 #else
+    #if defined(__APPLE__)
+    (void)card_idx; return gui_cxadc_macos_get("center_offset", value_out);
+#else
     return cxadc_sysfs_read_int_param(card_idx, "center_offset", value_out);
+#endif
 #endif
 }
 
@@ -420,7 +425,11 @@ int gui_cxadc_set_center_offset(int card_idx, int value)
 #else
     if (value < CXADC_SYSFS_CENTER_OFFSET_MIN) value = CXADC_SYSFS_CENTER_OFFSET_MIN;
     if (value > CXADC_SYSFS_CENTER_OFFSET_MAX) value = CXADC_SYSFS_CENTER_OFFSET_MAX;
+    #if defined(__APPLE__)
+    (void)card_idx; return gui_cxadc_macos_set("center_offset", value);
+#else
     return cxadc_sysfs_write_int_param(card_idx, "center_offset", value);
+#endif
 #endif
 }
 
@@ -451,6 +460,9 @@ int gui_cxadc_get_tenbit(int card_idx, int *value_out)
     *value_out = enabled ? 1 : 0;
     return 0;
 #else
+    #if defined(__APPLE__)
+    (void)card_idx; *value_out=0; return 0;
+    #endif
     int raw = 0;
     if (cxadc_sysfs_read_int_param(card_idx, "tenbit", &raw) != 0) {
         return -1;
@@ -465,6 +477,9 @@ int gui_cxadc_set_tenbit(int card_idx, bool enabled)
 #if defined(_WIN32)
     return cxadc_win_set_tenbit(card_idx, enabled);
 #else
+    #if defined(__APPLE__)
+    (void)card_idx; return enabled ? -1 : 0;
+    #endif
     return cxadc_sysfs_write_int_param(card_idx, "tenbit", enabled ? 1 : 0);
 #endif
 }
@@ -493,6 +508,10 @@ bool gui_cxadc_get_sample_rate_hz(int card_idx, bool tenbit, uint32_t *rate_hz_o
 {
     if (!rate_hz_out) return false;
     *rate_hz_out = 0;
+#if defined(__APPLE__)
+    if (card_idx>=0 && card_idx<CXADC_MAX_CARDS && !tenbit) {*rate_hz_out=28636363;return true;}
+    return false;
+#endif
     if (card_idx < 0 || card_idx >= CXADC_MAX_CARDS) return false;
 #if defined(_WIN32)
     // CxadcWin PowerShell config doesn't expose tenxfsc/crystal; callers use
@@ -621,10 +640,7 @@ static inline uint32_t cxadc_encode_raw_sample(int16_t sample_a, int16_t sample_
     uint32_t ch_b = (uint32_t)((2047 - sample_b) & 0xFFF);
     return ch_a | (ch_b << 20);
 }
-static inline int16_t cxadc_decode_sample_8bit(uint8_t sample)
-{
-    return (int16_t)(((int)sample - 128) << 4);
-}
+#include "cxadc_samples.h"
 
 static inline int16_t cxadc_decode_sample_tenbit(uint8_t lo, uint8_t hi)
 {
@@ -713,6 +729,9 @@ static void cxadc_close_handle(HANDLE *handle)
 #else
 static int cxadc_open_card(int card_idx)
 {
+#if defined(__APPLE__)
+    return gui_cxadc_macos_open(card_idx);
+#endif
     char path[32];
     snprintf(path, sizeof(path), "/dev/cxadc%d", card_idx);
     return open(path, O_RDONLY);
@@ -720,6 +739,9 @@ static int cxadc_open_card(int card_idx)
 
 static int cxadc_read_card(int fd, uint8_t *buf, size_t len)
 {
+#if defined(__APPLE__)
+    return gui_cxadc_macos_read(fd,buf,len);
+#endif
     if (!buf || len == 0 || fd < 0) {
         return -1;
     }
@@ -738,7 +760,11 @@ static void cxadc_close_fd(int *fd)
 {
     if (!fd) return;
     if (*fd >= 0) {
+#if defined(__APPLE__)
+        gui_cxadc_macos_close(*fd);
+#else
         close(*fd);
+#endif
         *fd = -1;
     }
 }
@@ -833,6 +859,11 @@ static size_t s_cxadc_probe_consumed_bytes[CXADC_MAX_CARDS];
 static bool cxadc_measure_card_rate_hz(int card_idx, bool tenbit, size_t probe_bytes,
                                         uint32_t *measured_hz_out)
 {
+#if defined(__APPLE__)
+    (void)card_idx;(void)tenbit;(void)probe_bytes;
+    if(measured_hz_out)*measured_hz_out=0;
+    return false; /* configured nominal rate, never claim a calibrated measurement */
+#endif
     if (card_idx < 0 || card_idx >= CXADC_MAX_CARDS || !measured_hz_out) {
         return false;
     }
@@ -1063,6 +1094,9 @@ int gui_cxadc_probe_card_rates(int card_count, const bool tenbit_modes[CXADC_MAX
 
 int gui_cxadc_detect_cards(void)
 {
+#if defined(__APPLE__)
+    return gui_cxadc_macos_detect();
+#endif
     int count = 0;
     for (int i = 0; i < CXADC_MAX_CARDS; i++) {
 #if defined(_WIN32)
@@ -1998,6 +2032,9 @@ static int cxadc_capture_thread(void *ctx_ptr)
     const int input_bytes_per_sample_a = ctx->tenbit_mode[0] ? 2 : 1;
     const int input_bytes_per_sample_b = ctx->tenbit_mode[1] ? 2 : 1;
     uint32_t tap_frame_index = 0;
+#if defined(__APPLE__)
+    uint64_t native_last_data=get_time_ms();
+#endif
 
     atomic_store(&app->stream_synced, true);
     atomic_store(&app->sample_rate, ctx->rf_sample_rate_hz);
@@ -2009,14 +2046,32 @@ static int cxadc_capture_thread(void *ctx_ptr)
         int read_a = cxadc_read_card(ctx->card_fds[0], card_buf_a, CXADC_READ_CHUNK_BYTES);
 #endif
         if (read_a < 0) {
+#if defined(__APPLE__)
+            gui_app_set_status(app,gui_cxadc_macos_error());
+            gui_cxadc_macos_mark_failed();
+            atomic_store(&app->dropout_stop_reason,GUI_DROPOUT_DEVICE_ERROR);
+            atomic_store(&app->dropout_stop_requested,true);
+#else
             gui_app_set_status(app, "CXADC read error on card 0");
+#endif
             break;
         }
         if (read_a == 0) {
+#if defined(__APPLE__)
+            if(get_time_ms()-native_last_data>2000){
+                gui_app_set_status(app,"macOS CXADC stopped delivering samples (device/driver unavailable)");
+                gui_cxadc_macos_mark_failed();
+                atomic_store(&app->dropout_stop_reason,GUI_DROPOUT_CALLBACK_GAP);
+                atomic_store(&app->dropout_stop_requested,true);break;
+            }
+#endif
             thrd_sleep_ms(1);
             continue;
         }
 
+#if defined(__APPLE__)
+        native_last_data=get_time_ms();
+#endif
         int output_samples = read_a / input_bytes_per_sample_a;
         if (output_samples <= 0) {
             thrd_sleep_ms(1);
@@ -2085,6 +2140,11 @@ static int cxadc_capture_thread(void *ctx_ptr)
         uint32_t *raw_out = (uint32_t *)bufmgr_write_begin(&app->buffers, BUF_CAPTURE_RF, output_bytes, NULL);
         if (!raw_out) {
             atomic_fetch_add(&app->rb_drop_count, 1);
+#if defined(__APPLE__)
+            gui_cxadc_macos_mark_failed();
+            atomic_store(&app->dropout_stop_reason,GUI_DROPOUT_BACKPRESSURE);
+            atomic_store(&app->dropout_stop_requested,true);break;
+#endif
             continue;
         }
 
@@ -2386,6 +2446,20 @@ static void cxadc_sync_card_starts(cxadc_ctx_t *ctx, int card_count)
 int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
 {
     if (!app) return -1;
+#if defined(__APPLE__)
+    int native_index=0;
+    if(app->selected_device>=0 && app->selected_device<app->device_count)
+        sscanf(app->devices[app->selected_device].serial,"CXADC_MACOS_%d",&native_index);
+    gui_cxadc_macos_select(native_index);
+    if(card_count!=1 || misrc_clockgen_mode){gui_app_set_status(app,"macOS CXADC supports one stock RAW8 card per capture");return -1;}
+    app->settings.cxadc_tenbit_mode_card[0]=false;
+    app->settings.rf_bits_a=8;app->settings.enable_resample_a=false;
+    app->settings.capture_a=true;app->settings.capture_b=false;
+    app->settings.enable_audio_4ch=false;app->settings.enable_audio_2ch_12=false;app->settings.enable_audio_2ch_34=false;
+    for(int n=0;n<4;n++)app->settings.enable_audio_1ch[n]=false;
+    app->settings.audio_monitor_playback=false;app->settings.use_flac=false;
+    app->settings.stop_on_dropout=true;
+#endif
     if (atomic_load(&s_cxadc.running)) return 0;
 
     // card_count == 0 is valid for the audio-only MISRC Clockgen path (no
@@ -2469,6 +2543,10 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
         }
 
         if (cxadc_open_cards(&s_cxadc, card_count) != 0) {
+#if defined(__APPLE__)
+            gui_app_set_status(app,gui_cxadc_macos_error());
+            return -1;
+#endif
 #if !defined(_WIN32)
             int saved_errno = errno;
             fprintf(stderr, "[CXADC] failed to open /dev/cxadc0..%d: %s (errno %d)\n",
@@ -2559,6 +2637,9 @@ int gui_cxadc_start(gui_app_t *app, int card_count, bool misrc_clockgen_mode)
     // and the direct RAW availability check all use the measured truth.
     if (card_count > 0) {
         for (int i = 0; i < card_count && i < CXADC_MAX_CARDS; i++) {
+#if defined(__APPLE__)
+            continue; /* on-demand DMA has no boot backlog; keep configured nominal rate */
+#endif
             // Reset the per-session consumed counter before the capture-start
             // probe so the exact-alignment grid references this fd session only.
             s_cxadc_probe_consumed_bytes[i] = 0;

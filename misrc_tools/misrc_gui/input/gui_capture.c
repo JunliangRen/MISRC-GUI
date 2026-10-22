@@ -23,6 +23,7 @@
 #include "gui_simulated.h"
 #include "gui_playback.h"
 #include "gui_cxadc.h"
+#include "gui_cxadc_macos.h"
 #ifdef ENABLE_FX3
 #include "gui_fx3.h"
 #endif
@@ -1491,6 +1492,14 @@ void gui_app_enumerate_devices(gui_app_t *app) {
     // MISRC Clockgen entries are offered (the clockgen drives either backend).
     bool misrc_clockgen_audio_present = gui_cxadc_detect_misrc_clockgen_audio();
 
+#if defined(__APPLE__)
+    for(int i=0;i<cxadc_card_count && app->device_count<MAX_DEVICES;i++) {
+        device_info_t *dst=&app->devices[app->device_count++];
+        snprintf(dst->name,sizeof(dst->name),"[CXADC] %s",gui_cxadc_macos_name(i));
+        snprintf(dst->serial,sizeof(dst->serial),"CXADC_MACOS_%d",i);
+        dst->type=DEVICE_TYPE_CXADC;dst->index=1;
+    }
+#else
     if (cxadc_card_count > 1) {
         if (app->device_count < MAX_DEVICES) {
             device_info_t *dst = &app->devices[app->device_count];
@@ -1508,6 +1517,8 @@ void gui_app_enumerate_devices(gui_app_t *app) {
         dst->index = 1;
         app->device_count++;
     }
+
+#endif
 
     // MISRC Clockgen entry: own device type, own marker serial. Offered whenever
     // the MISRC clockgen USB-audio endpoint is present (audio-only rigs have 0

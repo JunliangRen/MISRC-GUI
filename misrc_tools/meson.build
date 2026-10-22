@@ -572,6 +572,7 @@ if raylib_dep.found()
     gui_ldflags += ['-Wl,-framework,OpenGL', '-Wl,-framework,Cocoa', '-Wl,-framework,IOKit', '-Wl,-framework,CoreAudio', '-Wl,-framework,CoreVideo']
     gui_ldflags += ['-Wl,-framework,AVFoundation', '-Wl,-framework,CoreMedia', '-Wl,-framework,Security']
     sources_gui += 'misrc_capture/simple_capture/simple_capture_avfoundation.m'
+    sources_gui += 'misrc_gui/input/gui_cxadc_macos.c'
   endif
 
   gui_includes = include_directories('misrc_gui/ui')
@@ -1046,3 +1047,12 @@ beta_hifi_state_test = executable('gui_beta_hifi_state_test',
   'test/gui_beta_hifi_state_test.c',
   c_args: cflags, dependencies: [meson.get_compiler('c').find_library('m', required: false)])
 test('gui_beta_hifi_state', beta_hifi_state_test)
+
+if host_system == 'darwin'
+  macos_ringbuffer_test = executable('macos_ringbuffer_test',
+    ['test/macos_ringbuffer_test.c', 'common/ringbuffer.c'], c_args: cflags)
+  test('macos_ringbuffer', macos_ringbuffer_test)
+endif
+
+cxadc_samples_test = executable('cxadc_samples_test', 'test/cxadc_samples_test.c', c_args: cflags)
+test('cxadc_samples', cxadc_samples_test)

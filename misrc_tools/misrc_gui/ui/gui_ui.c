@@ -1,3 +1,4 @@
+#include "../input/gui_cxadc_macos.h"
 /*
  * MISRC GUI - UI Layout Implementation
  * Clay-based declarative UI layout (Clay v0.14 API)
@@ -291,6 +292,9 @@ static int s_cxadc_rate_total[2] = { 0, 0 };
 
 static void gui_ui_cxadc_cycle_rate(gui_app_t *app, int card_idx)
 {
+#if defined(__APPLE__)
+    (void)card_idx;gui_app_set_status(app,"macOS CXADC: stock 28.636363 MSPS unsigned8 only; F8 for hardware settings");return;
+#endif
     if (!app) return;
     if (card_idx < 0 || card_idx > 1) card_idx = 0;
     bool *tenbit_field = &app->settings.cxadc_tenbit_mode_card[card_idx];
@@ -384,6 +388,9 @@ static uint8_t gui_ui_cxadc_rf_bits(const gui_app_t *app, int card_idx)
 }
 static void gui_ui_toggle_cxadc_bit_mode(gui_app_t *app, int card_idx)
 {
+#if defined(__APPLE__)
+    (void)card_idx;gui_app_set_status(app,"macOS CXADC: stock 28.636363 MSPS unsigned8 only; F8 for hardware settings");return;
+#endif
     if (!app) return;
     if (card_idx < 0 || card_idx > 1) card_idx = 0;
     app->settings.cxadc_tenbit_mode_card[card_idx] = !app->settings.cxadc_tenbit_mode_card[card_idx];
@@ -8426,6 +8433,9 @@ static void gui_ui_poll_android_results(gui_app_t *app)
 
 // Handle UI interactions
 void gui_handle_interactions(gui_app_t *app) {
+#if defined(__APPLE__)
+    if(gui_cxadc_macos_ui_handle(app))return;
+#endif
     // Reset click consumed flag at start of each frame
     s_ui_consumed_click = false;
 #if defined(__ANDROID__)
