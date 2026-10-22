@@ -116,18 +116,39 @@
     (the installed replacement actually runs).
   - Cleanup: /tmp tree removed.
 
+## Push + post-rebase re-verification (hard data)
+
+- Commit created (05432fc, 11 files, +2307/-541) but the first push was
+  REJECTED: remote main had moved while this session ran - PR #10
+  (NTSC Betamax/SuperBeta RF preview, "JunliangRen/ntsc-betamax-preview-
+  upstream") was merged as 9c3894c and TAGGED v1.2.6 (the release this
+  session validated against all along; only meson.build overlapped).
+- `git fetch origin` + `git rebase origin/main` -> clean, no conflicts
+  (both sides' meson.build additions merged: gui_updater + beta_hifi).
+- Re-verification on the merged tree: compile 0 errors; meson test
+  **38/38 OK** (34 prior + 4 new from PR #10, incl. gui_updater);
+  `ci_guard_tests.py --static-only` **43/43 PASS**, no FAILED/ERROR;
+  `release_link_check.py --tag v1.2.6` **6/6 OK**.
+- Pushed: **4b756b6** on origin/main.
+- LIVE check (exact CI command) after the push, against the real raw URL:
+  live manifest fetched + valid from
+  https://raw.githubusercontent.com/harrypm/MISRC-GUI/main/update_manifest.json,
+  releases page HTTP 200, latest tag v1.2.6 via manifest tag_lookup_url,
+  6/6 live-manifest + 6/6 repo-manifest asset URLs HTTP 200 -> **the
+  auto-patch mechanism is live and every URL it serves resolves.**
+
 ## Not yet verified / follow-ups
 
-- The LIVE raw-main manifest check (release_link_check.py live mode) will
-  404 until this change is committed + pushed to main (first run right after
-  the push may need the retry/re-run; green after the raw CDN catches up,
-  typically minutes). All other live checks already pass.
 - Windows/macOS install code paths are implemented + guarded but only
   statically verified here (build + guards); the real-data install proof
   above covers the shared pipeline on Linux.
 - GUI behaviour (Releases Page button, Install two-click confirm, capture
   gate) still needs a real-world confirmation run by the user (per rule:
   user-interactable elements need real-world confirmation).
+- The push-triggered CI run on GitHub (guard/build/release-link-check jobs
+  on 4b756b6) is expected green; if the release-link-check job raced the
+  raw CDN at push time, its built-in retries should cover it (worst case,
+  re-run the job).
 
 ## Commands run (full list)
 
@@ -172,8 +193,9 @@
 
 ## Output
 
-All local verification green (34/34 meson tests, 43/43 guards, 6/6+6/6 live
-URL checks vs v1.2.6, real-data install pipeline proof). Pending: push to
-main (activates the live raw manifest), user real-world GUI confirmation, and
-per the fix-restore-point rule a log note + zip once the user confirms it is
-fully working.
+Pushed as 4b756b6 on origin/main (rebased onto the merged PR #10 / v1.2.6
+release commit). All verification green on the final tree: 38/38 meson tests,
+43/43 guards, full live manifest pipeline 6/6+6/6 HTTP 200 vs v1.2.6, and the
+real-data install pipeline proof. Remaining: user real-world GUI
+confirmation; per the fix-restore-point rule a log note + zip restore point
+will be created once the user confirms it is fully working.
