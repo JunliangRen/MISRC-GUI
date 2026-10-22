@@ -246,9 +246,29 @@ static bool gui_updater_manifest_find_int(const char *text, const char *key, lon
     return true;
 }
 
-static bool gui_updater_url_is_https(const char *url)
+static bool gui_updater_url_scheme_ok(const char *url)
 {
-    return url && gui_updater_ci_starts_with(url, "https://");
+    if (!url || !url[0]) return false;
+    if (gui_updater_ci_starts_with(url, "https://")) return true;
+    /* http:// is allowed ONLY for loopback hosts (127.0.0.1 / localhost /
+     * [::1]): the automated update-CLI end-to-end test serves the manifest,
+     * the tag redirect and the asset from a local server. Any other http
+     * source is rejected. */
+    if (gui_updater_ci_starts_with(url, "http://")) {
+        const char *host = url + 7;
+        size_t consumed = 0;
+        while (host[consumed] && host[consumed] != ':' && host[consumed] != '/' &&
+               consumed < 64) {
+            consumed++;
+        }
+        char hostbuf[65];
+        memcpy(hostbuf, host, consumed);
+        hostbuf[consumed] = '\0';
+        return strcmp(hostbuf, "127.0.0.1") == 0 ||
+               strcmp(hostbuf, "localhost") == 0 ||
+               strcmp(hostbuf, "[::1]") == 0;
+    }
+    return false;
 }
 
 static bool gui_updater_asset_pattern_valid(const char *pattern)
@@ -285,9 +305,9 @@ bool gui_updater_parse_manifest_text(const char *text, gui_updater_manifest_t *o
         return false;
     }
 
-    if (!gui_updater_url_is_https(out->releases_page) ||
-        !gui_updater_url_is_https(out->tag_lookup_url) ||
-        !gui_updater_url_is_https(out->download_base_url)) {
+    if (!gui_updater_url_scheme_ok(out->releases_page) ||
+        !gui_updater_url_scheme_ok(out->tag_lookup_url) ||
+        !gui_updater_url_scheme_ok(out->download_base_url)) {
         memset(out, 0, sizeof(*out));
         return false;
     }
@@ -311,23 +331,59 @@ bool gui_updater_parse_manifest_text(const char *text, gui_updater_manifest_t *o
 bool gui_updater_fetch_manifest(gui_updater_manifest_t *out,
                                 char *error_out, size_t error_out_len)
 {
+    return gui_updater_load_manifest_from(GUI_UPDATER_MANIFEST_URL, out,
+                                          error_out, error_out_len);
+}
+
+bool gui_updater_load_manifest_from(const char *source,
+                                    gui_updater_manifest_t *out,
+                                    char *error_out, size_t error_out_len)
+{
     if (!out) return false;
     memset(out, 0, sizeof(*out));
     if (error_out && error_out_len > 0) error_out[0] = '\0';
-
-    char cmd[GUI_UPDATER_URL_MAX + 64];
-    if (snprintf(cmd, sizeof(cmd), "%s -fsSL --max-time 15 \"%s\"",
-                 GUI_UPDATER_CURL_EXE, GUI_UPDATER_MANIFEST_URL) >= (int)sizeof(cmd)) {
-        if (error_out) snprintf(error_out, error_out_len, "manifest command too long");
+    if (!source || !source[0]) {
+        if (error_out) snprintf(error_out, error_out_len, "manifest source is empty");
         return false;
     }
 
     char text[GUI_UPDATER_MANIFEST_TEXT_MAX];
-    int rc = gui_updater_run_command(cmd, text, sizeof(text));
-    if (rc != 0) {
-        if (error_out) snprintf(error_out, error_out_len, "manifest fetch failed (curl rc=%d)", rc);
-        return false;
+    if (gui_updater_ci_starts_with(source, "http://") ||
+        gui_updater_ci_starts_with(source, "https://")) {
+        if (!gui_updater_url_scheme_ok(source)) {
+            if (error_out) {
+                snprintf(error_out, error_out_len,
+                         "manifest URL scheme not allowed (https, or http on a loopback host only)");
+            }
+            return false;
+        }
+        char cmd[GUI_UPDATER_URL_MAX + 64];
+        if (snprintf(cmd, sizeof(cmd), "%s -fsSL --max-time 15 \"%s\"",
+                     GUI_UPDATER_CURL_EXE, source) >= (int)sizeof(cmd)) {
+            if (error_out) snprintf(error_out, error_out_len, "manifest command too long");
+            return false;
+        }
+        int rc = gui_updater_run_command(cmd, text, sizeof(text));
+        if (rc != 0) {
+            if (error_out) snprintf(error_out, error_out_len, "manifest fetch failed (curl rc=%d)", rc);
+            return false;
+        }
+    } else {
+        /* Local file path (diagnostics / offline automated tests). */
+        FILE *fp = fopen(source, "rb");
+        if (!fp) {
+            if (error_out) snprintf(error_out, error_out_len, "cannot open manifest file");
+            return false;
+        }
+        size_t got = fread(text, 1, sizeof(text) - 1, fp);
+        text[got] = '\0';
+        fclose(fp);
+        if (got == 0) {
+            if (error_out) snprintf(error_out, error_out_len, "manifest file is empty");
+            return false;
+        }
     }
+
     if (!gui_updater_parse_manifest_text(text, out)) {
         if (error_out) snprintf(error_out, error_out_len, "manifest malformed or fields missing");
         return false;

@@ -73,11 +73,19 @@ typedef struct {
  * leaves *out zeroed on any malformed/missing field. Pure logic, no IO. */
 bool gui_updater_parse_manifest_text(const char *text, gui_updater_manifest_t *out);
 
-/* Fetch + parse the manifest over the network (curl via popen, exactly the
- * pattern the old in-app updater used). NULL tag_lookup_url/default args
- * fall back to the compiled-in URLs. */
+/* Fetch + parse the compiled-in manifest URL (what the GUI updater uses). */
 bool gui_updater_fetch_manifest(gui_updater_manifest_t *out,
                                 char *error_out, size_t error_out_len);
+
+/* Load + parse a manifest from an explicit source (the CLI's --update-manifest
+ * override for diagnostics/automated tests): an https URL, an http URL on a
+ * loopback host (127.0.0.1/localhost/[::1] ONLY - the automated end-to-end
+ * test serves the manifest/tag/assets from a local server; everything else
+ * must be https), or a local file path. Same acceptance rules as the live
+ * fetch. */
+bool gui_updater_load_manifest_from(const char *source,
+                                    gui_updater_manifest_t *out,
+                                    char *error_out, size_t error_out_len);
 
 /* --- helpers shared by the check + install paths (moved from gui_ui.c) --- */
 void gui_updater_trim_ascii_whitespace_inplace(char *s);

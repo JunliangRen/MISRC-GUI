@@ -624,7 +624,9 @@ if raylib_dep.found()
                 c_args: gui_cflags,
                 install: true)
   else
-    executable('misrc_gui',
+    # Captured into misrc_gui_exe so the update_cli test can depend on the
+    # real built binary (it drives the headless update CLI end to end).
+    misrc_gui_exe = executable('misrc_gui',
                 sources_gui + gui_win_resources,
                 dependencies: gui_deps,
                 include_directories: gui_includes,
@@ -696,6 +698,20 @@ if raylib_dep.found()
       c_args: cflags, link_args: settings_path_ldflags,
       override_options: ['b_lto=true', 'optimization=2'])
     test('gui_updater', gui_updater_test)
+
+    # Update CLI end-to-end test: drives the REAL built misrc_gui binary
+    # through the headless update flags (--check-update / --update-dry-run /
+    # --install-update --yes) against a local test server that serves the
+    # manifest, the releases/latest redirect and the asset zip, with an
+    # isolated HOME. Asserts the key: value output, the --install-update
+    # refusal without --yes, and the full install (old binary archived by
+    # rename, payload replaced). Loopback http only - gui_updater's URL
+    # scheme rule allows exactly that for this test.
+    if path_test_python.found()
+      test('update_cli', path_test_python,
+        args: [files('test/update_cli_test.py'), misrc_gui_exe.full_path()],
+        depends: [misrc_gui_exe])
+    endif
     if flac_dep.found()
       record_paths_test = executable('gui_record_paths_test',
         ['test/gui_record_paths_test.c', 'common/file_utils.c', version_target],

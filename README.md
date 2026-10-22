@@ -366,6 +366,36 @@ These flags open the GUI window (no capture args):
 </details>
 
 <details closed>
+<summary>Headless update mode</summary>
+<br>
+
+The updater pipeline (the same one the Info window uses) runs without the GUI, so it is scriptable and automatically testable:
+
+| Flag | Arg | Description |
+|------|-----|-------------|
+| `--check-update` | — | Fetch the update manifest + latest release tag, print `key: value` lines, exit 0 on success |
+| `--update-dry-run` | — | Also resolve this platform's asset URL, the running executable, the updates dir and the archive path; no download, nothing replaced |
+| `--install-update` | — | Perform the confirmed self-update (download, archive the old binary by rename — never deleted, install in place); requires `--yes` |
+| `--update-manifest` | `<url-or-path>` | Manifest source override (https URL, `http://127.0.0.1` loopback only for automated tests, or a local file) |
+| `--yes` | — | Explicit confirmation for `--install-update` |
+
+Example:
+
+```bash
+$ misrc_gui --check-update
+update_mode: check
+manifest_source: https://raw.githubusercontent.com/harrypm/MISRC-GUI/main/update_manifest.json
+manifest: ok
+latest: v1.2.6
+current: v1.2.5
+update_available: true
+```
+
+The full pipeline (check, dry-run, the install refusal without `--yes`, and the confirmed install with the old binary archived) is exercised automatically by the `update_cli` meson test against a local test server.
+
+</details>
+
+<details closed>
 <summary>Headless CLI capture mode (full arg list)</summary>
 <br>
 

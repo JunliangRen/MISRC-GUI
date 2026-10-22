@@ -182,6 +182,55 @@
 - The fix push's own CI run was watched to green (run 39793372186:
   success, all jobs) - recorded above.
 
+## 2026-10-22 follow-up 2: update stuff in the CLI + automatically testable
+
+- User request: "update stuff should also be in the CLI this should be
+  automatically testable".
+- Implemented:
+  - gui_updater.c/.h: `gui_updater_load_manifest_from(source, ...)` - manifest
+    from an https URL, an http URL on a LOOPBACK host only (127.0.0.1 /
+    localhost / [::1]; the automated test's local server; any other http is
+    rejected), or a local file; `gui_updater_fetch_manifest` now wraps it with
+    the compiled-in URL.
+  - misrc_gui.c: headless update CLI (the same pipeline as the GUI buttons,
+    no window, runs before settings/elevation):
+    - `--check-update`: manifest + tag fetched, prints `key: value` lines
+      (update_mode/manifest_source/manifest/latest/current/update_available),
+      exit 0/1;
+    - `--update-dry-run`: also the platform asset URL + exe path + updates
+      dir + archive path; no download, nothing replaced;
+    - `--install-update`: the full confirmed install (requires `--yes`);
+      prints install/install_status/archive;
+    - `--update-manifest <url-or-path>`: manifest source override for
+      diagnostics/automated tests; `--yes`: confirmation. Usage text updated.
+  - misrc_tools/test/update_cli_test.py (new, meson `test('update_cli')`,
+    drives the REAL built misrc_gui): local http server serves the manifest,
+    a 302 releases/latest -> tag redirect, and a crafted asset zip; isolated
+    HOME; a COPY of the binary is the "old version". Asserts: check output,
+    dry-run output (asset URL per platform, exe path, archive path), the
+    install REFUSAL without --yes (binary untouched), and the FULL confirmed
+    install: download kept, old binary archived by rename byte-for-byte,
+    payload replaced at the original path, install: ok. macOS runs
+    check/dry-run/refusal only (real install needs a real DMG).
+  - meson.build: misrc_gui executable captured into misrc_gui_exe + the
+    update_cli test wiring (path_io-style python test).
+  - ci_guard_tests.py: new `update CLI contract` guard (flags, runner,
+    confirmation gate, manifest-source load + loopback carve-out, test
+    assertions, meson wiring, README docs).
+  - README.md: "Headless update mode" section (flags table + example).
+- Verification (hard data):
+  - compile 0 errors; meson test **39/39 OK** incl. `update_cli` (0.74 s:
+    check + dry-run + refusal + full confirmed install against the local
+    server, old binary archived, payload replaced, download kept);
+  - `ci_guard_tests.py --static-only` **44/44 PASS** incl. the new
+    `update CLI contract`;
+  - LIVE CLI demo (no override - the compiled-in raw URL):
+    `--check-update` -> manifest ok, latest v1.2.6, current
+    dev-2026-10-22-aac5820-dirty, update_available true;
+    `--update-dry-run` -> the real
+    https://github.com/harrypm/MISRC-GUI/releases/download/v1.2.6/Linux_MISRC_GUI_v1.2.6_x86.zip,
+    exe path, updates dir, archive path.
+
 ## Commands run (full list)
 
 - ls -la /home/harry/MISRC-GUI; ls prompt_logs misrc_tools .github/workflows scripts

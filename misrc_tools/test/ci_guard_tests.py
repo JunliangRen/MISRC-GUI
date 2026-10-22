@@ -1733,6 +1733,103 @@ def check_release_download_link_contract(repo_root: Path, workflow_path: Path) -
     return 0
 
 
+def check_update_cli_contract(repo_root: Path) -> int:
+    """Assert the headless update CLI + its end-to-end automated test wiring.
+
+    The updater pipeline (gui_updater.c) must be reachable WITHOUT the GUI
+    (--check-update / --update-dry-run / --install-update --yes): the update
+    flow has to be automatically testable, so the update_cli meson test drives
+    the REAL built binary through every mode against a local test server
+    (manifest + releases/latest redirect + asset zip, isolated HOME) -
+    including the full confirmed install, the install refusal without --yes,
+    and the old binary archived by rename (never deleted).
+
+    Pins: the misrc_gui.c flags + runner + confirmation gate, the gui_updater
+    manifest-source load (URL/file) + the loopback-http-only test carve-out,
+    the update_cli test's assertions, the meson wiring (the captured
+    misrc_gui_exe + test('update_cli')), and the README documentation.
+    """
+    gui_c_path = repo_root / "misrc_tools" / "misrc_gui" / "core" / "misrc_gui.c"
+    updater_h = repo_root / "misrc_tools" / "misrc_gui" / "core" / "gui_updater.h"
+    updater_c = repo_root / "misrc_tools" / "misrc_gui" / "core" / "gui_updater.c"
+    update_cli_test = repo_root / "misrc_tools" / "test" / "update_cli_test.py"
+    meson_path = repo_root / "misrc_tools" / "meson.build"
+    readme_path = repo_root / "README.md"
+
+    for path, label in [
+        (gui_c_path, "misrc_gui.c"),
+        (updater_h, "gui_updater.h"),
+        (updater_c, "gui_updater.c"),
+        (update_cli_test, "update_cli_test.py"),
+        (meson_path, "meson.build"),
+        (readme_path, "README.md"),
+    ]:
+        if not path.exists():
+            return fail(f"Missing {label}: {path}")
+
+    gui_text = read_text(gui_c_path)
+    for snippet, label in [
+        ("--check-update", "the check flag"),
+        ("--update-dry-run", "the dry-run flag"),
+        ("--install-update", "the install flag"),
+        ("--update-manifest", "the manifest source override flag"),
+        ("--yes", "the install confirmation flag"),
+        ("gui_run_update_cli", "the headless update runner"),
+        ("gui_updater_load_manifest_from", "the manifest source load"),
+        ("update_available: ", "the update_available output key"),
+        ("--install-update requires --yes", "the install confirmation gate"),
+    ]:
+        if snippet not in gui_text:
+            return fail(f"misrc_gui.c headless update CLI missing {label}: {snippet}")
+
+    for snippet, label in [
+        ("gui_updater_load_manifest_from", "the manifest-source load declaration"),
+    ]:
+        if snippet not in read_text(updater_h):
+            return fail(f"gui_updater.h missing {label}: {snippet}")
+
+    updater_text = read_text(updater_c)
+    for snippet, label in [
+        ("gui_updater_load_manifest_from", "the manifest-source load implementation"),
+        ("127.0.0.1", "the loopback-http-only test carve-out"),
+    ]:
+        if snippet not in updater_text:
+            return fail(f"gui_updater.c missing {label}: {snippet}")
+
+    test_text = read_text(update_cli_test)
+    for snippet, label in [
+        ("--check-update", "the check mode"),
+        ("--update-dry-run", "the dry-run mode"),
+        ("--install-update", "the install mode"),
+        ("--yes", "the confirmation flag"),
+        ("--update-manifest", "the manifest override"),
+        ("releases/latest", "the tag redirect endpoint"),
+        ('out["install"] == "ok"', "the install success assertion"),
+        ("archived-", "the archive rename assertion"),
+        ("never deleted", "the archive-not-delete assertion"),
+    ]:
+        if snippet not in test_text:
+            return fail(f"update_cli_test.py missing {label}: {snippet}")
+
+    meson_text = read_text(meson_path)
+    for snippet, label in [
+        ("test('update_cli'", "the update_cli meson test registration"),
+        ("misrc_gui_exe = executable('misrc_gui'", "the captured misrc_gui exe the test drives"),
+    ]:
+        if snippet not in meson_text:
+            return fail(f"misrc_tools/meson.build missing {label}: {snippet}")
+
+    readme_text = read_text(readme_path)
+    for snippet, label in [
+        ("Headless update mode", "the README section"),
+        ("--check-update", "the README check flag doc"),
+        ("--install-update", "the README install flag doc"),
+    ]:
+        if snippet not in readme_text:
+            return fail(f"README.md missing {label}: {snippet}")
+    return 0
+
+
 def check_release_version_resolution_contract(repo_root: Path, workflow_path: Path) -> int:
     """Assert release-context CI runs resolve the tag (never a dev string) and
     that a release can never ship a dev-named artifact under the tag.
@@ -2948,6 +3045,7 @@ def main() -> int:
         ("Android packaging assertions", lambda: check_android_packaging_assertions(workflow_path)),
         ("release artifact naming contract", lambda: check_release_artifact_naming_contract(repo_root, workflow_path)),
         ("release download link contract", lambda: check_release_download_link_contract(repo_root, workflow_path)),
+        ("update CLI contract", lambda: check_update_cli_contract(repo_root)),
         ("release version resolution contract", lambda: check_release_version_resolution_contract(repo_root, workflow_path)),
         ("build workflow entrypoint contract", lambda: check_build_workflow_entrypoint_contract(workflow_path)),
         ("legacy release-sanity workflow removed", lambda: check_no_legacy_release_sanity_workflow(legacy_workflow_path)),
