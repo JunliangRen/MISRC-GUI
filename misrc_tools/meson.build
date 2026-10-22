@@ -555,6 +555,9 @@ if raylib_dep.found()
     # DefWindowProc's modal loop blocked raylib's event poll)
     sources_gui += 'misrc_gui/core/gui_win32_modal.c'
     gui_ldflags += ['-lmf', '-lmfplat', '-lmfuuid', '-lmfreadwrite', '-lole32', '-lavrt', '-lksuser', '-luuid', '-lshell32']
+    # oleaut32 for the cxadc-win WMI config path in gui_cxadc.c
+    # (VariantClear/SysFreeString on the ROOT\WMI IWbemServices calls)
+    gui_ldflags += ['-loleaut32']
   elif host_system == 'linux'
     gui_ldflags += ['-lGL', '-lm', '-lpthread', '-ldl', '-lrt', '-lX11']
     sources_gui += 'misrc_capture/simple_capture/simple_capture_v4l2.c'

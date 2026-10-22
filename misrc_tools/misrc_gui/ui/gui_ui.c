@@ -8585,6 +8585,18 @@ void gui_handle_interactions(gui_app_t *app) {
         if (atomic_exchange(&app->cxadc_perm_help_pending, false)) {
             gui_dropdown_close_all();
             gui_ui_clear_text_edit();
+#if defined(_WIN32)
+            // cxadc-win driver: the 10-bit toggle is a WMI config write
+            // (CxadcWin_Config.EnableTenbit). Windows denies that write for
+            // non-admin users; re-running elevated lets it through.
+            gui_popup_info("CXADC 10-bit mode needs elevation",
+                "10-bit mode requires a config write to the cxadc-win driver\n"
+                "(WMI CxadcWin_Config), which Windows denied for this user.\n"
+                "Capture fell back to 8-bit.\n\n"
+                "Close and re-run MISRC GUI as Administrator\n"
+                "(right-click -> Run as administrator), then re-enable 10-bit.\n\n"
+                "8-bit capture needs no elevation and still works.");
+#else
             gui_popup_info("CXADC 10-bit mode needs one-time setup",
                 "10-bit mode requires write access to the cxadc sysfs parameters,\n"
                 "which are root-only by default. Capture fell back to 8-bit.\n\n"
@@ -8593,6 +8605,7 @@ void gui_handle_interactions(gui_app_t *app) {
                 "  sudo chmod g+w   /sys/class/cxadc/cxadc*/device/parameters/*\n"
                 "  sudo usermod -aG video $USER   (then log out/in)\n\n"
                 "8-bit capture needs no setup and still works.");
+#endif
         } else if (atomic_exchange(&app->cxadc_open_perm_help_pending, false)) {
             gui_dropdown_close_all();
             gui_ui_clear_text_edit();
@@ -9523,7 +9536,11 @@ void gui_handle_interactions(gui_app_t *app) {
                 int current_raw = 0;
                 if (gui_cxadc_get_center_offset(card_idx, &current_raw) != 0) {
                     if (errno == EACCES || errno == EPERM) {
+#if defined(_WIN32)
+                        gui_app_set_status(app, "CXADC DC-offset write denied - re-run as administrator");
+#else
                         gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
+#endif
                     } else {
                         gui_app_set_status(app, "Failed to read CXADC DC offset");
                     }
@@ -9539,8 +9556,9 @@ void gui_handle_interactions(gui_app_t *app) {
                 int delta = dc_down ? -dc_step : dc_step;
                 int target_relative = s_cxadc_dc_relative[card_idx] + delta;
                 int target_raw = s_cxadc_dc_anchor_raw[card_idx] + target_relative;
+                const int cxadc_dc_raw_max = gui_cxadc_center_offset_max();
                 if (target_raw < 0) target_raw = 0;
-                if (target_raw > 255) target_raw = 255;
+                if (target_raw > cxadc_dc_raw_max) target_raw = cxadc_dc_raw_max;
                 target_relative = target_raw - s_cxadc_dc_anchor_raw[card_idx];
 
                 if (gui_cxadc_set_center_offset(card_idx, target_raw) == 0) {
@@ -9550,7 +9568,11 @@ void gui_handle_interactions(gui_app_t *app) {
                     gui_app_set_status(app, msg);
                 } else {
                     if (errno == EACCES || errno == EPERM) {
+#if defined(_WIN32)
+                        gui_app_set_status(app, "CXADC DC-offset write denied - re-run as administrator");
+#else
                         gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
+#endif
                     } else {
                         gui_app_set_status(app, "Failed to update CXADC DC offset");
                     }
