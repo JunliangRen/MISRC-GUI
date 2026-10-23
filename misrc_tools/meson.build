@@ -515,6 +515,11 @@ if raylib_dep.found()
     '-ftree-vectorize',       # Enable auto-vectorization
     '-ffast-math',            # Fast floating-point (safe for video/audio processing)
   ]
+  # Keep rlgl.h and phosphor shader syntax consistent with the vendored raylib
+  # OpenGL 2.1 build on Linux ARM64. Other platforms retain their existing path.
+  if host_system == 'linux' and host_cpu_family == 'aarch64'
+    gui_cflags += ['-DGRAPHICS_API_OPENGL_21']
+  endif
 
   # GUI doesn't need all the ldflags_capture (e.g., onecore conflicts with raylib's CloseWindow)
   gui_ldflags = ldflags

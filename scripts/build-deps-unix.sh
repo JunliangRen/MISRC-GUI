@@ -31,6 +31,13 @@ case "$OS" in
 esac
 HOST_ARCH="${MACOS_ARCH:-$(uname -m)}"  # MACOS_ARCH overrides macOS build arch
 
+# Raspberry Pi 5/V3D and other Linux ARM64 targets need the OpenGL 2.1 path.
+# Keep OpenGL 3.3 for non-ARM Linux and macOS builds.
+RAYLIB_OPENGL_VERSION=3.3
+if [[ "$HOST_SYSTEM" == "linux" && ( "$HOST_ARCH" == "aarch64" || "$HOST_ARCH" == "arm64" ) ]]; then
+  RAYLIB_OPENGL_VERSION=2.1
+fi
+
 mkdir -p "$DEPS_PREFIX/lib/pkgconfig" "$DEPS_PREFIX/include" "$REPO_ROOT/.deps"
 
 require_tools() {
@@ -56,6 +63,7 @@ compute_stamp() {
   {
     echo "host=$HOST_SYSTEM arch=$HOST_ARCH"
     echo "raylib_tag=$RAYLIB_TAG"
+    echo "raylib_opengl_version=$RAYLIB_OPENGL_VERSION"
     if [[ -d "$HSDAOH_SOURCE_DIR/.git" ]]; then
       git -C "$HSDAOH_SOURCE_DIR" rev-parse HEAD 2>/dev/null || true
     fi
@@ -87,7 +95,7 @@ git config --global --add safe.directory "$HSDAOH_SOURCE_DIR" 2>/dev/null || tru
 git config --global --add safe.directory "$REPO_ROOT/.deps/raylib" 2>/dev/null || true
 
 HS_CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" -DINSTALL_UDEV_RULES=OFF)
-RAY_CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF -DBUILD_GAMES=OFF -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX")
+RAY_CMAKE_ARGS=(-DCMAKE_BUILD_TYPE=Release -DBUILD_EXAMPLES=OFF -DBUILD_GAMES=OFF -DOPENGL_VERSION="$RAYLIB_OPENGL_VERSION" -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX")
 if [[ "$HOST_SYSTEM" == "darwin" ]]; then
   BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
   FLAC_PREFIX="$(brew --prefix flac 2>/dev/null || echo "$BREW_PREFIX/opt/flac")"
