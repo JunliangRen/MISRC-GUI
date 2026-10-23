@@ -98,6 +98,24 @@ static void test_helpers(void)
 {
     char s[32];
 
+    snprintf(s, sizeof(s), "stale output");
+    assert(gui_updater_run_command(NULL, s, sizeof(s)) == -1);
+    assert(s[0] == '\0');
+#if defined(_WIN32)
+    assert(gui_updater_run_command("misrc-updater-nonexistent-tool.exe", s, sizeof(s)) == -1);
+    assert(s[0] == '\0');
+    assert(gui_updater_run_command("cmd.exe /d /c \"exit /b 7\"", NULL, 0) == 7);
+    HANDLE saved_error = GetStdHandle(STD_ERROR_HANDLE);
+    assert(SetStdHandle(STD_ERROR_HANDLE, (HANDLE)(UINT_PTR)1));
+    int no_error_handle = gui_updater_run_command("cmd.exe /d /c \"exit /b 7\"", NULL, 0);
+    assert(SetStdHandle(STD_ERROR_HANDLE, saved_error));
+    assert(no_error_handle == 7);
+    /* A short capture buffer must still drain output beyond the pipe capacity. */
+    assert(gui_updater_run_command(
+        "cmd.exe /d /c \"for /L %i in (1,1,1000) do @echo payload\"", s, 5) == 0);
+    assert(!strcmp(s, "payl"));
+#endif
+
     snprintf(s, sizeof(s), "  v1.2.6 \t\r\n");
     gui_updater_trim_ascii_whitespace_inplace(s);
     assert(!strcmp(s, "v1.2.6"));

@@ -806,6 +806,13 @@ if raylib_dep.found()
     )
     test('gui_rf_routes', rf_routes_test)
 
+    rf_geometry_test = executable('gui_rf_preview_geometry_test',
+      'test/gui_rf_preview_geometry_test.c',
+      c_args: cflags,
+      dependencies: [meson.get_compiler('c').find_library('m', required: false)],
+    )
+    test('gui_rf_preview_geometry', rf_geometry_test)
+
     # Synthetic baseband composite contracts for the ported CVBS profile +
     # VBI sync model + burst-locked colour (gui_cvbs.c included directly,
     # trigger_analyze_cvbs_levels links from gui_trigger.c; LTO drops UI paths).
@@ -951,6 +958,14 @@ rf_decoder_test = executable('gui_rf_preview_test',
   ['test/gui_rf_preview_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
 test('gui_rf_preview', rf_decoder_test, timeout: 120)
+rf_secam_test = executable('gui_rf_secam_test',
+  ['test/gui_rf_secam_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_rf_secam', rf_secam_test, timeout: 60)
+rf_mesecam_test = executable('gui_rf_mesecam_test',
+  ['test/gui_rf_mesecam_test.c', 'misrc_gui/signal/gui_rf_preview.c'],
+  dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)
+test('gui_rf_mesecam', rf_mesecam_test, timeout: 180)
 rf_resampler_test = executable('gui_rf_resampler_test',
   ['test/gui_rf_resampler_test.c', 'misrc_gui/signal/gui_rf_resampler.c'],
   dependencies: rf_test_deps, c_args: rf_test_cflags, link_args: ldflags)

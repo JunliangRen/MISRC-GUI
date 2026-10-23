@@ -3,6 +3,7 @@
  * Raylib resources and the front RGBA copy belong exclusively to the UI.
  */
 #include "gui_vhs_fm.h"
+#include "gui_rf_preview_geometry.h"
 #include "../visualization/gui_text.h"
 #include "../ui/gui_ui.h"
 #include <stdlib.h>
@@ -61,16 +62,25 @@ void gui_vhs_fm_reset(vhs_fm_decoder_t *decoder) {
 }
 void gui_vhs_fm_set_format(vhs_fm_decoder_t *decoder, int format_select) {
     if (!decoder) return;
-    decoder->overlay.selected_system = decoder->overlay.selected_tape ? 1 : format_select == 1;
-    decoder->format = decoder->overlay.selected_system ? VHS_FM_FORMAT_NTSC : VHS_FM_FORMAT_PAL;
+    int system = format_select >= 0 && format_select <= 2 ? format_select : 0;
+    decoder->overlay.selected_system = decoder->overlay.selected_tape ? 1 : system;
+    decoder->format = gui_vhs_fm_get_format(decoder);
     // The UI route update rebinds this subscriber; other subscribers keep their system.
+}
+void gui_vhs_fm_set_mesecam(vhs_fm_decoder_t *decoder, bool enabled) {
+    if (!decoder) return;
+    decoder->overlay.secam_mesecam = enabled;
+    decoder->format = gui_vhs_fm_get_format(decoder);
+    // Only SECAM VHS uses this option; keep the remembered value on other systems.
 }
 gui_rf_profile_t gui_vhs_fm_get_profile(const vhs_fm_decoder_t *decoder) {
     if (decoder && decoder->overlay.selected_tape == 1 && decoder->overlay.beta_super)
         return decoder->overlay.beta_hifi ? GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI : GUI_RF_PROFILE_NTSC_SUPERBETA;
     if (decoder && decoder->overlay.selected_tape == 1)
         return decoder->overlay.beta_hifi ? GUI_RF_PROFILE_NTSC_BETAMAX_HIFI : GUI_RF_PROFILE_NTSC_BETAMAX;
-    return decoder && decoder->overlay.selected_system ? GUI_RF_PROFILE_NTSC_VHS : GUI_RF_PROFILE_PAL_VHS;
+    if (decoder && decoder->overlay.selected_system == 2)
+        return decoder->overlay.secam_mesecam ? GUI_RF_PROFILE_MESECAM_VHS : GUI_RF_PROFILE_SECAM_VHS;
+    return decoder && decoder->overlay.selected_system == 1 ? GUI_RF_PROFILE_NTSC_VHS : GUI_RF_PROFILE_PAL_VHS;
 }
 void gui_vhs_fm_set_frame_mode(vhs_fm_decoder_t *decoder, int mode_select) {
     if (!decoder) return;
@@ -81,10 +91,17 @@ void gui_vhs_fm_set_frame_mode(vhs_fm_decoder_t *decoder, int mode_select) {
     }
 }
 vhs_fm_format_t gui_vhs_fm_get_format(vhs_fm_decoder_t *decoder) {
-    return decoder ? decoder->format : VHS_FM_FORMAT_UNKNOWN;
+    if (!decoder) return VHS_FM_FORMAT_UNKNOWN;
+    gui_rf_profile_t profile = gui_vhs_fm_get_profile(decoder);
+    return profile == GUI_RF_PROFILE_MESECAM_VHS ? VHS_FM_FORMAT_MESECAM
+        : profile == GUI_RF_PROFILE_SECAM_VHS ? VHS_FM_FORMAT_SECAM
+        : profile == GUI_RF_PROFILE_PAL_VHS ? VHS_FM_FORMAT_PAL : VHS_FM_FORMAT_NTSC;
 }
 const char *gui_vhs_fm_get_format_name(vhs_fm_decoder_t *decoder) {
-    return gui_vhs_fm_get_format(decoder) == VHS_FM_FORMAT_NTSC ? "NTSC" : "PAL";
+    vhs_fm_format_t format = gui_vhs_fm_get_format(decoder);
+    return format == VHS_FM_FORMAT_MESECAM ? "MESECAM"
+        : format == VHS_FM_FORMAT_SECAM ? "SECAM"
+        : format == VHS_FM_FORMAT_NTSC ? "NTSC" : "PAL";
 }
 void gui_vhs_fm_swap_buffers(vhs_fm_decoder_t *decoder) {
     if (!decoder || !decoder->worker) return;
@@ -143,19 +160,13 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
             decoder->displayed_generation = decoder->generation;
             decoder->displayed_frames++;
         }
-        /* Draw the frame at its own aspect: Active mode is exactly 4:3
-         * (768x576 PAL / 640x480 NTSC); Full mode includes the whole
-         * vertical blanking interval and is slightly taller (768x626 /
-         * 640x526), so a hardcoded 0.75 would squash it. Before the first
-         * frame (or on an invalid size) fall back to 4:3. */
-        float frame_aspect = (decoder->width > 0 && decoder->height > 0)
-            ? (float)decoder->height / (float)decoder->width : 0.75f;
-        if (!(frame_aspect > 0.05f)) frame_aspect = 0.75f;
-        float draw_w = width, draw_h = width * frame_aspect;
-        if (draw_h > height) { draw_h = height; draw_w = height / frame_aspect; }
+        /* Full widens the sampled horizontal window as well as adding VBI.
+         * Correct its display pixels so the active picture keeps its shape. */
+        gui_rf_preview_rect_t frame = gui_rf_preview_fit_frame(
+            decoder->width, decoder->height, x, y, width, height);
         DrawTexturePro(decoder->texture,
                        (Rectangle){0, 0, (float)decoder->width, (float)decoder->height},
-                       (Rectangle){x + (width-draw_w)*0.5f, y + (height-draw_h)*0.5f, draw_w, draw_h},
+                       (Rectangle){frame.x, frame.y, frame.width, frame.height},
                        (Vector2){0, 0}, 0, WHITE);
     }
     uint64_t now = get_time_ms();

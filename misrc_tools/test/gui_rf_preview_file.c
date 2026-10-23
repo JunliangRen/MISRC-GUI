@@ -98,10 +98,10 @@ int main(int argc, char **argv) {
     double seconds_cap = 0.0, budget = 0.0;
     const char *audio_path = NULL;
     if (argc < 5 ||
-        (strcmp(argv[3], "pal") != 0 && strcmp(argv[3], "ntsc") != 0 &&
+        (strcmp(argv[3], "pal") != 0 && strcmp(argv[3], "ntsc") != 0 && strcmp(argv[3], "secam") != 0 && strcmp(argv[3], "mesecam") != 0 &&
          strcmp(argv[3], "ntsc-beta") != 0 && strcmp(argv[3], "ntsc-beta-hifi") != 0 &&
          strcmp(argv[3], "ntsc-superbeta") != 0 && strcmp(argv[3], "ntsc-superbeta-hifi") != 0)) {
-        fprintf(stderr, "Usage: %s input.s16le sample_rate_hz pal|ntsc|ntsc-beta|ntsc-beta-hifi|ntsc-superbeta|ntsc-superbeta-hifi output.ppm"
+        fprintf(stderr, "Usage: %s input.s16le sample_rate_hz pal|ntsc|secam|mesecam|ntsc-beta|ntsc-beta-hifi|ntsc-superbeta|ntsc-superbeta-hifi output.ppm"
                         " [--max|--realtime] [--full] [output.wav] [seconds_cap] [realtime_budget_cores]\n", argv[0]);
         return 1;
     }
@@ -141,6 +141,8 @@ int main(int argc, char **argv) {
     }
     uint32_t rate = (uint32_t)parsed_rate;
     gui_rf_profile_t profile = strcmp(argv[3],"pal")==0 ? GUI_RF_PROFILE_PAL_VHS :
+        strcmp(argv[3],"secam")==0 ? GUI_RF_PROFILE_SECAM_VHS :
+        strcmp(argv[3],"mesecam")==0 ? GUI_RF_PROFILE_MESECAM_VHS :
         strcmp(argv[3],"ntsc-beta")==0 ? GUI_RF_PROFILE_NTSC_BETAMAX :
         strcmp(argv[3],"ntsc-beta-hifi")==0 ? GUI_RF_PROFILE_NTSC_BETAMAX_HIFI :
         strcmp(argv[3],"ntsc-superbeta")==0 ? GUI_RF_PROFILE_NTSC_SUPERBETA :

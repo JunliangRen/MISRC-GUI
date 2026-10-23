@@ -1082,7 +1082,9 @@ static void run_full_frame_format(gui_rf_profile_t profile) {
 }
 
 static void run_full_frame_contracts(void) {
-    for (int profile=GUI_RF_PROFILE_PAL_VHS;profile<GUI_RF_PROFILE_COUNT;++profile)
+    /* This QAM fixture models PAL/NTSC VHS and Beta only. Native SECAM's
+     * independent FM oracle covers its Active/Full geometry separately. */
+    for (int profile=GUI_RF_PROFILE_PAL_VHS;profile<=GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;++profile)
         run_full_frame_format((gui_rf_profile_t)profile);
 }
 
