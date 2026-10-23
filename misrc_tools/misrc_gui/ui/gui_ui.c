@@ -26,6 +26,7 @@
 #include "../output/gui_record.h"
 #include "../input/gui_capture.h" // Support hsdoah-rp2350 Error & stats
 #include "../net/gui_net.h"
+#include "../core/gui_updater.h" // Manifest-driven updater: releases page + auto-patch manifest + confirmed self-update
 #include "version.h"
 #include "../visualization/gui_custom_elements.h"
 #include "../../common/buffer_manager.h"
@@ -715,14 +716,19 @@ static double s_record_limit_deadline_s = 0.0;
 #if defined(__ANDROID__)
 static bool s_android_keyboard_visible = false;
 #endif
-// Update checker (GitHub release tag lookup).
+// Update checker (manifest-driven; see core/gui_updater.h): the releases
+// PAGE button can never 404, the auto-patch manifest fixes asset naming for
+// every installed binary without a new release, and confirmed self-update
+// archives the old binary (rename, never delete).
 #define GUI_UI_UPDATE_CHECK_INTERVAL_SECONDS (7ULL * 24ULL * 60ULL * 60ULL)
-#define GUI_UI_RELEASES_LATEST_URL "https://github.com/harrypm/MISRC-GUI/releases/latest"
-#define GUI_UI_RELEASES_DOWNLOAD_BASE_URL "https://github.com/harrypm/MISRC-GUI/releases/download"
 #define VERSION_INFO_NET_DISCOVERY_MAX_ROWS 6
 
 typedef struct {
-    bool manual;
+    bool manual;   // update-check task
+    bool install;  // confirmed self-update install task (fields below)
+    char asset_url[GUI_UPDATER_URL_MAX];
+    char asset_name[192];
+    char current_version[64];
 } gui_ui_update_check_task_t;
 
 static thrd_t s_update_check_thread;
@@ -731,233 +737,18 @@ static atomic_bool s_update_check_running = false;
 static atomic_bool s_update_check_result_pending = false;
 static bool s_update_check_result_manual = false;
 static bool s_update_check_result_success = false;
+static bool s_update_check_result_install = false;      // result is an install result
+static bool s_update_check_result_install_ok = false;
 static char s_update_check_result_tag[64] = {0};
 static char s_update_check_result_error[160] = {0};
-
-static void gui_ui_trim_ascii_whitespace_inplace(char *s)
-{
-    if (!s) return;
-    size_t len = strlen(s);
-    while (len > 0 && isspace((unsigned char)s[len - 1])) {
-        s[--len] = '\0';
-    }
-    char *start = s;
-    while (*start && isspace((unsigned char)*start)) {
-        start++;
-    }
-    if (start != s) {
-        memmove(s, start, strlen(start) + 1);
-    }
-}
-
-static bool gui_ui_ci_starts_with(const char *value, const char *prefix)
-{
-    if (!value || !prefix) return false;
-    while (*prefix) {
-        if (!*value) return false;
-        if (tolower((unsigned char)*value) != tolower((unsigned char)*prefix)) {
-            return false;
-        }
-        value++;
-        prefix++;
-    }
-    return true;
-}
-
-static bool gui_ui_extract_release_tag_from_url(const char *url, char *tag_out, size_t tag_out_len)
-{
-    if (!url || !tag_out || tag_out_len == 0) return false;
-    tag_out[0] = '\0';
-    const char *marker = "/releases/tag/";
-    const char *start = strstr(url, marker);
-    if (!start) return false;
-    start += strlen(marker);
-    if (*start == '\0') return false;
-
-    size_t i = 0;
-    while (start[i] &&
-           !isspace((unsigned char)start[i]) &&
-           start[i] != '?' &&
-           start[i] != '#' &&
-           start[i] != '/') {
-        if (i + 1 >= tag_out_len) break;
-        tag_out[i] = start[i];
-        i++;
-    }
-    tag_out[i] = '\0';
-    return (i > 0);
-}
-
-static bool gui_ui_parse_semver_triplet(const char *version, int *major_out, int *minor_out, int *patch_out)
-{
-    if (!version || !major_out || !minor_out || !patch_out) return false;
-    const char *p = version;
-    if (*p == 'v' || *p == 'V') p++;
-    if (!isdigit((unsigned char)*p)) return false;
-
-    char *end = NULL;
-    long major = strtol(p, &end, 10);
-    if (!end || end == p || *end != '.') return false;
-    p = end + 1;
-    if (!isdigit((unsigned char)*p)) return false;
-
-    long minor = strtol(p, &end, 10);
-    if (!end || end == p || *end != '.') return false;
-    p = end + 1;
-    if (!isdigit((unsigned char)*p)) return false;
-
-    long patch = strtol(p, &end, 10);
-    if (!end || end == p) return false;
-
-    *major_out = (int)major;
-    *minor_out = (int)minor;
-    *patch_out = (int)patch;
-    return true;
-}
-
-static bool gui_ui_is_release_tag_safe(const char *tag)
-{
-    if (!tag || !tag[0]) return false;
-    const unsigned char *p = (const unsigned char *)tag;
-    while (*p) {
-        if (!(isalnum(*p) || *p == '.' || *p == '-' || *p == '_')) {
-            return false;
-        }
-        p++;
-    }
-    return true;
-}
-
-static int gui_ui_compare_versions(const char *current_version, const char *latest_version)
-{
-    int cmaj = 0, cmin = 0, cpat = 0;
-    int lmaj = 0, lmin = 0, lpat = 0;
-    bool current_ok = gui_ui_parse_semver_triplet(current_version, &cmaj, &cmin, &cpat);
-    bool latest_ok = gui_ui_parse_semver_triplet(latest_version, &lmaj, &lmin, &lpat);
-    if (current_ok && latest_ok) {
-        if (cmaj != lmaj) return (cmaj < lmaj) ? -1 : 1;
-        if (cmin != lmin) return (cmin < lmin) ? -1 : 1;
-        if (cpat != lpat) return (cpat < lpat) ? -1 : 1;
-        return 0;
-    }
-    int text_cmp = strcmp(current_version ? current_version : "",
-                          latest_version ? latest_version : "");
-    if (text_cmp < 0) return -1;
-    if (text_cmp > 0) return 1;
-    return 0;
-}
-
-static bool gui_ui_fetch_latest_release_tag(char *tag_out, size_t tag_out_len, char *error_out, size_t error_out_len)
-{
-    if (!tag_out || tag_out_len == 0 || !error_out || error_out_len == 0) return false;
-    tag_out[0] = '\0';
-    error_out[0] = '\0';
-
-#if defined(_WIN32)
-    const char *cmd = "curl.exe -fsSI --max-time 10 " GUI_UI_RELEASES_LATEST_URL;
-    FILE *fp = _popen(cmd, "r");
-#else
-    const char *cmd = "curl -fsSI --max-time 10 " GUI_UI_RELEASES_LATEST_URL;
-    FILE *fp = popen(cmd, "r");
-#endif
-    if (!fp) {
-        snprintf(error_out, error_out_len, "unable to launch curl");
-        return false;
-    }
-
-    char line[512];
-    char location[512] = {0};
-    while (fgets(line, sizeof(line), fp)) {
-        gui_ui_trim_ascii_whitespace_inplace(line);
-        if (line[0] == '\0') continue;
-        if (gui_ui_ci_starts_with(line, "location:")) {
-            const char *value = line + 9;
-            while (*value && isspace((unsigned char)*value)) value++;
-            snprintf(location, sizeof(location), "%s", value);
-        }
-    }
-
-#if defined(_WIN32)
-    int rc = _pclose(fp);
-#else
-    int rc = pclose(fp);
-#endif
-
-    if (location[0] == '\0') {
-        if (rc != 0) {
-            snprintf(error_out, error_out_len, "curl request failed");
-        } else {
-            snprintf(error_out, error_out_len, "latest release redirect header missing");
-        }
-        return false;
-    }
-
-    if (!gui_ui_extract_release_tag_from_url(location, tag_out, tag_out_len)) {
-        snprintf(error_out, error_out_len, "unable to parse release tag");
-        return false;
-    }
-    return true;
-}
-
-static bool gui_ui_build_release_asset_filename_for_platform(const char *release_tag,
-                                                             char *filename_out,
-                                                             size_t filename_out_len)
-{
-    if (!release_tag || !filename_out || filename_out_len == 0) return false;
-    filename_out[0] = '\0';
-    if (!gui_ui_is_release_tag_safe(release_tag)) return false;
-
-#if defined(__ANDROID__)
-    const char *pattern = "Android_MISRC_GUI_%s_arm64.apk";
-#elif defined(__APPLE__)
-    const char *pattern = "macOS_MISRC_GUI_%s_universal.dmg";
-#elif defined(_WIN32)
-#if defined(_M_ARM64) || defined(__aarch64__) || defined(__arm64__)
-    const char *pattern = "Windows_MISRC_GUI_%s_arm64.zip";
-#else
-    const char *pattern = "Windows_MISRC_GUI_%s_x86.zip";
-#endif
-#elif defined(__linux__)
-#if defined(__aarch64__) || defined(__arm64__)
-    const char *pattern = "Linux_MISRC_GUI_%s_arm64.zip";
-#else
-    const char *pattern = "Linux_MISRC_GUI_%s_x86.zip";
-#endif
-#else
-    return false;
-#endif
-
-    int written = snprintf(filename_out, filename_out_len, pattern, release_tag);
-    return (written > 0) && ((size_t)written < filename_out_len);
-}
-
-static bool gui_ui_build_release_asset_url_for_platform(const char *release_tag,
-                                                        char *url_out,
-                                                        size_t url_out_len,
-                                                        char *asset_out,
-                                                        size_t asset_out_len)
-{
-    if (!url_out || url_out_len == 0) return false;
-    url_out[0] = '\0';
-    if (asset_out && asset_out_len > 0) asset_out[0] = '\0';
-
-    char asset[160];
-    if (!gui_ui_build_release_asset_filename_for_platform(release_tag, asset, sizeof(asset))) {
-        return false;
-    }
-    int written = snprintf(url_out,
-                           url_out_len,
-                           GUI_UI_RELEASES_DOWNLOAD_BASE_URL "/%s/%s",
-                           release_tag,
-                           asset);
-    if (written <= 0 || (size_t)written >= url_out_len) {
-        return false;
-    }
-    if (asset_out && asset_out_len > 0) {
-        snprintf(asset_out, asset_out_len, "%s", asset);
-    }
-    return true;
-}
+static char s_update_check_result_message[GUI_UPDATER_STATUS_MAX] = {0};
+static gui_updater_manifest_t s_update_check_result_manifest; // worker writes, UI thread reads after pending
+static bool s_update_check_result_manifest_ok = false;
+// Last auto-patch manifest successfully fetched by a check (UI thread only).
+static gui_updater_manifest_t s_update_manifest;
+static bool s_update_manifest_ok = false;
+// Two-click confirmation state for the Install button (UI thread only).
+static bool s_update_install_armed = false;
 
 static bool gui_ui_open_url_external(const char *url, char *error_out, size_t error_out_len)
 {
@@ -998,11 +789,47 @@ static int gui_ui_update_check_thread_main(void *arg_ptr)
         free(arg_ptr);
     }
 
+    if (task.install) {
+        // Confirmed self-update install: download the asset, archive the old
+        // binary (rename, never delete), move the new one into place.
+        char status_text[GUI_UPDATER_STATUS_MAX] = {0};
+        char archive_path[GUI_UPDATER_PATH_MAX] = {0};
+        bool install_ok = gui_updater_install_asset(task.asset_url,
+                                                     task.asset_name,
+                                                     task.current_version,
+                                                     status_text, sizeof(status_text),
+                                                     archive_path, sizeof(archive_path));
+        s_update_check_result_manual = false;
+        s_update_check_result_install = true;
+        s_update_check_result_install_ok = install_ok;
+        s_update_check_result_success = install_ok;
+        s_update_check_result_tag[0] = '\0';
+        s_update_check_result_error[0] = '\0';
+        snprintf(s_update_check_result_message, sizeof(s_update_check_result_message), "%s",
+                 status_text[0] ? status_text : (install_ok ? "update installed" : "update install failed"));
+        atomic_store_explicit(&s_update_check_result_pending, true, memory_order_release);
+        atomic_store_explicit(&s_update_check_running, false, memory_order_release);
+        return 0;
+    }
+
+    // Check task: fetch the auto-patch manifest first (it defines the tag
+    // lookup URL + asset naming), then resolve the latest tag through it.
+    // Manifest unreachable: still check the tag via the compiled-in default
+    // lookup so "Update available" keeps working (self-update stays off).
+    gui_updater_manifest_t manifest = {0};
+    char manifest_error[GUI_UPDATER_ERROR_MAX] = {0};
+    bool manifest_ok = gui_updater_fetch_manifest(&manifest, manifest_error, sizeof(manifest_error));
+
     char latest_tag[64] = {0};
     char error_text[160] = {0};
-    bool ok = gui_ui_fetch_latest_release_tag(latest_tag, sizeof(latest_tag), error_text, sizeof(error_text));
+    bool ok = gui_updater_fetch_latest_release_tag(manifest_ok ? manifest.tag_lookup_url : NULL,
+                                                   latest_tag, sizeof(latest_tag),
+                                                   error_text, sizeof(error_text));
 
     s_update_check_result_manual = task.manual;
+    s_update_check_result_install = false;
+    s_update_check_result_install_ok = false;
+    s_update_check_result_message[0] = '\0';
     s_update_check_result_success = ok;
     if (ok) {
         snprintf(s_update_check_result_tag, sizeof(s_update_check_result_tag), "%s", latest_tag);
@@ -1012,14 +839,19 @@ static int gui_ui_update_check_thread_main(void *arg_ptr)
         snprintf(s_update_check_result_error, sizeof(s_update_check_result_error), "%s",
                  error_text[0] ? error_text : "unknown error");
     }
+    s_update_check_result_manifest_ok = manifest_ok;
+    s_update_check_result_manifest = manifest;
 
     atomic_store_explicit(&s_update_check_result_pending, true, memory_order_release);
     atomic_store_explicit(&s_update_check_running, false, memory_order_release);
     return 0;
 }
 
-static bool gui_ui_start_update_check(bool manual)
+static bool gui_ui_start_update_task(const gui_ui_update_check_task_t *task_in)
 {
+    if (!task_in) {
+        return false;
+    }
     if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
         return false;
     }
@@ -1030,7 +862,7 @@ static bool gui_ui_start_update_check(bool manual)
     if (!task) {
         return false;
     }
-    task->manual = manual;
+    *task = *task_in;
 
     atomic_store_explicit(&s_update_check_running, true, memory_order_release);
     if (thrd_create_with_priority(&s_update_check_thread,
@@ -1043,6 +875,17 @@ static bool gui_ui_start_update_check(bool manual)
     }
     s_update_check_thread_started = true;
     return true;
+}
+
+static bool gui_ui_start_update_check(bool manual)
+{
+    gui_ui_update_check_task_t task = {0};
+    task.manual = manual;
+    if (gui_ui_start_update_task(&task)) {
+        s_update_install_armed = false; // a fresh check re-validates what to install
+        return true;
+    }
+    return false;
 }
 
 static void gui_ui_join_update_check_thread_if_needed(void)
@@ -1062,17 +905,36 @@ static void gui_ui_process_update_check_result(gui_app_t *app)
     uint64_t now_s = (uint64_t)time(NULL);
     app->settings.update_last_check_unix_s = now_s;
 
+    // Install result: the running process is still the old version until
+    // restart; surface the installer's own status message (includes the
+    // archive path on success / the kept download path on failure).
+    if (s_update_check_result_install) {
+        s_update_install_armed = false;
+        if (s_update_check_result_message[0]) {
+            gui_app_set_status(app, s_update_check_result_message);
+        }
+        return;
+    }
+
+    // Check result: adopt the auto-patch manifest (drives the releases page
+    // URL + self-update asset naming) and drop any stale install-armed state.
+    if (s_update_check_result_manifest_ok) {
+        s_update_manifest = s_update_check_result_manifest;
+        s_update_manifest_ok = true;
+    }
+    s_update_install_armed = false;
+
     if (s_update_check_result_success) {
         snprintf(app->settings.update_last_release_tag,
                  sizeof(app->settings.update_last_release_tag),
                  "%s",
                  s_update_check_result_tag);
-        int cmp = gui_ui_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
+        int cmp = gui_updater_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
         app->settings.update_available_cached = (cmp < 0);
         gui_settings_save(&app->settings);
 
         if (s_update_check_result_manual) {
-            char msg[196];
+            char msg[240];
             if (cmp < 0) {
                 snprintf(msg, sizeof(msg), "Update available: %s (current %s)",
                          app->settings.update_last_release_tag, MIRSC_TOOLS_VERSION);
@@ -1082,6 +944,10 @@ static void gui_ui_process_update_check_result(gui_app_t *app)
             } else {
                 snprintf(msg, sizeof(msg), "Running newer build than release %s",
                          app->settings.update_last_release_tag);
+            }
+            if (!s_update_check_result_manifest_ok) {
+                size_t len = strlen(msg);
+                snprintf(msg + len, sizeof(msg) - len, " [self-update offline]");
             }
             gui_app_set_status(app, msg);
         } else if (app->settings.update_available_cached) {
@@ -4361,7 +4227,7 @@ static void render_version_info_window(gui_app_t *app)
     if (update_check_running) {
         snprintf(vi_update_status, sizeof(vi_update_status), "Checking...");
     } else if (app->settings.update_last_release_tag[0]) {
-        int update_cmp = gui_ui_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
+        int update_cmp = gui_updater_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
         if (update_cmp < 0) {
             snprintf(vi_update_status, sizeof(vi_update_status), "Available: %s", app->settings.update_last_release_tag);
             update_status_color = COLOR_METER_YELLOW;
@@ -4374,10 +4240,33 @@ static void render_version_info_window(gui_app_t *app)
     } else {
         snprintf(vi_update_status, sizeof(vi_update_status), "Not checked yet");
     }
-    Color update_download_btn_bg = update_check_running ? ui_disabled_color(COLOR_BUTTON)
-                                                        : COLOR_BUTTON;
-    Color update_download_btn_fg = update_check_running ? ui_disabled_color(COLOR_TEXT)
-                                                        : COLOR_TEXT;
+    // Releases Page button: opens the releases PAGE (never a per-platform
+    // asset URL that can 404). Always available.
+    Color update_page_btn_bg = COLOR_BUTTON;
+    Color update_page_btn_fg = COLOR_TEXT;
+    // Install button: shown only once a check found a newer release; blocked
+    // (click explains why) while a check runs, while capturing/recording, or
+    // without a manifest. Two-click confirm: first click arms, second runs.
+    bool update_install_available =
+        !update_check_running &&
+        app->settings.update_last_release_tag[0] &&
+        (gui_updater_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag) < 0);
+    bool update_install_blocked = update_check_running ||
+                                  app->is_capturing || app->is_recording ||
+                                  !s_update_manifest_ok;
+    Color update_install_btn_bg = (update_install_available && !update_install_blocked)
+                                      ? COLOR_BUTTON
+                                      : ui_disabled_color(COLOR_BUTTON);
+    Color update_install_btn_fg = (update_install_available && !update_install_blocked)
+                                      ? COLOR_TEXT
+                                      : ui_disabled_color(COLOR_TEXT);
+    char update_install_label[48];
+    if (s_update_install_armed) {
+        snprintf(update_install_label, sizeof(update_install_label), "Confirm install");
+    } else {
+        snprintf(update_install_label, sizeof(update_install_label), "Install %s",
+                 app->settings.update_last_release_tag);
+    }
     bool ab_swap_cxadc = gui_ui_selected_device_is_cxadc(app, NULL);
 #ifdef ENABLE_FX3
     bool ab_swap_fx3 = gui_ui_selected_device_is_fx3(app);
@@ -4502,16 +4391,53 @@ static void render_version_info_window(gui_app_t *app)
                 CLAY_TEXT(make_string(vi_update_status),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_status_color) }));
             }
-            CLAY(CLAY_ID("VersionInfoDownloadButton"), {
+            CLAY(CLAY_ID("VersionInfoReleasesPageButton"), {
                 .layout = {
                     .sizing = { CLAY_SIZING_FIXED(120), CLAY_SIZING_FIXED(24) },
                     .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
                 },
-                .backgroundColor = to_clay_color(update_download_btn_bg),
+                .backgroundColor = to_clay_color(update_page_btn_bg),
                 .cornerRadius = CLAY_CORNER_RADIUS(4)
             }) {
-                CLAY_TEXT(CLAY_STRING("Download Latest"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_download_btn_fg) }));
+                CLAY_TEXT(CLAY_STRING("Releases Page"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_page_btn_fg) }));
+            }
+        }
+
+        // Install row: rendered only when a check found a newer release.
+        // Two-click confirm; the old binary is archived (renamed), never deleted.
+        if (update_install_available) {
+            CLAY(CLAY_ID("VersionInfoInstallRow"), {
+                .layout = {
+                    .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) },
+                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                    .childAlignment = { .y = CLAY_ALIGN_Y_CENTER },
+                    .childGap = 10
+                }
+            }) {
+                CLAY(CLAY_ID("VersionInfoInstallLabel"), {
+                    .layout = { .sizing = { CLAY_SIZING_FIXED(110), CLAY_SIZING_FIT(0) } }
+                }) {
+                    CLAY_TEXT(CLAY_STRING("Install:"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
+                CLAY(CLAY_ID("VersionInfoInstallButton"), {
+                    .layout = {
+                        .sizing = { CLAY_SIZING_FIXED(150), CLAY_SIZING_FIXED(24) },
+                        .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
+                    },
+                    .backgroundColor = to_clay_color(update_install_btn_bg),
+                    .cornerRadius = CLAY_CORNER_RADIUS(4)
+                }) {
+                    CLAY_TEXT(make_string(update_install_label),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(update_install_btn_fg) }));
+                }
+                CLAY(CLAY_ID("VersionInfoInstallHint"), {
+                    .layout = { .sizing = { CLAY_SIZING_FIT(.min = 0, .max = 260), CLAY_SIZING_FIT(0) } }
+                }) {
+                    CLAY_TEXT(CLAY_STRING("old version archived, not deleted"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
             }
         }
 
@@ -8530,6 +8456,7 @@ void gui_handle_interactions(gui_app_t *app) {
     }
     if (s_version_info_window_open && IsKeyPressed(KEY_ESCAPE)) {
         s_version_info_window_open = false;
+        s_update_install_armed = false;
     }
     if (s_metadata_window_open && IsKeyPressed(KEY_ESCAPE)) {
         s_metadata_window_open = false;
@@ -8668,6 +8595,18 @@ void gui_handle_interactions(gui_app_t *app) {
         if (atomic_exchange(&app->cxadc_perm_help_pending, false)) {
             gui_dropdown_close_all();
             gui_ui_clear_text_edit();
+#if defined(_WIN32)
+            // cxadc-win driver: the 10-bit toggle is a WMI config write
+            // (CxadcWin_Config.EnableTenbit). Windows denies that write for
+            // non-admin users; re-running elevated lets it through.
+            gui_popup_info("CXADC 10-bit mode needs elevation",
+                "10-bit mode requires a config write to the cxadc-win driver\n"
+                "(WMI CxadcWin_Config), which Windows denied for this user.\n"
+                "Capture fell back to 8-bit.\n\n"
+                "Close and re-run MISRC GUI as Administrator\n"
+                "(right-click -> Run as administrator), then re-enable 10-bit.\n\n"
+                "8-bit capture needs no elevation and still works.");
+#else
             gui_popup_info("CXADC 10-bit mode needs one-time setup",
                 "10-bit mode requires write access to the cxadc sysfs parameters,\n"
                 "which are root-only by default. Capture fell back to 8-bit.\n\n"
@@ -8676,6 +8615,7 @@ void gui_handle_interactions(gui_app_t *app) {
                 "  sudo chmod g+w   /sys/class/cxadc/cxadc*/device/parameters/*\n"
                 "  sudo usermod -aG video $USER   (then log out/in)\n\n"
                 "8-bit capture needs no setup and still works.");
+#endif
         } else if (atomic_exchange(&app->cxadc_open_perm_help_pending, false)) {
             gui_dropdown_close_all();
             gui_ui_clear_text_edit();
@@ -8716,82 +8656,123 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
                 return;
             }
-            if (Clay_PointerOver(CLAY_ID("VersionInfoDownloadButton"))) {
+            if (Clay_PointerOver(CLAY_ID("VersionInfoReleasesPageButton"))) {
                 gui_ui_process_update_check_result(app);
                 if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
                     gui_app_set_status(app, "Please wait for update check to finish");
                     gui_ui_set_click_consumed();
                     return;
                 }
-
-                char latest_tag[64] = {0};
-                char lookup_error[160] = {0};
-                bool used_cached_tag = false;
-                bool have_latest_tag = gui_ui_fetch_latest_release_tag(latest_tag,
-                                                                       sizeof(latest_tag),
-                                                                       lookup_error,
-                                                                       sizeof(lookup_error));
-                if (have_latest_tag) {
-                    snprintf(app->settings.update_last_release_tag,
-                             sizeof(app->settings.update_last_release_tag),
-                             "%s",
-                             latest_tag);
-                    app->settings.update_last_check_unix_s = (uint64_t)time(NULL);
-                    int cmp = gui_ui_compare_versions(MIRSC_TOOLS_VERSION, latest_tag);
-                    app->settings.update_available_cached = (cmp < 0);
-                    gui_settings_save(&app->settings);
-                } else if (gui_ui_is_release_tag_safe(app->settings.update_last_release_tag)) {
-                    snprintf(latest_tag, sizeof(latest_tag), "%s", app->settings.update_last_release_tag);
-                    used_cached_tag = true;
-                    have_latest_tag = true;
-                }
-
-                if (!have_latest_tag) {
-                    char msg[220];
-                    snprintf(msg,
-                             sizeof(msg),
-                             "Unable to resolve latest release: %s",
-                             lookup_error[0] ? lookup_error : "unknown error");
-                    gui_app_set_status(app, msg);
-                    gui_ui_set_click_consumed();
-                    return;
-                }
-
-                char download_url[512] = {0};
-                char asset_name[160] = {0};
-                if (!gui_ui_build_release_asset_url_for_platform(latest_tag,
-                                                                 download_url,
-                                                                 sizeof(download_url),
-                                                                 asset_name,
-                                                                 sizeof(asset_name))) {
-                    gui_app_set_status(app, "No direct download mapping for this platform");
-                    gui_ui_set_click_consumed();
-                    return;
-                }
-
+                // Always the releases PAGE (never a per-platform asset URL
+                // that can 404): manifest value when available, compiled
+                // default otherwise.
+                s_update_install_armed = false;
+                const char *page_url = s_update_manifest_ok
+                    ? s_update_manifest.releases_page
+                    : GUI_UPDATER_RELEASES_PAGE_URL;
                 char open_error[160] = {0};
-                if (!gui_ui_open_url_external(download_url, open_error, sizeof(open_error))) {
+                if (!gui_ui_open_url_external(page_url, open_error, sizeof(open_error))) {
                     char msg[240];
-                    snprintf(msg,
-                             sizeof(msg),
-                             "Failed to open download URL: %s",
+                    snprintf(msg, sizeof(msg), "Failed to open the releases page: %s",
                              open_error[0] ? open_error : "unknown error");
                     gui_app_set_status(app, msg);
-                    gui_ui_set_click_consumed();
-                    return;
-                }
-
-                if (used_cached_tag) {
-                    char msg[220];
-                    snprintf(msg, sizeof(msg), "Opening cached download: %s", asset_name);
-                    gui_app_set_status(app, msg);
                 } else {
-                    char msg[220];
-                    snprintf(msg, sizeof(msg), "Opening latest download: %s", asset_name);
-                    gui_app_set_status(app, msg);
+                    gui_app_set_status(app, "Opening the releases page");
                 }
                 gui_ui_set_click_consumed();
                 return;
+            }
+            // Install Update: two-click confirm (first click arms, second
+            // triggers). Desktop: full self-update on the worker thread -
+            // download, archive the old binary (rename, never delete), move
+            // the new one into place. Android: guided browser download of the
+            // manifest-named APK; Android's installer then replaces the app
+            // after the user confirms (the APK stays as the archive copy).
+            if (Clay_PointerOver(CLAY_ID("VersionInfoInstallButton"))) {
+                gui_ui_process_update_check_result(app);
+                if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
+                    gui_app_set_status(app, "Please wait for update check to finish");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+                if (app->is_capturing || app->is_recording) {
+                    gui_app_set_status(app, "Stop capture/recording before installing an update");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+                if (!s_update_manifest_ok) {
+                    s_update_install_armed = false;
+                    gui_app_set_status(app, "Update manifest unavailable - use the Releases Page button");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+                // Target tag: the cached tag when it still reports a newer
+                // release, otherwise resolve now via the manifest's lookup.
+                char latest_tag[GUI_UPDATER_TAG_MAX] = {0};
+                if (gui_updater_is_release_tag_safe(app->settings.update_last_release_tag) &&
+                    gui_updater_compare_versions(MIRSC_TOOLS_VERSION,
+                                                 app->settings.update_last_release_tag) < 0) {
+                    snprintf(latest_tag, sizeof(latest_tag), "%s", app->settings.update_last_release_tag);
+                } else {
+                    char lookup_error[GUI_UPDATER_ERROR_MAX] = {0};
+                    if (!gui_updater_fetch_latest_release_tag(s_update_manifest.tag_lookup_url,
+                                                              latest_tag, sizeof(latest_tag),
+                                                              lookup_error, sizeof(lookup_error))) {
+                        gui_app_set_status(app, "Unable to resolve the latest release - run Check for Update");
+                        gui_ui_set_click_consumed();
+                        return;
+                    }
+                }
+                if (!s_update_install_armed) {
+                    // First click only ARMS the install (explicit confirmation).
+                    s_update_install_armed = true;
+                    char msg[GUI_UPDATER_STATUS_MAX];
+                    snprintf(msg, sizeof(msg),
+                             "Click Install again to confirm updating to %s "
+                             "(the old version is archived, not deleted)",
+                             latest_tag);
+                    gui_app_set_status(app, msg);
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+                s_update_install_armed = false;
+                char asset_url[GUI_UPDATER_URL_MAX] = {0};
+                char asset_name[192] = {0};
+                if (!gui_updater_build_asset_url(&s_update_manifest, latest_tag,
+                                                 asset_url, sizeof(asset_url),
+                                                 asset_name, sizeof(asset_name))) {
+                    gui_app_set_status(app, "No update asset mapping - use the Releases Page button");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+#if defined(__ANDROID__)
+                (void)asset_name;
+                char open_error[160] = {0};
+                if (!gui_ui_open_url_external(asset_url, open_error, sizeof(open_error))) {
+                    char msg[240];
+                    snprintf(msg, sizeof(msg), "Failed to open the update download: %s",
+                             open_error[0] ? open_error : "unknown error");
+                    gui_app_set_status(app, msg);
+                } else {
+                    gui_app_set_status(app, "Downloading the update in the browser - install it when Android asks");
+                }
+                gui_ui_set_click_consumed();
+                return;
+#else
+                gui_ui_update_check_task_t task = {0};
+                task.install = true;
+                snprintf(task.asset_url, sizeof(task.asset_url), "%s", asset_url);
+                snprintf(task.asset_name, sizeof(task.asset_name), "%s", asset_name);
+                snprintf(task.current_version, sizeof(task.current_version), "%s", MIRSC_TOOLS_VERSION);
+                if (!gui_ui_start_update_task(&task)) {
+                    gui_app_set_status(app, "Unable to start the update install");
+                    gui_ui_set_click_consumed();
+                    return;
+                }
+                gui_app_set_status(app, "Installing update: downloading and archiving the old version...");
+                gui_ui_set_click_consumed();
+                return;
+#endif
             }
             if (Clay_PointerOver(CLAY_ID("VersionInfoCorePinningToggle"))) {
                 app->settings.show_core_pinning_in_settings = !app->settings.show_core_pinning_in_settings;
@@ -8957,6 +8938,7 @@ void gui_handle_interactions(gui_app_t *app) {
             }
             if (Clay_PointerOver(CLAY_ID("VersionInfoCloseButton"))) {
                 s_version_info_window_open = false;
+                s_update_install_armed = false;
                 // Commit any in-progress net field edit on close.
                 if (s_active_text_field == UI_TEXT_FIELD_NET_SERVER_PORT ||
                     s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_HOST ||
@@ -8974,6 +8956,7 @@ void gui_handle_interactions(gui_app_t *app) {
             }
             if (Clay_PointerOver(CLAY_ID("VersionInfoBackdrop"))) {
                 s_version_info_window_open = false;
+                s_update_install_armed = false;
                 gui_ui_set_click_consumed();
                 return;
             }
@@ -9179,6 +9162,8 @@ void gui_handle_interactions(gui_app_t *app) {
             s_version_info_window_open = !s_version_info_window_open;
             if (s_version_info_window_open) {
                 s_metadata_window_open = false;
+            } else {
+                s_update_install_armed = false;
             }
             gui_ui_set_click_consumed();
             return;
@@ -9235,6 +9220,7 @@ void gui_handle_interactions(gui_app_t *app) {
             s_metadata_window_open = !s_metadata_window_open;
             if (s_metadata_window_open) {
                 s_version_info_window_open = false;
+                s_update_install_armed = false;
             }
             gui_ui_set_click_consumed();
             return;
@@ -9560,7 +9546,11 @@ void gui_handle_interactions(gui_app_t *app) {
                 int current_raw = 0;
                 if (gui_cxadc_get_center_offset(card_idx, &current_raw) != 0) {
                     if (errno == EACCES || errno == EPERM) {
+#if defined(_WIN32)
+                        gui_app_set_status(app, "CXADC DC-offset write denied - re-run as administrator");
+#else
                         gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
+#endif
                     } else {
                         gui_app_set_status(app, "Failed to read CXADC DC offset");
                     }
@@ -9576,8 +9566,9 @@ void gui_handle_interactions(gui_app_t *app) {
                 int delta = dc_down ? -dc_step : dc_step;
                 int target_relative = s_cxadc_dc_relative[card_idx] + delta;
                 int target_raw = s_cxadc_dc_anchor_raw[card_idx] + target_relative;
+                const int cxadc_dc_raw_max = gui_cxadc_center_offset_max();
                 if (target_raw < 0) target_raw = 0;
-                if (target_raw > 255) target_raw = 255;
+                if (target_raw > cxadc_dc_raw_max) target_raw = cxadc_dc_raw_max;
                 target_relative = target_raw - s_cxadc_dc_anchor_raw[card_idx];
 
                 if (gui_cxadc_set_center_offset(card_idx, target_raw) == 0) {
@@ -9587,7 +9578,11 @@ void gui_handle_interactions(gui_app_t *app) {
                     gui_app_set_status(app, msg);
                 } else {
                     if (errno == EACCES || errno == EPERM) {
+#if defined(_WIN32)
+                        gui_app_set_status(app, "CXADC DC-offset write denied - re-run as administrator");
+#else
                         gui_app_set_status(app, "CXADC permission denied: run sudo chgrp video /sys/class/cxadc/cxadc*/device/parameters/*");
+#endif
                     } else {
                         gui_app_set_status(app, "Failed to update CXADC DC offset");
                     }

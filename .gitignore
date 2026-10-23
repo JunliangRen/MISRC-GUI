@@ -13,6 +13,9 @@
 # CI artifact output
 /.ci-artifacts/
 
+# Python bytecode from running the python-driven tests/guards
+__pycache__/
+
 # Scratch
 /.tmp/
 

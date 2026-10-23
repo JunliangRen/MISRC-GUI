@@ -27,6 +27,17 @@ Downloads can be found on the [releases page](https://github.com/harrypm/MISRC-G
 
 x86 (AMD/Intel) and ARM64 (Apple M, Snapdragon, RockChip) are fully supported and intended for long-term support. 
 
+### In-app updates
+
+The Info window checks GitHub once a week (or on demand via "Check for Update"):
+
+- "Releases Page" always opens the [releases page](https://github.com/harrypm/MISRC-GUI/releases) in your browser.
+- When a newer release is found, "Install" (two-click confirm) downloads the update for your platform and installs it in place. Your current version is archived next to the new one (renamed, never deleted); downloads are kept in `~/.local/share/misrc/updates` (Linux), `%LOCALAPPDATA%\misrc\updates` (Windows) or `~/Library/Application Support/misrc/updates` (macOS).
+- Android downloads the APK via the browser and Android itself asks to confirm the install.
+- Installing is blocked while a capture/record session is running.
+
+Download naming is delivered by a remote manifest (`update_manifest.json` on `main`), so if a download link ever breaks, a fix reaches every installed copy without shipping a new release.
+
 Building from source? See [INSTALLATION.md](INSTALLATION.md).
 
 
@@ -351,6 +362,36 @@ These flags open the GUI window (no capture args):
 | `--auto-connect` | — | Auto-trigger server/client connection (requires `--config`) |
 
 `--auto-connect` requires `--config <path>` with a server (`net_mode: 1`) or client (`net_mode: 2`) config. Server mode auto-starts capture so RF data flows to clients; client mode auto-connects to the configured server. Without `--config` it exits with an error.
+
+</details>
+
+<details closed>
+<summary>Headless update mode</summary>
+<br>
+
+The updater pipeline (the same one the Info window uses) runs without the GUI, so it is scriptable and automatically testable:
+
+| Flag | Arg | Description |
+|------|-----|-------------|
+| `--check-update` | — | Fetch the update manifest + latest release tag, print `key: value` lines, exit 0 on success |
+| `--update-dry-run` | — | Also resolve this platform's asset URL, the running executable, the updates dir and the archive path; no download, nothing replaced |
+| `--install-update` | — | Perform the confirmed self-update (download, archive the old binary by rename — never deleted, install in place); requires `--yes` |
+| `--update-manifest` | `<url-or-path>` | Manifest source override (https URL, `http://127.0.0.1` loopback only for automated tests, or a local file) |
+| `--yes` | — | Explicit confirmation for `--install-update` |
+
+Example:
+
+```bash
+$ misrc_gui --check-update
+update_mode: check
+manifest_source: https://raw.githubusercontent.com/harrypm/MISRC-GUI/main/update_manifest.json
+manifest: ok
+latest: v1.2.6
+current: v1.2.5
+update_available: true
+```
+
+The full pipeline (check, dry-run, the install refusal without `--yes`, and the confirmed install with the old binary archived) is exercised automatically by the `update_cli` meson test against a local test server.
 
 </details>
 

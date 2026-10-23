@@ -25,6 +25,7 @@
 #include "../assets/space_mono_font_data.h"
 
 #include "gui_app.h"
+#include "gui_updater.h"
 #if !defined(__ANDROID__)
 #include "../../misrc_capture/misrc_capture_cli.h"
 #endif
@@ -96,6 +97,23 @@ static void print_usage(const char *program_name) {
             "Usage:\n"
             "  %s [--help] [--version] [--smoke-test] [--debug-view] [--config <path>] [--auto-connect]\n"
             "     [--select-device <index-or-name>] [--auto-capture] [--auto-record <seconds>]\n"
+            "     [--check-update] [--update-dry-run] [--install-update [--yes]]\n"
+            "     [--update-manifest <url-or-path>]\n"
+            "\n"
+            "Headless update mode (the same pipeline as the in-app updater;\n"
+            "prints key: value lines for humans and automated tests):\n"
+            "--check-update  fetch the update manifest + latest release tag, print\n"
+            "                them and exit 0 (prints update_available true/false).\n"
+            "--update-dry-run  also resolve this platform's asset URL, the running\n"
+            "                executable, the updates dir and the archive path; no\n"
+            "                download, nothing is replaced.\n"
+            "--install-update  perform the confirmed self-update: download, archive\n"
+            "                the old binary by rename (never deleted), install the\n"
+            "                new one in place. Requires --yes (the CLI confirmation).\n"
+            "--update-manifest <url-or-path>  use this manifest source instead of the\n"
+            "                compiled-in raw URL: an https URL, http://127.0.0.1 (loopback\n"
+            "                only, for automated tests), or a local file path.\n"
+            "--yes           explicit confirmation for --install-update.\n"
             "\n"
             "No arguments launch the GUI.\n"
             "--debug-view enables verbose runtime logs.\n"
@@ -130,6 +148,100 @@ static void print_usage(const char *program_name) {
     fprintf(stdout, "(Headless CLI capture mode is not available in the Android build.)\n");
 #endif
 }
+// Headless update CLI (--check-update / --update-dry-run / --install-update):
+// the same gui_updater pipeline the GUI's Releases Page / Install buttons use,
+// runnable without a window and assertable by automated tests (the update_cli
+// meson test drives all modes against a local test server; see
+// misrc_tools/test/update_cli_test.py).
+typedef enum {
+    GUI_UPDATE_CLI_NONE = 0,
+    GUI_UPDATE_CLI_CHECK,
+    GUI_UPDATE_CLI_DRY_RUN,
+    GUI_UPDATE_CLI_INSTALL,
+} gui_update_cli_mode_t;
+
+static int gui_run_update_cli(gui_update_cli_mode_t mode, const char *manifest_source, bool confirmed)
+{
+    const char *mode_name = (mode == GUI_UPDATE_CLI_CHECK) ? "check"
+                          : (mode == GUI_UPDATE_CLI_DRY_RUN) ? "dry-run"
+                          : "install";
+    printf("update_mode: %s\n", mode_name);
+    const char *source = (manifest_source && manifest_source[0]) ? manifest_source
+                                                                 : GUI_UPDATER_MANIFEST_URL;
+    printf("manifest_source: %s\n", source);
+
+    gui_updater_manifest_t manifest;
+    char manifest_error[GUI_UPDATER_ERROR_MAX] = {0};
+    if (!gui_updater_load_manifest_from(source, &manifest,
+                                        manifest_error, sizeof(manifest_error))) {
+        printf("manifest: failed\n");
+        printf("manifest_error: %s\n", manifest_error[0] ? manifest_error : "unknown error");
+        return 1;
+    }
+    printf("manifest: ok\n");
+
+    char latest_tag[GUI_UPDATER_TAG_MAX] = {0};
+    char tag_error[GUI_UPDATER_ERROR_MAX] = {0};
+    if (!gui_updater_fetch_latest_release_tag(manifest.tag_lookup_url,
+                                              latest_tag, sizeof(latest_tag),
+                                              tag_error, sizeof(tag_error))) {
+        printf("tag_lookup: failed\n");
+        printf("tag_error: %s\n", tag_error[0] ? tag_error : "unknown error");
+        return 1;
+    }
+    printf("latest: %s\n", latest_tag);
+    printf("current: %s\n", MIRSC_TOOLS_VERSION);
+    int cmp = gui_updater_compare_versions(MIRSC_TOOLS_VERSION, latest_tag);
+    printf("update_available: %s\n", (cmp < 0) ? "true" : "false");
+
+    if (mode == GUI_UPDATE_CLI_CHECK) {
+        return 0;
+    }
+
+    char asset_url[GUI_UPDATER_URL_MAX] = {0};
+    char asset_name[192] = {0};
+    if (!gui_updater_build_asset_url(&manifest, latest_tag,
+                                    asset_url, sizeof(asset_url),
+                                    asset_name, sizeof(asset_name))) {
+        printf("asset_url: failed (no asset mapping for this platform)\n");
+        return 1;
+    }
+    printf("asset_url: %s\n", asset_url);
+
+    if (mode == GUI_UPDATE_CLI_DRY_RUN) {
+        char exe_path[GUI_UPDATER_PATH_MAX];
+        char updates_dir[GUI_UPDATER_PATH_MAX];
+        char archive_path[GUI_UPDATER_PATH_MAX];
+        bool exe_ok = gui_updater_get_executable_path(exe_path, sizeof(exe_path));
+        bool dir_ok = exe_ok && gui_updater_get_updates_dir(updates_dir, sizeof(updates_dir));
+        printf("exe_path: %s\n", exe_ok ? exe_path : "unresolved");
+        printf("updates_dir: %s\n", dir_ok ? updates_dir : "unresolved");
+        if (exe_ok && gui_updater_build_archive_path(exe_path, MIRSC_TOOLS_VERSION,
+                                                    archive_path, sizeof(archive_path))) {
+            printf("archive_path: %s\n", archive_path);
+        } else {
+            printf("archive_path: unresolved\n");
+        }
+        return (exe_ok && dir_ok) ? 0 : 1;
+    }
+
+    // --install-update: the explicit CLI invocation + --yes is the user
+    // confirmation (the GUI equivalent is the two-click Install confirm).
+    if (!confirmed) {
+        fprintf(stderr, "--install-update requires --yes (explicit confirmation; the old version is archived, not deleted)\n");
+        return 1;
+    }
+    char install_status[GUI_UPDATER_STATUS_MAX] = {0};
+    char archive_path[GUI_UPDATER_PATH_MAX] = {0};
+    bool install_ok = gui_updater_install_asset(asset_url, asset_name, MIRSC_TOOLS_VERSION,
+                                                install_status, sizeof(install_status),
+                                                archive_path, sizeof(archive_path));
+    printf("install: %s\n", install_ok ? "ok" : "failed");
+    printf("install_status: %s\n", install_status[0] ? install_status : "-");
+    printf("archive: %s\n", archive_path[0] ? archive_path : "-");
+    return install_ok ? 0 : 1;
+}
+
 static bool gui_status_is_permission_denied(const gui_app_t *app) {
     if (!app) return false;
     return strstr(app->status_message, "Permission denied") != NULL ||
@@ -499,6 +611,10 @@ int main(int argc, char **argv) {
     bool auto_capture = false;             /* --auto-capture */
     bool auto_record_given = false;        /* --auto-record <seconds> seen */
     int auto_record_seconds = 0;           /* --auto-record seconds */
+    gui_update_cli_mode_t update_cli_mode = GUI_UPDATE_CLI_NONE; /* headless update CLI */
+    bool update_cli_mode_error = false;   /* more than one update mode flag given */
+    const char *update_manifest_source = NULL;  /* --update-manifest <url-or-path> */
+    bool update_cli_yes = false;                 /* --install-update confirmation */
     // First pass: classify args. Any arg that isn't a pure GUI flag is treated
     // as a capture arg and routes the process into headless CLI capture mode
     // (the full misrc_capture CLI), so the GUI binary doubles as the CLI tool
@@ -556,6 +672,36 @@ int main(int argc, char **argv) {
             }
             continue;
         }
+        if (strcmp(a, "--check-update") == 0 ||
+            strcmp(a, "--update-dry-run") == 0 ||
+            strcmp(a, "--install-update") == 0) {
+            // Headless update mode flags (GUI flags: must NOT route into the
+            // capture CLI). At most one mode per invocation.
+            gui_update_cli_mode_t wanted =
+                (strcmp(a, "--check-update") == 0) ? GUI_UPDATE_CLI_CHECK
+                : (strcmp(a, "--update-dry-run") == 0) ? GUI_UPDATE_CLI_DRY_RUN
+                : GUI_UPDATE_CLI_INSTALL;
+            if (update_cli_mode != GUI_UPDATE_CLI_NONE) {
+                update_cli_mode_error = true;
+            }
+            update_cli_mode = wanted;
+            continue;
+        }
+        if (strcmp(a, "--update-manifest") == 0) {
+            // --update-manifest <url-or-path>: manifest source override for
+            // diagnostics/automated tests. Consumes the next arg.
+            if (i + 1 < argc) {
+                update_manifest_source = argv[++i];
+            } else {
+                fprintf(stderr, "--update-manifest requires a <url-or-path> value\n");
+                return 1;
+            }
+            continue;
+        }
+        if (strcmp(a, "--yes") == 0) {
+            update_cli_yes = true;
+            continue;
+        }
         has_capture_arg = true;
     }
 #if !defined(__ANDROID__)
@@ -576,6 +722,14 @@ int main(int argc, char **argv) {
     }
     if (smoke_test) {
         return 0;
+    }
+    if (update_cli_mode != GUI_UPDATE_CLI_NONE || update_cli_mode_error) {
+        // Headless update mode: fully windowless, before settings/elevation.
+        if (update_cli_mode_error) {
+            fprintf(stderr, "pass at most one of --check-update/--update-dry-run/--install-update\n");
+            return 1;
+        }
+        return gui_run_update_cli(update_cli_mode, update_manifest_source, update_cli_yes);
     }
     if (auto_record_given && auto_record_seconds < 1) {
         fprintf(stderr, "--auto-record requires a positive <seconds> value\n");
