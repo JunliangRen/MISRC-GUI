@@ -11,6 +11,8 @@ A universal cross platform GUI tool for interfacing with and visualizing monitor
 
 - [MISRC](https://misrc.org) (v1.0-v1.5a / native v2.5)
 - CXADC (single cards and Clockgen Mod with sound)
+- CXADC MacOS
+- CXADC Win
 - HSDAOH
 - FX3 (Generic tinkering firmware support)
 - DdD (Domesday Duplicator)
@@ -165,7 +167,7 @@ Level Autostop, this allows for you to set a overall % level alongside a timer t
 - Base Name and Output
 - A/B RF Capture On/Off
 - FLAC/RAW PCM Encoding Control
-- Bit-Depth Selection Control (for MISRC/HSDAOH, CXADC)
+- Bit-Depth Selection Control
 - FLAC Level & Threads Control
 - Stereo/Mono/Quad channel record control for audio (You can select multiple options) 
 - Resampling Control for A/B (VHS config 20msps video 10msps hifi shown)
@@ -181,7 +183,8 @@ Included currently are the following viewer modes.
 
 - Stream Waveform (similar to an oscilloscope) 
 - FTT (visualizes peaks of signals carriers i.g video/hifi or your local FM radio)
-- CVBS (Basic composite video decoder Luma B/W only currently)
+- CVBS (PAL/NTSC/SECAM with hybrid mode) 
+- Tape FM (VHS, Betamax NTSC + HiFi) 
 
 <img width="140" height="132" alt="image" src="assets/images/MISRC_GUI_Window_Monitor_Plugins_Current.png" />
 
