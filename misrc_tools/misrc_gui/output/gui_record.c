@@ -1,3 +1,4 @@
+#include "../input/gui_cxadc_macos.h"
 /*
  * MISRC - hsdaoh-rp2350 GUI - Recording Module
  *
@@ -2013,7 +2014,16 @@ static uint64_t gui_record_direct_spill_backlog_cb(void *user, int channel) {
 }
 
 static void gui_record_direct_set_write_error_cb(void *user, int channel, bool active) {
+#if defined(__APPLE__)
+    if (active && gui_cxadc_macos_active()) {
+        gui_app_t *app = user;
+        gui_cxadc_macos_mark_failed();
+        atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_BACKPRESSURE);
+        atomic_store(&app->dropout_stop_requested, true);
+    }
+#else
     (void)user;
+#endif
     if (gui_record_spill_valid_channel(channel)) {
         atomic_store(&s_record_write_error[channel], active);
     }
@@ -2042,7 +2052,14 @@ static void gui_record_direct_report_drop(int card, uint32_t frame_index, size_t
              card == 0 ? 'A' : 'B', frame_index, len);
     gui_record_log_capture_event(app, "ERROR", msg, GUI_ERROR_CLASS_SYSTEM, 1);
     fprintf(stderr, "[DIRECT] %s\n", msg);
-    if (app->settings.stop_on_dropout && !atomic_load(&app->dropout_stop_requested)) {
+#if defined(__APPLE__)
+    if (gui_cxadc_macos_active()) gui_cxadc_macos_mark_failed();
+#endif
+    if ((app->settings.stop_on_dropout
+#if defined(__APPLE__)
+         || gui_cxadc_macos_active()
+#endif
+        ) && !atomic_load(&app->dropout_stop_requested)) {
         atomic_store(&app->dropout_stop_reason, GUI_DROPOUT_BACKPRESSURE);
         atomic_store(&app->dropout_stop_requested, true);
     }
@@ -2595,6 +2612,14 @@ static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_cou
 
 // Start recording - checks for file existence first
 int gui_record_start(gui_app_t *app) {
+#if defined(__APPLE__)
+    if(gui_cxadc_macos_active() && (app->settings.use_flac || app->settings.enable_resample_a ||
+        app->settings.rf_bits_a!=8 || app->settings.capture_b || app->settings.enable_audio_4ch || app->settings.enable_audio_2ch_12 ||
+        app->settings.enable_audio_2ch_34 || app->settings.enable_audio_1ch[0] || app->settings.enable_audio_1ch[1] ||
+        app->settings.enable_audio_1ch[2] || app->settings.enable_audio_1ch[3])) {
+        gui_app_set_status(app,"macOS CXADC recording requires RAW8 channel A, no resampling or audio");return -1;
+    }
+#endif
 
     (void)gui_record_collect_finalize_if_done();
 
@@ -2640,7 +2665,11 @@ int gui_record_start(gui_app_t *app) {
     }
 
     // No files exist, start recording directly
-    return gui_record_start_confirmed(app);
+    int native_record_result=gui_record_start_confirmed(app);
+#if defined(__APPLE__)
+    if(native_record_result==0)gui_cxadc_macos_log(app);
+#endif
+    return native_record_result;
 }
 
 // Check popup result and continue recording if confirmed
@@ -2665,7 +2694,12 @@ void gui_record_check_popup(gui_app_t *app) {
 
     if (result == POPUP_RESULT_YES) {
         // User confirmed, start recording
-        gui_record_start_confirmed(app);
+        int result=gui_record_start_confirmed(app);
+#if defined(__APPLE__)
+        if(result==0)gui_cxadc_macos_log(app);
+#else
+        (void)result;
+#endif
     } else {
         // User cancelled
         gui_app_set_status(app, "Recording cancelled");

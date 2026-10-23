@@ -1,3 +1,4 @@
+#include "../input/gui_cxadc_macos.h"
 /*
  * MISRC GUI - Graphical Capture Interface
  *
@@ -510,7 +511,7 @@ static bool gui_build_elevated_command(int argc, char **argv, char *out, size_t 
 
 static int gui_macos_relaunch_as_admin_if_needed(int argc, char **argv)
 {
-    if (geteuid() == 0) {
+    if (getenv("MISRC_GUI_NO_ADMIN") || geteuid() == 0) {
         return 0;
     }
 
@@ -1279,6 +1280,9 @@ int main(int argc, char **argv) {
             } else if (auto_rec_phase == AUTO_REC_RECORDING) {
                 if (!app.is_recording) {
                     fprintf(stderr, "[AUTO] recording stopped early; finishing\n");
+#if defined(__APPLE__)
+                    if (gui_cxadc_macos_active()) auto_rec_failed = true;
+#endif
                     auto_rec_phase = AUTO_REC_FINALIZING;
                 } else if (auto_now >= auto_rec_deadline) {
                     gui_app_stop_recording(&app);
@@ -1291,6 +1295,9 @@ int main(int argc, char **argv) {
                         gui_app_stop_capture(&app);
                         fprintf(stderr, "[AUTO] capture stopped\n");
                     }
+#if defined(__APPLE__)
+                    if (gui_cxadc_macos_failed()) auto_rec_failed = true;
+#endif
                     fprintf(stderr, "[AUTO] record cycle complete%s; exiting\n",
                             auto_rec_failed ? " (with errors)" : "");
                     atomic_store(&do_exit, 1);
@@ -1564,6 +1571,9 @@ int main(int argc, char **argv) {
         DrawFPS(10, 10);
         #endif
 
+#if defined(__APPLE__)
+        gui_cxadc_macos_ui_draw(&app);
+#endif
         EndDrawing();
     }
 
