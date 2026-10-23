@@ -1,7 +1,10 @@
 # Native macOS CXADC backend
 
 Experimental local integration based on upstream
-`9c3894cd764db20c3eca835d041ad972cf986d37`. Not submitted upstream.
+`9c3894cd764db20c3eca835d041ad972cf986d37`, subsequently merged with upstream
+`4245e5839e0da4a872b4b279630606d1aa2ef093` for review.
+The driver/client source is maintained separately at
+[cxadc-macos](https://github.com/jlnbxn/cxadc-macos).
 
 ## Build and launch
 
@@ -88,8 +91,10 @@ M3 Max, macOS 26.7.1, CX23880-19 through an OWC enclosure; single card only.
 Unmodified upstream build/smoke passed before changes. The smoke flag exits
 before window creation. Integrated automated runs initialized a real OpenGL
 window and processed live data through display workers; no computer-use/UI
-interaction was used. Manual appearance, F8/button interaction and window-close
-acceptance remain for the user.
+interaction was used. The user subsequently launched the GUI, reported success, and produced an
+eight-second RF recording which was decoded and exported with dropout correction.
+Individual F8 controls and window-close behavior have not been independently
+verified.
 
 Real RF, VMUX 1, level 31, boost off, center 8, AGC on:
 
@@ -109,7 +114,7 @@ the wall-clock limit at chunk/GUI frame granularity. The oscillator is unmeasure
 A separate 5-second GUI run rejected a concurrent CLI start with IOReturnBusy,
 kept recording and stopped cleanly. Multiple sequential GUI processes captured
 successfully. Same-window repeated start/stop, physical unplug, full disk,
-suspend, multi-hour recording and visual GUI acceptance remain untested.
+suspend and multi-hour GUI recording remain untested.
 
 Existing full suite: 34/37 passed before adding the unsigned mapping test.
 The three failures (`gui_settings_paths`, `gui_audio_hifi_monitor`,
@@ -131,4 +136,20 @@ checks real mirroring and descriptor closure across 32 allocation cycles.
 
 No ClockGen, multi-card synchronization, audio, 10-bit capture, alternate clock,
 FLAC or resampling support is claimed for this native backend. Unsupported RAW
-settings fail visibly. The next acceptance step is interactive user testing.
+settings fail visibly. Broader recovery and distribution testing remain separate.
+
+## Upstream merge verification (2026-10-23)
+
+Merged upstream `4245e58` without rewriting the tested integration commits.
+The center-offset conflict preserves upstream's Windows range (0–63),
+Linux/macOS range (0–255) and the native macOS setter.
+
+The merged native arm64 build, smoke and static guards pass. Full local suite:
+38/40 pass. `gui_settings_paths` and `gui_audio_hifi_monitor` still fail as they
+did in the untouched original upstream baseline. Their test/implementation
+sources were unchanged by the intervening upstream commits. The previously
+failing timing-sensitive `gui_rf_preview_worker` passes in this run. Native RAW,
+unsigned mapping, Darwin ring lifecycle and the new upstream updater tests pass.
+This is build/test validation of the merge; the hardware capture evidence above
+was recorded on the original integration, not repeated for this merge.
+Cross-platform hosted CI status is reported separately in the pull request.
