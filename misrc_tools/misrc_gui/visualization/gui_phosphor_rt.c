@@ -31,6 +31,16 @@
     #define GLSL_FRAG_OUT "out vec4 finalColor;\n"
     #define GLSL_FRAG_COLOR "finalColor"
     #define GLSL_TEXTURE "texture"
+#elif defined(GRAPHICS_API_OPENGL_21)
+    // Desktop OpenGL 2.1: GLSL 1.20 legacy attribute/varying syntax.
+    #define GLSL_VERSION_STRING "#version 120\n"
+    #define GLSL_PRECISION ""
+    #define GLSL_IN "attribute "
+    #define GLSL_OUT "varying "
+    #define GLSL_FRAG_IN "varying "
+    #define GLSL_FRAG_OUT ""
+    #define GLSL_FRAG_COLOR "gl_FragColor"
+    #define GLSL_TEXTURE "texture2D"
 #else  // Desktop OpenGL 3.3+
     #define GLSL_VERSION_STRING "#version 330\n"
     #define GLSL_PRECISION ""
