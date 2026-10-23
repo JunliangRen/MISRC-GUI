@@ -3,6 +3,11 @@
 #include "../misrc_gui/signal/gui_cvbs.c"
 #include "../misrc_gui/processing/gui_rf_preview_pressure.c"
 #include "../misrc_gui/visualization/gui_panel.c"
+/* Exercise the production profile selectors while retaining the route fixture's
+ * lightweight binder below. LTO drops the unused texture/render functions. */
+#define gui_vhs_fm_bind_worker route_production_bind_worker
+#include "../misrc_gui/signal/gui_vhs_fm.c"
+#undef gui_vhs_fm_bind_worker
 #include <assert.h>
 typedef struct { gui_rf_format_t format; gui_rf_profile_t profile; atomic_bool paused, audio_enabled; atomic_int submits; } route_worker_t;
 static const void *monitor_source;
@@ -19,16 +24,13 @@ gui_rf_preview_worker_t *gui_rf_preview_worker_create(gui_rf_format_t format) {
     atomic_init(&w->submits,0);
     atomic_fetch_add(&creates,1); return (gui_rf_preview_worker_t*)w;
 }
-gui_rf_profile_t gui_vhs_fm_get_profile(const vhs_fm_decoder_t *d) {
-    if(d->overlay.selected_tape==1 && d->overlay.beta_super)
-        return d->overlay.beta_hifi ? GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI : GUI_RF_PROFILE_NTSC_SUPERBETA;
-    return d->overlay.selected_tape==1 ? (d->overlay.beta_hifi ? GUI_RF_PROFILE_NTSC_BETAMAX_HIFI : GUI_RF_PROFILE_NTSC_BETAMAX)
-                                     : (d->overlay.selected_system ? GUI_RF_PROFILE_NTSC_VHS : GUI_RF_PROFILE_PAL_VHS);
-}
 bool gui_rf_profile_has_hifi(gui_rf_profile_t profile) {
     return profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI || profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;
 }
-gui_rf_format_t gui_rf_profile_format(gui_rf_profile_t p) { return p==GUI_RF_PROFILE_PAL_VHS ? GUI_RF_PAL : GUI_RF_NTSC; }
+gui_rf_format_t gui_rf_profile_format(gui_rf_profile_t p) {
+    return p==GUI_RF_PROFILE_PAL_VHS || p==GUI_RF_PROFILE_SECAM_VHS ||
+        p==GUI_RF_PROFILE_MESECAM_VHS ? GUI_RF_PAL : GUI_RF_NTSC;
+}
 gui_rf_preview_worker_t *gui_rf_preview_worker_create_profile(gui_rf_profile_t profile) {
     gui_rf_preview_worker_t *worker=gui_rf_preview_worker_create(gui_rf_profile_format(profile));
     ((route_worker_t*)worker)->profile=profile;
@@ -79,6 +81,78 @@ static bool route_audio_enabled(const vhs_fm_decoder_t *decoder) {
     assert(decoder->worker);
     return atomic_load(&((route_worker_t*)decoder->worker)->audio_enabled);
 }
+static void test_secam_vhs_routes(bool mesecam,gui_rf_profile_t profile,
+                                  vhs_fm_format_t format,const char *name) {
+    _Static_assert(GUI_RF_PROFILE_PAL_VHS==0 && GUI_RF_PROFILE_NTSC_VHS==1 &&
+        GUI_RF_PROFILE_NTSC_BETAMAX==2 && GUI_RF_PROFILE_NTSC_BETAMAX_HIFI==3 &&
+        GUI_RF_PROFILE_NTSC_SUPERBETA==4 && GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI==5 &&
+        GUI_RF_PROFILE_SECAM_VHS==6 && GUI_RF_PROFILE_MESECAM_VHS==7,
+        "append tape profiles without renumbering existing IDs");
+    video_panel_state_t left={0},right={0};
+    assert(gui_vhs_fm_init(&left.vhs_fm.decoder));
+    assert(gui_vhs_fm_init(&right.vhs_fm.decoder));
+    vhs_fm_decoder_t *a=&left.vhs_fm.decoder,*b=&right.vhs_fm.decoder;
+    assert(!a->overlay.secam_mesecam && !b->overlay.secam_mesecam);
+    atomic_init(&left.active_plugin,VIDEO_PLUGIN_VHS_FM);
+    atomic_init(&right.active_plugin,VIDEO_PLUGIN_VHS_FM);
+    route_app.panel_config_a=(channel_panel_config_t){.left_view=PANEL_VIEW_CVBS,
+        .right_view=PANEL_VIEW_CVBS,.left_state=&left,.right_state=&right,.split=true};
+    route_app.panel_config_b=(channel_panel_config_t){.left_view=PANEL_VIEW_WAVEFORM,
+        .right_view=PANEL_VIEW_WAVEFORM};
+    route_app.is_capturing=true;route_app.settings.audio_monitor_playback=true;
+    int created=atomic_load(&creates),destroyed=atomic_load(&destroys);
+    gui_vhs_fm_set_format(a,2);gui_vhs_fm_set_format(b,2);
+    gui_vhs_fm_set_mesecam(a,mesecam);gui_vhs_fm_set_mesecam(b,mesecam);
+    /* Remembered Beta options do not affect either SECAM VHS recording. */
+    a->overlay.beta_super=a->overlay.beta_hifi=true;
+    assert(gui_vhs_fm_get_profile(a)==profile);
+    assert(gui_vhs_fm_get_format(a)==format);
+    assert(!strcmp(gui_vhs_fm_get_format_name(a),name));
+    gui_video_update_rf_routes(&route_app);
+    assert(atomic_load(&creates)==created+1 && a->worker==b->worker);
+    assert(((route_worker_t*)a->worker)->format==GUI_RF_PAL && a->bound_system==0);
+    assert(!monitor_source && !route_audio_enabled(a));
+    gui_rf_preview_worker_t *secam_worker=a->worker;
+    gui_vhs_fm_set_format(b,0);gui_video_update_rf_routes(&route_app);
+    assert(atomic_load(&creates)==created+2 && a->worker!=b->worker);
+    assert(a->worker==secam_worker && ((route_worker_t*)b->worker)->format==GUI_RF_PAL);
+    assert(((route_worker_t*)b->worker)->profile==GUI_RF_PROFILE_PAL_VHS);
+    gui_vhs_fm_set_format(b,2);gui_video_update_rf_routes(&route_app);
+    assert(a->worker==secam_worker && b->worker==secam_worker);
+    assert(atomic_load(&destroys)==destroyed+1);
+    int calls=atomic_load(&route_calls),reset_count=atomic_load(&resets);
+    gui_video_submit_rf(&route_app,route_a,NULL,2,0,route_info,true);
+    assert(atomic_load(&route_calls)==calls+1); /* One submit for shared SECAM views. */
+    gui_vhs_fm_reset(a);assert(atomic_load(&resets)==reset_count+1);
+    gui_rf_block_info_t gap[2]={route_info[0],route_info[1]};gap[0].discontinuity=true;
+    gui_video_submit_rf(&route_app,NULL,NULL,0,0,gap,true);
+    assert(atomic_load(&resets)==reset_count+2);
+    /* Betamax continues to force NTSC even when the prior VHS pick was SECAM. */
+    b->overlay.selected_tape=1;gui_vhs_fm_set_format(b,2);
+    assert(b->overlay.selected_system==1 && gui_vhs_fm_get_format(b)==VHS_FM_FORMAT_NTSC);
+    assert(gui_vhs_fm_get_profile(b)==GUI_RF_PROFILE_NTSC_BETAMAX);
+    gui_video_update_rf_routes(&route_app);
+    assert(a->worker==secam_worker && ((route_worker_t*)b->worker)->format==GUI_RF_NTSC);
+    b->overlay.selected_tape=0;gui_vhs_fm_set_format(b,-1);
+    assert(gui_vhs_fm_get_profile(b)==GUI_RF_PROFILE_PAL_VHS);
+    /* Native SECAM and MESECAM share timing, never their worker identity. */
+    gui_vhs_fm_set_mesecam(b,!mesecam);gui_vhs_fm_set_format(b,2);
+    gui_video_update_rf_routes(&route_app);
+    assert(a->worker==secam_worker && b->worker!=secam_worker);
+    assert(((route_worker_t*)b->worker)->format==GUI_RF_PAL);
+    assert(((route_worker_t*)b->worker)->profile==
+        (mesecam?GUI_RF_PROFILE_SECAM_VHS:GUI_RF_PROFILE_MESECAM_VHS));
+    assert(a->overlay.selected_system==2 && b->overlay.selected_system==2);
+    calls=atomic_load(&route_calls);
+    gui_video_submit_rf(&route_app,route_a,NULL,2,0,route_info,true);
+    assert(atomic_load(&route_calls)==calls+2);
+    gui_vhs_fm_set_mesecam(b,mesecam);gui_video_update_rf_routes(&route_app);
+    assert(b->worker==secam_worker);
+    video_detach_rf(a);assert(b->worker==secam_worker);
+    video_detach_rf(b);assert(!monitor_source);
+    assert(atomic_load(&creates)-created==atomic_load(&destroys)-destroyed);
+    for(int index=0;index<GUI_RF_PROFILE_COUNT;index++) assert(!atomic_load(&s_rf_routes[0][index]));
+}
 // Use the production panel cache transitions with lightweight panel factories:
 // the route fixtures below own their video states and need no render resources.
 static void *cache_waveform_create(void) { void *state=calloc(1,1); assert(state); return state; }
@@ -87,6 +161,71 @@ const panel_vtable_t *panel_get_vtable(panel_view_type_t type) {
     static const panel_vtable_t waveform={.create=cache_waveform_create,.destroy=free};
     static const panel_vtable_t video={.destroy=cache_video_destroy};
     return type==PANEL_VIEW_WAVEFORM ? &waveform : type==PANEL_VIEW_CVBS ? &video : NULL;
+}
+static void test_secam_recording_selector(void) {
+    vhs_fm_decoder_t d;
+    assert(gui_vhs_fm_init(&d));
+    assert(!d.overlay.secam_mesecam);
+    gui_vhs_fm_set_format(&d,2);
+    assert(gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_SECAM_VHS);
+    assert(gui_vhs_fm_get_format(&d)==VHS_FM_FORMAT_SECAM);
+    gui_vhs_fm_set_mesecam(&d,true);
+    assert(d.overlay.selected_system==2 && gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_MESECAM_VHS);
+    assert(gui_vhs_fm_get_format(&d)==VHS_FM_FORMAT_MESECAM);
+    assert(!strcmp(gui_vhs_fm_get_format_name(&d),"MESECAM"));
+    gui_vhs_fm_set_format(&d,0);
+    assert(d.overlay.secam_mesecam && gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_PAL_VHS);
+    assert(gui_vhs_fm_get_format(&d)==VHS_FM_FORMAT_PAL);
+    gui_vhs_fm_set_format(&d,1);
+    assert(d.overlay.secam_mesecam && gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_NTSC_VHS);
+    assert(gui_vhs_fm_get_format(&d)==VHS_FM_FORMAT_NTSC);
+    d.overlay.selected_tape=1;
+    for(int options=0;options<4;options++) {
+        d.overlay.beta_super=(options&2)!=0;d.overlay.beta_hifi=(options&1)!=0;
+        gui_vhs_fm_set_format(&d,2);
+        assert(d.overlay.selected_system==1 && d.overlay.secam_mesecam);
+        assert(gui_vhs_fm_get_format(&d)==VHS_FM_FORMAT_NTSC);
+        assert(gui_vhs_fm_get_profile(&d)==(options==0?GUI_RF_PROFILE_NTSC_BETAMAX:
+            options==1?GUI_RF_PROFILE_NTSC_BETAMAX_HIFI:
+            options==2?GUI_RF_PROFILE_NTSC_SUPERBETA:GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI));
+    }
+    d.overlay.selected_tape=0;gui_vhs_fm_set_format(&d,2);
+    assert(gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_MESECAM_VHS);
+    gui_vhs_fm_set_mesecam(&d,false);
+    assert(gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_SECAM_VHS);
+    assert(gui_vhs_fm_get_format(&d)==VHS_FM_FORMAT_SECAM);
+    assert(!strcmp(gui_vhs_fm_get_format_name(&d),"SECAM"));
+    gui_vhs_fm_set_format(&d,3); /* Only three broadcast systems are selectable. */
+    assert(d.overlay.selected_system==0 && gui_vhs_fm_get_profile(&d)==GUI_RF_PROFILE_PAL_VHS);
+}
+static void test_cached_mesecam_panel(void) {
+    video_panel_state_t panel={0};
+    vhs_fm_decoder_t *d=&panel.vhs_fm.decoder;
+    assert(gui_vhs_fm_init(d));
+    atomic_init(&panel.active_plugin,VIDEO_PLUGIN_VHS_FM);
+    gui_vhs_fm_set_format(d,2);gui_vhs_fm_set_mesecam(d,true);
+    channel_panel_config_t *config=&route_app.panel_config_a;
+    *config=(channel_panel_config_t){.left_view=PANEL_VIEW_CVBS,.left_state=&panel,
+        .left_cached_view=PANEL_VIEW_COUNT,.right_cached_view=PANEL_VIEW_COUNT};
+    route_app.panel_config_b=(channel_panel_config_t){.left_view=PANEL_VIEW_WAVEFORM,
+        .right_view=PANEL_VIEW_WAVEFORM};
+    route_app.is_capturing=true;
+    int created=atomic_load(&creates),destroyed=atomic_load(&destroys);
+    gui_video_update_rf_routes(&route_app);
+    assert(((route_worker_t*)d->worker)->profile==GUI_RF_PROFILE_MESECAM_VHS);
+    panel_config_set_left_view(config,PANEL_VIEW_WAVEFORM);
+    assert(config->left_cached_state==&panel);
+    gui_video_update_rf_routes(&route_app);
+    assert(!d->worker && d->overlay.selected_system==2 && d->overlay.secam_mesecam);
+    panel_config_set_left_view(config,PANEL_VIEW_CVBS);
+    assert(config->left_state==&panel);
+    gui_video_update_rf_routes(&route_app);
+    assert(((route_worker_t*)d->worker)->profile==GUI_RF_PROFILE_MESECAM_VHS);
+    assert(d->overlay.selected_system==2 && d->overlay.secam_mesecam);
+    gui_vhs_fm_set_mesecam(d,false);gui_video_update_rf_routes(&route_app);
+    assert(((route_worker_t*)d->worker)->profile==GUI_RF_PROFILE_SECAM_VHS);
+    panel_config_cleanup(config);
+    assert(atomic_load(&creates)==created+3 && atomic_load(&destroys)==destroyed+3);
 }
 static void test_cached_hifi_panel_routes(void) {
     video_panel_state_t a={0},b={0};
@@ -356,5 +495,9 @@ int main(void) {
     test_superbeta_routes();
     test_superbeta_option_routes();
     test_cached_hifi_panel_routes();
-    puts("RF routes: shared profiles, optional SuperBeta HiFi, cached panels, source priority, mute, pressure and concurrent last-release passed");
+    test_secam_recording_selector();
+    test_secam_vhs_routes(false,GUI_RF_PROFILE_SECAM_VHS,VHS_FM_FORMAT_SECAM,"SECAM");
+    test_secam_vhs_routes(true,GUI_RF_PROFILE_MESECAM_VHS,VHS_FM_FORMAT_MESECAM,"MESECAM");
+    test_cached_mesecam_panel();
+    puts("RF routes: shared profiles, SECAM/MESECAM VHS isolation, optional SuperBeta HiFi, cached panels, source priority, mute, pressure and concurrent last-release passed");
 }

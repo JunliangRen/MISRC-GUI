@@ -5676,6 +5676,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     if (panel->chrome.controls_hidden) return;
 
     decoder->overlay.tape_rect = decoder->overlay.super_rect = decoder->overlay.hifi_rect = (Rectangle){0};
+    decoder->overlay.mesecam_rect = (Rectangle){0};
     for (int i = 0; i < 3; ++i) decoder->overlay.stats_opts_rect[i] = (Rectangle){0};
     if (bounds.width <= 0 || bounds.height <= 0) {
         decoder->overlay.is_visible = false;
@@ -5709,7 +5710,8 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
                   FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
     control_y += btn_h + 6;
     const char *format_label = decoder->overlay.selected_tape ? "NTSC (fixed)"
-        : decoder->overlay.selected_system ? "System: NTSC" : "System: PAL";
+        : decoder->overlay.selected_system == 2 ? "System: SECAM"
+        : decoder->overlay.selected_system == 1 ? "System: NTSC" : "System: PAL";
     float fmt_w = (float)gui_text_measure(format_label, FONT_SIZE_DROPDOWN_OPT) + 16;
     decoder->overlay.format_rect = (Rectangle){x_right - fmt_w, control_y, fmt_w, btn_h};
     DrawRectangleRounded(decoder->overlay.format_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
@@ -5717,6 +5719,18 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     gui_text_draw(format_label, decoder->overlay.format_rect.x + 8, text_y,
                    FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
     control_y += btn_h + 6;
+    if (!decoder->overlay.selected_tape && decoder->overlay.selected_system == 2) {
+        const char *mesecam_label = decoder->overlay.secam_mesecam ? "MESECAM: On" : "MESECAM: Off";
+        float mesecam_w = (float)gui_text_measure(mesecam_label, FONT_SIZE_DROPDOWN_OPT) + 16;
+        decoder->overlay.mesecam_rect =
+            (Rectangle){x_right - mesecam_w, control_y, mesecam_w, btn_h};
+        DrawRectangleRounded(decoder->overlay.mesecam_rect, 0.15f, 4,
+                             decoder->overlay.secam_mesecam ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
+        gui_text_draw(mesecam_label, decoder->overlay.mesecam_rect.x + 8,
+                      control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
+                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+        control_y += btn_h + 6;
+    }
     if (decoder->overlay.selected_tape) {
         const char *super_label = decoder->overlay.beta_super ? "SuperBeta: On" : "SuperBeta: Off";
         float super_w = (float)gui_text_measure(super_label, FONT_SIZE_DROPDOWN_OPT) + 16;
@@ -5921,6 +5935,12 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
             if (vhs->overlay.beta_hifi) gui_audio_set_playback_enabled(app,true);
             return true;
         }
+        if (chrome_visible && !vhs->overlay.selected_tape && vhs->overlay.selected_system == 2 &&
+            CheckCollisionPointRec(mouse_pos,vhs->overlay.mesecam_rect)) {
+            panel->chrome.last_click_ms=0;
+            gui_vhs_fm_set_mesecam(vhs, !vhs->overlay.secam_mesecam);
+            return true;
+        }
         if (chrome_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.budget_rect)) {
             panel->chrome.last_click_ms = 0;
             app->settings.rf_preview_budget_percent=
@@ -5929,7 +5949,7 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
         }
         if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.format_rect)) {
             panel->chrome.last_click_ms = 0;
-            gui_vhs_fm_set_format(vhs, !vhs->overlay.selected_system);
+            gui_vhs_fm_set_format(vhs, (vhs->overlay.selected_system + 1) % 3);
             return true;
         }
         if (chrome_visible && CheckCollisionPointRec(mouse_pos, vhs->overlay.stats_btn_rect)) {

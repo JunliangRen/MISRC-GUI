@@ -56,6 +56,8 @@ typedef enum {
     GUI_RF_PROFILE_NTSC_BETAMAX_HIFI,
     GUI_RF_PROFILE_NTSC_SUPERBETA,
     GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI,
+    GUI_RF_PROFILE_SECAM_VHS,
+    GUI_RF_PROFILE_MESECAM_VHS,
     GUI_RF_PROFILE_COUNT
 } gui_rf_profile_t;
 typedef struct gui_rf_decoder gui_rf_decoder_t;

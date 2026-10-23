@@ -147,6 +147,10 @@ def main():
             env = os.environ.copy()
             if os.name == "nt":
                 env["LOCALAPPDATA"] = str(home)
+                # A tar beside the app/on PATH must not replace Windows' system tar.
+                # where.exe rejects tar's flags, so using this shadow must fail.
+                shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "where.exe", root / "tar.exe")
+                env["PATH"] = str(root) + os.pathsep + env.get("PATH", "")
             else:
                 env["HOME"] = str(home)
             manifest_url = f"{Handler.base}/manifest.json"
@@ -168,7 +172,10 @@ def main():
             assert out["update_available"] == "true", \
                 f"{TAG} must compare as newer than the shipped {version}"
 
-            # 2. --update-dry-run: resolve-only, nothing touched.
+            # 2. --update-dry-run: resolve paths without downloading/replacing files.
+            if os.name == "nt":
+                updates = home / "misrc" / "updates"
+                assert not updates.exists()
             r = subprocess.run(
                 [str(exe), "--update-dry-run", "--update-manifest", manifest_url],
                 capture_output=True, text=True, env=env)
@@ -178,14 +185,33 @@ def main():
             assert out["asset_url"] == f"{Handler.base}/releases/download/{TAG}/{expected_asset()}"
             assert out["exe_path"] == str(exe), out["exe_path"]
             assert out["archive_path"] == f"{exe}.archived-{version}"
+            assert not Path(out["archive_path"]).exists()
             assert exe.read_bytes() == original_bytes  # nothing replaced
+            if os.name == "nt":
+                assert Path(out["updates_dir"]) == updates
+                assert updates.is_dir()
+                assert not (updates / expected_asset()).exists()
+
+                # Also create a fresh tree from a forward-slash drive path,
+                # then resolve it again with the directories already present.
+                slash_home = home / "forward-slash"
+                slash_env = env.copy()
+                slash_env["LOCALAPPDATA"] = slash_home.as_posix()
+                for _ in range(2):
+                    r = subprocess.run(
+                        [str(exe), "--update-dry-run", "--update-manifest", manifest_url],
+                        capture_output=True, text=True, env=slash_env)
+                    assert r.returncode == 0, f"forward-slash dry-run failed:\n{r.stdout}\n{r.stderr}"
+                    assert Path(parse_output(r.stdout)["updates_dir"]) == slash_home / "misrc" / "updates"
+                assert (slash_home / "misrc" / "updates").is_dir()
+                assert exe.read_bytes() == original_bytes
 
             # 3. --install-update without --yes: refused, binary untouched.
             r = subprocess.run(
                 [str(exe), "--install-update", "--update-manifest", manifest_url],
                 capture_output=True, text=True, env=env)
             assert r.returncode != 0, "--install-update must refuse without --yes"
-            assert "--install-update requires --yes" in r.stderr, r.stderr
+            assert "--install-update requires --yes" in r.stderr, f"{r.stdout}\n{r.stderr}"
             assert exe.read_bytes() == original_bytes
 
             if platform.system() == "Darwin":

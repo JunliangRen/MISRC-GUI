@@ -6,7 +6,8 @@
 #include "raylib.h"
 #include <stdatomic.h>
 
-typedef enum { VHS_FM_FORMAT_UNKNOWN, VHS_FM_FORMAT_PAL, VHS_FM_FORMAT_NTSC } vhs_fm_format_t;
+typedef enum { VHS_FM_FORMAT_UNKNOWN, VHS_FM_FORMAT_PAL, VHS_FM_FORMAT_NTSC,
+               VHS_FM_FORMAT_SECAM, VHS_FM_FORMAT_MESECAM } vhs_fm_format_t;
 typedef struct vhs_fm_decoder {
     gui_rf_preview_worker_t *worker; // Borrowed from the channel/profile pool.
     int bound_channel, bound_system, bound_profile;
@@ -22,11 +23,13 @@ typedef struct vhs_fm_decoder {
     vhs_fm_format_t format;
     struct {
         Rectangle button_rect, format_rect, budget_rect, tape_rect, super_rect, hifi_rect;
+        Rectangle mesecam_rect;
         Rectangle stats_btn_rect, stats_opts_rect[3];
         Rectangle frame_rect;
         bool is_visible, dropdown_open, stats_dropdown_open;
-        int selected_system;
+        int selected_system;         // VHS RF: 0 = PAL, 1 = NTSC, 2 = SECAM
         int selected_tape;            // 0 = VHS, 1 = Betamax (NTSC only)
+        bool secam_mesecam;           // SECAM VHS heterodyne recording; off selects native SECAM
         bool beta_super;              // Optional SuperBeta video mode; off by default
         bool beta_hifi;               // Optional RF audio; Betamax also uses its Hi-Fi video profile
         int stats_view;               // 0 = All, 1 = Basic, 2 = Off
@@ -46,6 +49,7 @@ void gui_vhs_fm_swap_buffers(vhs_fm_decoder_t *decoder);
 void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
                              float width, float height, bool controls_hidden);
 void gui_vhs_fm_set_format(vhs_fm_decoder_t *decoder, int format_select);
+void gui_vhs_fm_set_mesecam(vhs_fm_decoder_t *decoder, bool enabled);
 gui_rf_profile_t gui_vhs_fm_get_profile(const vhs_fm_decoder_t *decoder);
 // Frame display mode: 0 = Active (default), 1 = Full (VBI + burst with
 // decoded chroma). Persists across worker rebinds.
