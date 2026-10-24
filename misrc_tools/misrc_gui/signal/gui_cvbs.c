@@ -5675,7 +5675,7 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
     // overlay chrome — buttons + stats text — for a clean video preview.
     if (panel->chrome.controls_hidden) return;
 
-    decoder->overlay.tape_rect = decoder->overlay.super_rect = decoder->overlay.hifi_rect = (Rectangle){0};
+    decoder->overlay.tape_rect = decoder->overlay.beta_preset_rect = (Rectangle){0};
     decoder->overlay.mesecam_rect = (Rectangle){0};
     for (int i = 0; i < 3; ++i) decoder->overlay.stats_opts_rect[i] = (Rectangle){0};
     if (bounds.width <= 0 || bounds.height <= 0) {
@@ -5732,23 +5732,13 @@ static void render_vhs_decoder_overlay(video_panel_state_t *panel, gui_app_t *ap
         control_y += btn_h + 6;
     }
     if (decoder->overlay.selected_tape) {
-        const char *super_label = decoder->overlay.beta_super ? "SuperBeta: On" : "SuperBeta: Off";
-        float super_w = (float)gui_text_measure(super_label, FONT_SIZE_DROPDOWN_OPT) + 16;
-        decoder->overlay.super_rect =
-            (Rectangle){x_right - super_w, control_y, super_w, btn_h};
-        DrawRectangleRounded(decoder->overlay.super_rect, 0.15f, 4,
-                             decoder->overlay.beta_super ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
-        gui_text_draw(super_label, decoder->overlay.super_rect.x + 8,
-                      control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
-                      FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
-        control_y += btn_h + 6;
-        const char *hifi_label = decoder->overlay.beta_hifi ? "Beta Hi-Fi: On" : "Beta Hi-Fi: Off";
-        float hifi_w = (float)gui_text_measure(hifi_label, FONT_SIZE_DROPDOWN_OPT) + 16;
-        decoder->overlay.hifi_rect =
-            (Rectangle){x_right - hifi_w, control_y, hifi_w, btn_h};
-        DrawRectangleRounded(decoder->overlay.hifi_rect, 0.15f, 4,
-                             decoder->overlay.beta_hifi ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON);
-        gui_text_draw(hifi_label, decoder->overlay.hifi_rect.x + 8,
+        char preset_label[40];
+        snprintf(preset_label, sizeof(preset_label), "Preset: %s", gui_vhs_fm_get_beta_preset_name(decoder));
+        float preset_w = (float)gui_text_measure(preset_label, FONT_SIZE_DROPDOWN_OPT) + 16;
+        decoder->overlay.beta_preset_rect =
+            (Rectangle){x_right - preset_w, control_y, preset_w, btn_h};
+        DrawRectangleRounded(decoder->overlay.beta_preset_rect, 0.15f, 4, COLOR_BUTTON_HOVER);
+        gui_text_draw(preset_label, decoder->overlay.beta_preset_rect.x + 8,
                       control_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
                       FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
         control_y += btn_h + 6;
@@ -5916,23 +5906,13 @@ static bool cvbs_vtable_handle_click(void *state, gui_app_t *app, int channel,
         if (chrome_visible && CheckCollisionPointRec(mouse_pos,vhs->overlay.tape_rect)) {
             panel->chrome.last_click_ms=0;
             vhs->overlay.selected_tape=(vhs->overlay.selected_tape+1)%2;
-            if (vhs->overlay.selected_tape) {
-                gui_vhs_fm_set_format(vhs,1);
-                if (vhs->overlay.beta_hifi) gui_audio_set_playback_enabled(app,true);
-            }
+            if (vhs->overlay.selected_tape) gui_vhs_fm_set_format(vhs,1);
             return true;
         }
         if (chrome_visible && vhs->overlay.selected_tape &&
-            CheckCollisionPointRec(mouse_pos,vhs->overlay.super_rect)) {
+            CheckCollisionPointRec(mouse_pos,vhs->overlay.beta_preset_rect)) {
             panel->chrome.last_click_ms=0;
-            vhs->overlay.beta_super=!vhs->overlay.beta_super;
-            return true;
-        }
-        if (chrome_visible && vhs->overlay.selected_tape &&
-            CheckCollisionPointRec(mouse_pos,vhs->overlay.hifi_rect)) {
-            panel->chrome.last_click_ms=0;
-            vhs->overlay.beta_hifi=!vhs->overlay.beta_hifi;
-            if (vhs->overlay.beta_hifi) gui_audio_set_playback_enabled(app,true);
+            gui_vhs_fm_set_beta_preset(vhs, (vhs->overlay.beta_preset + 1) % GUI_BETA_PRESET_COUNT);
             return true;
         }
         if (chrome_visible && !vhs->overlay.selected_tape && vhs->overlay.selected_system == 2 &&

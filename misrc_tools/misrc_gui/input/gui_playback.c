@@ -2347,6 +2347,10 @@ static bool gui_playback_ogg_remux(const char *src, uint64_t file_size,
                 carry_len += seg;
                 pos += seg;
                 if (pg.segments[s] == 255) continue;
+                // Ogg permits nil packets, including an empty EOS terminator.
+                // A zero lace also completes nonempty packets of size 255*n;
+                // only the accumulated packet length distinguishes the two.
+                if (carry_len == 0) continue;
 
                 uint16_t block_size = 0;
                 size_t header_len = 0;
@@ -5805,13 +5809,25 @@ commit_failed:
     return -1;
 }
 
+static void gui_playback_format_start_error(const playback_ctx_t *ctx,
+                                             char *message, size_t capacity) {
+    if (ctx && ctx->info_a.error[0])
+        snprintf(message, capacity, "Playback A failed: %s", ctx->info_a.error);
+    else if (ctx && ctx->info_b.error[0])
+        snprintf(message, capacity, "Playback B failed: %s", ctx->info_b.error);
+    else
+        snprintf(message, capacity, "Playback failed to start");
+}
+
 int gui_playback_start(gui_app_t *app, const char *file_a, const char *file_b) {
     if (!app || s_playback_start.pending || (!file_a && !file_b)) return -1;
     playback_ctx_t *prepared = calloc(1, sizeof(*prepared));
     if (!prepared) return -1;
     if (gui_playback_prepare(prepared, app, file_a, file_b, NULL) != 0) {
+        char message[256];
+        gui_playback_format_start_error(prepared, message, sizeof(message));
         gui_playback_release_context(prepared); free(prepared);
-        gui_app_set_status(app, "Playback failed to start"); return -1;
+        gui_app_set_status(app, message); return -1;
     }
     return gui_playback_commit(app, prepared);
 }
@@ -5872,8 +5888,10 @@ int gui_playback_poll_start(gui_app_t *app) {
     int result = s_playback_start.result;
     s_playback_start.pending = false; s_playback_start.prepared = NULL;
     if (cancelled || result != 0) {
+        char message[256];
+        gui_playback_format_start_error(prepared, message, sizeof(message));
         gui_playback_release_context(prepared); free(prepared);
-        gui_app_set_status(app, cancelled ? "Playback load cancelled" : "Playback failed to start");
+        gui_app_set_status(app, cancelled ? "Playback load cancelled" : message);
         return -1;
     }
     return gui_playback_commit(app, prepared) == 0 ? 1 : -1;

@@ -94,8 +94,8 @@ typedef struct {
     // only consulted for headerless raw PCM.
     int format;                  // playback_input_format_t (int keeps this struct assignable across the enum)
     // Specific probe rejection detail (empty when the probe succeeded). The
-    // generic UI status line says only "Playback failed to start"; this field
-    // carries the actionable reason (missing <n>msps hint, non-FLAC Ogg codec,
+    // startup status includes this detail and the failing channel; this field
+    // also carries the actionable reason (missing <n>msps hint, non-FLAC Ogg codec,
     // ID3-prefixed FLAC, unsupported extension, non-mono layout...).
     char error[192];
 } playback_file_info_t;

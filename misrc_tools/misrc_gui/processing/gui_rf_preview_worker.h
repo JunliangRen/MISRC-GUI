@@ -5,6 +5,9 @@
 #include "../signal/gui_beta_hifi.h"
 
 typedef struct gui_rf_preview_worker gui_rf_preview_worker_t;
+/* Audio end_sample always uses the normalized 20 MSPS axis, including EDBeta.
+ * EDBeta video has a separate wide-passband 20 MSPS converter and retains
+ * public 20 MSPS frame timestamps. Beta Hi-Fi uses its ordinary converter. */
 typedef void (*gui_rf_preview_audio_callback_t)(void *context, const float *stereo,
                                                 size_t frames, uint64_t end_sample);
 

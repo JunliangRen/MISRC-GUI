@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #define GUI_RF_DECODE_RATE_HZ 20000000u
+#define GUI_RF_ED_BETA_RATE_HZ 20000000u
 #define GUI_RF_FRAME_MAX_WIDTH 768
 /* Full-frame mode weaves every field line: PAL needs 2x313 = 626 rows. */
 #define GUI_RF_FRAME_MAX_HEIGHT 640
@@ -58,6 +59,7 @@ typedef enum {
     GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI,
     GUI_RF_PROFILE_SECAM_VHS,
     GUI_RF_PROFILE_MESECAM_VHS,
+    GUI_RF_PROFILE_NTSC_ED_BETA,
     GUI_RF_PROFILE_COUNT
 } gui_rf_profile_t;
 typedef struct gui_rf_decoder gui_rf_decoder_t;
@@ -98,6 +100,9 @@ typedef void (*gui_rf_frame_callback_t)(void *context, const uint8_t *rgba,
 /* Invalid profiles are rejected; reset_profile leaves existing state intact. */
 gui_rf_decoder_t *gui_rf_decoder_create_profile(gui_rf_profile_t profile);
 void gui_rf_decoder_reset_profile(gui_rf_decoder_t *decoder, gui_rf_profile_t profile);
+// RF input rate required by the decoder. All profiles use 20 MSPS; ED uses
+// a separate wide-passband converter before its reduced-rate preview filters.
+uint32_t gui_rf_profile_video_rate_hz(gui_rf_profile_t profile);
 gui_rf_format_t gui_rf_profile_format(gui_rf_profile_t profile);
 const char *gui_rf_profile_name(gui_rf_profile_t profile);
 /* Only these profiles enable the separate Beta Hi-Fi audio path. */
@@ -114,6 +119,8 @@ void gui_rf_decoder_reset(gui_rf_decoder_t *decoder, gui_rf_format_t format);
  * (PAL 626, NTSC 526 rows). Unmeasured VBI lines (EQ/broad pulse rows
  * carry no H anchors) use nominal line positions. */
 void gui_rf_decoder_set_frame_mode(gui_rf_decoder_t *decoder, bool full_frame);
+// first_sample/count use the profile's video input rate. Frame callback
+// end_sample always uses the common 20 MSPS media clock, including ED Beta.
 void gui_rf_decoder_process(gui_rf_decoder_t *decoder, const float *samples,
                             size_t count, uint64_t first_sample,
                             gui_rf_frame_callback_t callback, void *context);

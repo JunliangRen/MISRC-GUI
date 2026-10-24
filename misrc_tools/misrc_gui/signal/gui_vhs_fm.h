@@ -8,6 +8,14 @@
 
 typedef enum { VHS_FM_FORMAT_UNKNOWN, VHS_FM_FORMAT_PAL, VHS_FM_FORMAT_NTSC,
                VHS_FM_FORMAT_SECAM, VHS_FM_FORMAT_MESECAM } vhs_fm_format_t;
+// Video recording preset; Audio Mon controls Hi-Fi listening independently.
+typedef enum {
+    GUI_BETA_PRESET_BETAMAX = 0,
+    GUI_BETA_PRESET_BETAMAX_HIFI,
+    GUI_BETA_PRESET_SUPERBETA,
+    GUI_BETA_PRESET_ED_BETA,
+    GUI_BETA_PRESET_COUNT
+} gui_beta_preset_t;
 typedef struct vhs_fm_decoder {
     gui_rf_preview_worker_t *worker; // Borrowed from the channel/profile pool.
     int bound_channel, bound_system, bound_profile;
@@ -22,7 +30,7 @@ typedef struct vhs_fm_decoder {
     atomic_bool input_supported;
     vhs_fm_format_t format;
     struct {
-        Rectangle button_rect, format_rect, budget_rect, tape_rect, super_rect, hifi_rect;
+        Rectangle button_rect, format_rect, budget_rect, tape_rect, beta_preset_rect;
         Rectangle mesecam_rect;
         Rectangle stats_btn_rect, stats_opts_rect[3];
         Rectangle frame_rect;
@@ -30,8 +38,7 @@ typedef struct vhs_fm_decoder {
         int selected_system;         // VHS RF: 0 = PAL, 1 = NTSC, 2 = SECAM
         int selected_tape;            // 0 = VHS, 1 = Betamax (NTSC only)
         bool secam_mesecam;           // SECAM VHS heterodyne recording; off selects native SECAM
-        bool beta_super;              // Optional SuperBeta video mode; off by default
-        bool beta_hifi;               // Optional RF audio; Betamax also uses its Hi-Fi video profile
+        gui_beta_preset_t beta_preset; // Betamax / Betamax Hi-Fi / SuperBeta / ED Beta
         int stats_view;               // 0 = All, 1 = Basic, 2 = Off
         int frame_mode;               // 0 = Active, 1 = Full (VBI + burst view)
     } overlay;
@@ -50,6 +57,8 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
                              float width, float height, bool controls_hidden);
 void gui_vhs_fm_set_format(vhs_fm_decoder_t *decoder, int format_select);
 void gui_vhs_fm_set_mesecam(vhs_fm_decoder_t *decoder, bool enabled);
+void gui_vhs_fm_set_beta_preset(vhs_fm_decoder_t *decoder, int preset);
+const char *gui_vhs_fm_get_beta_preset_name(const vhs_fm_decoder_t *decoder);
 gui_rf_profile_t gui_vhs_fm_get_profile(const vhs_fm_decoder_t *decoder);
 // Frame display mode: 0 = Active (default), 1 = Full (VBI + burst with
 // decoded chroma). Persists across worker rebinds.

@@ -1,7 +1,7 @@
 # Tape RF preview
 
-The RF Preview panel provides PAL/NTSC/SECAM VHS SP (native or MESECAM), NTSC Betamax and ordinary NTSC
-SuperBeta video-RF preview. It weaves two original fields into alternating
+The RF Preview panel provides PAL/NTSC/SECAM VHS SP (native or MESECAM),
+NTSC Betamax, ordinary NTSC SuperBeta and NTSC-J ED Beta video-RF preview. It weaves two original fields into alternating
 rows, without deinterlacing, field duplication or motion interpolation.
 Output is RGBA at 768x576 PAL or 640x480 NTSC, displayed at 4:3. Nominal
 output rates are 25 and 29.97 fps.
@@ -13,13 +13,11 @@ output rates are 25 and 29.97 fps.
    and select PAL, NTSC or SECAM. Under SECAM VHS, the **MESECAM** switch
    defaults to **Off** for native frequency-divided recording; **On** selects
    the heterodyne recording method. Betamax currently
-   supports NTSC only. Under Betamax,
-   **SuperBeta** is an optional toggle, off by default; enable it for a
-   SuperBeta recording. **Beta Hi-Fi** is a separate, independent toggle:
-   turn it on for a Hi-Fi recording to enable stereo monitoring. With
-   SuperBeta off, Hi-Fi also selects the ordinary Betamax Hi-Fi video carriers;
-   SuperBeta uses the same video parameters with either Hi-Fi state.
-   **Audio Mon** can subsequently mute or unmute playback.
+   supports NTSC only. Cycle **Preset** through **Betamax** (default),
+   **Betamax Hi-Fi**, **SuperBeta** and **ED Beta** to select the video recording profile.
+   **Audio Mon** independently controls Hi-Fi listening for Betamax Hi-Fi,
+   SuperBeta and ED Beta. Changing a preset does not enable monitoring; muting keeps the
+   video profile and lock.
 3. Connect a capture device or select FLAC playback files and connect.
 4. The shared Budget button cycles 0.50, 0.75, 1.00, 1.50, 2.00 or 3.00
    logical cores and is saved with the existing application settings. Its

@@ -23,7 +23,8 @@
  * stereo rejection), packed 10-bit .lds (group unpack, mid-group seek,
  * trailing-byte drop, 40 MSPS default + hint override), Ogg FLAC
  * (.ldf/.oga: mapping-header parse, exact last-page granule totals on
- * zero-total STREAMINFO, the RF_SAMPLE_RATE tag, truncated tails, and a
+ * zero-total STREAMINFO, the RF_SAMPLE_RATE tag, truncated tails, nil EOS
+ * packets versus nonempty 255-byte frame completion, malformed audio, and a
  * full remux-to-session-temp prepare that decodes sample-exact), and
  * magic-first sniffing with specific errors (non-FLAC Ogg codecs,
  * ID3-prefixed FLAC, unknown types).
@@ -465,40 +466,43 @@ static void ogg_test_put_le(uint8_t *p, uint64_t v, size_t len)
     for (size_t i = 0; i < len; i++) p[i] = (uint8_t)(v >> (8 * i));
 }
 
-// One Ogg page: header + lacing (255-per-segment) + payload, CRC-verified,
-// exactly like libogg/ffmpeg write (the production reader must accept it).
+// Explicit lacing keeps a nil packet (one 0 entry) distinct from an empty
+// page (no entries), and from a nonempty 255-byte multiple ending in 0.
+static void ogg_test_write_laced_page(FILE *f,uint8_t header_type,uint64_t granule,
+                                      uint32_t serial,uint32_t sequence,
+                                      const uint8_t *laces,size_t nseg,
+                                      const uint8_t *payload,size_t payload_len)
+{
+    assert(nseg<=255);
+    size_t laced_bytes=0;
+    for(size_t n=0;n<nseg;n++) laced_bytes+=laces[n];
+    assert(laced_bytes==payload_len);
+    size_t total=27+nseg+payload_len;
+    uint8_t *page=(uint8_t *)malloc(total);assert(page);
+    memcpy(page,"OggS",4);page[4]=0;page[5]=header_type;
+    ogg_test_put_le(page+6,granule,8);
+    ogg_test_put_le(page+14,serial,4);
+    ogg_test_put_le(page+18,sequence,4);
+    memset(page+22,0,4);page[26]=(uint8_t)nseg;
+    if(nseg) memcpy(page+27,laces,nseg);
+    if(payload_len) memcpy(page+27+nseg,payload,payload_len);
+    ogg_test_put_le(page+22,ogg_test_crc(0,page,total),4);
+    size_t written=fwrite(page,1,total,f);
+    assert(written==total);(void)written;
+    free(page);
+}
+
+// Legacy one-packet/empty-page builder retained for the existing fixtures.
 static void ogg_test_write_page(FILE *f, uint8_t header_type, uint64_t granule,
                                 uint32_t serial, uint32_t sequence,
                                 const uint8_t *payload, size_t payload_len)
 {
-    /* An empty page (the final EOS flush) carries no lacing values at all -
-     * a single zero-valued segment would read as a zero-byte packet. */
-    size_t nseg = payload_len == 0 ? 0 : payload_len / 255 + 1;
-    assert(nseg <= 255);
-    size_t total = 27 + nseg + payload_len;
-    uint8_t *page = (uint8_t *)malloc(total);
-    assert(page);
-    memcpy(page, "OggS", 4);
-    page[4] = 0;
-    page[5] = header_type;
-    ogg_test_put_le(page + 6, granule, 8);
-    ogg_test_put_le(page + 14, serial, 4);
-    ogg_test_put_le(page + 18, sequence, 4);
-    memset(page + 22, 0, 4);
-    page[26] = (uint8_t)nseg;
-    size_t filled = 0;
-    for (size_t s = 0; s + 1 < nseg; s++) {
-        page[27 + s] = 255;
-        filled += 255;
-    }
-    if (nseg > 0) {
-        page[27 + nseg - 1] = (uint8_t)(payload_len - filled);
-    }
-    memcpy(page + 27 + nseg, payload, payload_len);
-    uint32_t crc = ogg_test_crc(0, page, total);
-    ogg_test_put_le(page + 22, crc, 4);
-    fwrite(page, 1, total, f);
-    free(page);
+    size_t nseg=payload_len==0 ? 0 : payload_len/255+1;
+    assert(nseg<=255);
+    uint8_t laces[255];
+    for(size_t n=0;n<nseg;n++) laces[n]=(uint8_t)(n+1<nseg ? 255 : payload_len%255);
+    ogg_test_write_laced_page(f,header_type,granule,serial,sequence,
+                               laces,nseg,payload,payload_len);
 }
 
 // Split a metadata-less native FLAC (fLaC + STREAMINFO only) into its
@@ -1509,6 +1513,166 @@ static void test_sniff_errors(const char *temp_dir)
 
 // ---- Ogg FLAC (.ldf/.oga): probe, last granule, remux-to-temp prepare ----
 
+
+typedef enum {
+    OGG_NIL_SEPARATE_EOS,
+    OGG_NIL_MIXED_EOS,
+    OGG_NIL_NO_EXTRA_PACKET,
+    OGG_NIL_ONLY,
+    OGG_NIL_DAMAGED_FRAME
+} ogg_nil_layout_t;
+
+static bool ogg_test_wrap_nil(const char *path,const native_split_t *sp,
+                               ogg_nil_layout_t layout)
+{
+    FILE *f=fopen(path,"wb");if(!f) return false;
+    const uint32_t serial=0x24681357u;uint32_t sequence=0;
+    uint8_t map[51]={0x7f,'F','L','A','C',1,0,0,0,'f','L','a','C',0x80,0,0,34};
+    memcpy(map+17,sp->si,34);
+    /* STREAMINFO total0,like a piped writer; remux must count real frames. */
+    map[30]&=0xf0;memset(map+31,0,4);
+    ogg_test_write_page(f,2,0,serial,sequence++,map,sizeof(map));
+    uint64_t total=0;
+    if(layout!=OGG_NIL_ONLY) {
+        for(size_t n=0;n<sp->count;n++) {
+            const uint8_t *frame=sp->frames[n];size_t bytes=sp->lens[n];
+            uint8_t *damaged=NULL;
+            if(layout==OGG_NIL_DAMAGED_FRAME && n==0) {
+                damaged=(uint8_t *)malloc(bytes);assert(damaged && bytes);
+                memcpy(damaged,frame,bytes);damaged[0]^=1;frame=damaged;
+            }
+            bool last=n+1==sp->count;
+            bool eos=last && (layout==OGG_NIL_MIXED_EOS || layout==OGG_NIL_NO_EXTRA_PACKET);
+            bool extra_nil=last && layout==OGG_NIL_MIXED_EOS;
+            size_t frame_laces=bytes/255+1,nseg=frame_laces+(extra_nil ? 1 : 0);
+            assert(nseg<=255);uint8_t laces[255];
+            for(size_t k=0;k<frame_laces;k++)
+                laces[k]=(uint8_t)(k+1<frame_laces ? 255 : bytes%255);
+            if(extra_nil) laces[frame_laces]=0;
+            total+=sp->blocks[n];
+            ogg_test_write_laced_page(f,eos ? 4 : 0,total,serial,sequence++,
+                                       laces,nseg,frame,bytes);
+            free(damaged);
+        }
+    }
+    if(layout!=OGG_NIL_MIXED_EOS && layout!=OGG_NIL_NO_EXTRA_PACKET) {
+        const uint8_t nil_lace=0;
+        ogg_test_write_laced_page(f,4,total,serial,sequence++, &nil_lace,1,NULL,0);
+    }
+    return fclose(f)==0;
+}
+
+static void ogg_test_expect_nil_decode(const char *path,const decode_ref_t *ref,
+                                        unsigned bits)
+{
+    playback_ctx_t *ctx=(playback_ctx_t *)calloc(1,sizeof(*ctx));assert(ctx);
+    int result=gui_playback_prepare(ctx,&s_test_app,path,NULL,NULL);
+    expect_i64(result,0,"nil-compatible Ogg prepares through production remux");
+    if(result==0) {
+        expect_u64(ctx->info_a.total_samples,ref->count,"nil packets add no samples");
+        expect_u64(ctx->info_a.bits_per_sample,bits,"remux preserves source depth");
+        expect_true(ctx->decode_path_temp[0],"nil remux temp registered");
+        expect_true(ctx->decoder_a!=NULL,"nil remux opens a native decoder");
+        FLAC__StreamMetadata md;
+        bool metadata_ok=FLAC__metadata_get_streaminfo(ctx->decode_path[0],&md);
+        expect_true(metadata_ok,"nil remux has native STREAMINFO");
+        if(metadata_ok) expect_u64(md.data.stream_info.total_samples,ref->count,
+                                     "nil-free frame sum patches STREAMINFO");
+        while(ctx->decoder_a && ctx->decode_available_a<ref->count &&
+              FLAC__stream_decoder_get_state(ctx->decoder_a)!=FLAC__STREAM_DECODER_END_OF_STREAM) {
+            if(!FLAC__stream_decoder_process_single(ctx->decoder_a)) break;
+        }
+        expect_u64(ctx->decode_available_a,ref->count,"nil remux decodes every real sample");
+        bool match=ctx->decode_available_a==ref->count;
+        for(uint64_t n=0;match && n<ref->count;n++) {
+            int16_t want=(int16_t)(bits==8 ? ref->samples[n]*16 : ref->samples[n]>>4);
+            if(ctx->decode_buf_a[n]!=want) match=false;
+        }
+        expect_true(match,"nil remux PCM matches independent source values");
+    }
+    char temp_path[512];snprintf(temp_path,sizeof(temp_path),"%s",ctx->decode_path[0]);
+    gui_playback_release_context(ctx);free(ctx);
+    if(temp_path[0]) {
+        FILE *gone=fopen(temp_path,"rb");
+        expect_true(gone==NULL,"nil remux temp removed on release");
+        if(gone) fclose(gone);
+    }
+}
+
+static uint16_t ogg_test_frame_crc(const uint8_t *bytes,size_t count,unsigned bits,
+                                   uint16_t polynomial)
+{
+    uint16_t crc=0,mask=bits==8 ? 0xff : 0xffff;
+    for(size_t n=0;n<count;n++) {
+        crc^=(uint16_t)((uint16_t)bytes[n]<<(bits-8));
+        for(int bit=0;bit<8;bit++)
+            crc=(uint16_t)(((crc<<1)^((crc&(1u<<(bits-1))) ? polynomial : 0))&mask);
+    }
+    return crc;
+}
+
+static void test_ogg_nil_packets(const char *temp_dir,const native_split_t *sp,
+                                  const decode_ref_t *ref)
+{
+    char path[512],remux[512];uint32_t pid=(uint32_t)getpid();
+    snprintf(path,sizeof(path),"%s/misrc_pb_%u_ogg_nil.ldf",temp_dir,pid);
+    snprintf(remux,sizeof(remux),"%s/misrc_pb_%u_ogg_nil_remux.flac",temp_dir,pid);
+    test_case="ogg_nil_separate_eos";
+    expect_true(ogg_test_wrap_nil(path,sp,OGG_NIL_SEPARATE_EOS),"EOS page nseg1,lace0 written");
+    ogg_test_expect_nil_decode(path,ref,16);
+    test_case="ogg_nil_mixed_eos";
+    expect_true(ogg_test_wrap_nil(path,sp,OGG_NIL_MIXED_EOS),"EOS real frame then extra lace0 written");
+    ogg_test_expect_nil_decode(path,ref,16);
+
+    /* Independently specified legal mono 8-bit FLAC: seven-byte header,one-byte
+     * verbatim subframe header,245 PCM bytes,two-byte CRC16 =255 bytes. Its
+     * lacing[255,0] completes REAL audio;[255,0,0] adds a separate nil packet.
+     * libFLAC plus the explicit sample oracle checks the full frame grammar. */
+    uint8_t frame[255]={0xff,0xf8,0x60,0x02,0x00,0xf4,0x00,0x02};
+    FLAC__int32 samples[245];
+    for(unsigned n=0;n<245;n++) {
+        samples[n]=(int32_t)((n*13u)%251u)-125;
+        frame[8+n]=(uint8_t)(int8_t)samples[n];
+    }
+    frame[6]=(uint8_t)ogg_test_frame_crc(frame,6,8,0x07);
+    uint16_t crc=ogg_test_frame_crc(frame,253,16,0x8005);
+    frame[253]=(uint8_t)(crc>>8);frame[254]=(uint8_t)crc;
+    native_split_t exact={0};
+    exact.si[1]=exact.si[3]=245; /* min/max blocksize */
+    exact.si[6]=exact.si[9]=255; /* min/max frame size */
+    uint64_t packed=((uint64_t)TEST_SAMPLE_RATE_KHZ<<44)|(UINT64_C(7)<<36);
+    for(int n=0;n<8;n++) exact.si[10+n]=(uint8_t)(packed>>(56-8*n));
+    uint8_t *packet=frame;size_t bytes=sizeof(frame);uint16_t block=245;
+    exact.frames=&packet;exact.lens=&bytes;exact.blocks=&block;exact.count=1;
+    decode_ref_t exact_ref={.samples=samples,.count=245,.cap=245};
+    test_case="ogg_nonempty_255_zero_terminator";
+    expect_true(ogg_test_wrap_nil(path,&exact,OGG_NIL_NO_EXTRA_PACKET),"255-byte real frame with zero completion written");
+    ogg_test_expect_nil_decode(path,&exact_ref,8);
+    test_case="ogg_255_frame_then_nil";
+    expect_true(ogg_test_wrap_nil(path,&exact,OGG_NIL_MIXED_EOS),"255-byte frame completion then independent nil written");
+    ogg_test_expect_nil_decode(path,&exact_ref,8);
+
+    const ogg_nil_layout_t bad[]={OGG_NIL_ONLY,OGG_NIL_DAMAGED_FRAME};
+    const char *reasons[]={"holds no audio frames","not a valid FLAC frame"};
+    for(size_t n=0;n<sizeof(bad)/sizeof(bad[0]);n++) {
+        test_case=n==0 ? "ogg_nil_only_reject":"ogg_nonempty_damaged_header_reject";
+        expect_true(ogg_test_wrap_nil(path,sp,bad[n]),"negative nil fixture written with valid Ogg CRC");
+        playback_ogg_header_t header;char error[256];uint64_t size=0,total=99;
+        bool header_ok=gui_playback_ogg_read_header(path,&header,error,sizeof(error));
+        expect_true(header_ok,"negative fixture retains valid Ogg FLAC metadata");
+        if(header_ok) {
+            expect_true(gui_playback_stat_file_size(path,&size),"negative fixture file size");
+            expect_true(!gui_playback_ogg_remux(path,size,&header,remux,NULL,&total,error,sizeof(error)),
+                          "nil support does not accept missing/damaged real audio");
+            expect_u64(total,0,"rejected remux publishes no sample total");
+            expect_str_contains(error,reasons[n],"negative remux retains specific frame error");
+            gui_playback_ogg_header_cleanup(&header);
+        }
+        unlink(remux);
+    }
+    unlink(path);
+}
+
 static void test_ogg_flac(const char *temp_dir)
 {
     static char native_path[512];
@@ -1658,6 +1822,8 @@ static void test_ogg_flac(const char *temp_dir)
         expect_true(gone == NULL, "session temp unlinked on release");
         if (gone) fclose(gone);
     }
+
+    test_ogg_nil_packets(temp_dir,&sp,&ref);
 
     native_split_free(&sp);
     decode_ref_free(&ref);

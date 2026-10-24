@@ -984,10 +984,10 @@ static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
             IFileOpenDialog_GetOptions(pfd, &options);
             IFileOpenDialog_SetOptions(pfd, options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
         } else {
-            COMDLG_FILTERSPEC filter = { L"FLAC files", L"*.flac" };
+            COMDLG_FILTERSPEC filter = { L"FLAC / LDF files", L"*.flac;*.ldf;*.oga;*.ogg" };
             IFileOpenDialog_SetFileTypes(pfd, 1, &filter);
         }
-        IFileOpenDialog_SetTitle(pfd, folder ? L"Select output folder for MISRC captures" : L"Select FLAC playback file");
+        IFileOpenDialog_SetTitle(pfd, folder ? L"Select output folder for MISRC captures" : L"Select FLAC / LDF playback file");
         if (SUCCEEDED(IFileOpenDialog_Show(pfd, NULL))) {
             IShellItem *psi = NULL;
             if (SUCCEEDED(IFileOpenDialog_GetResult(pfd, &psi))) {
@@ -1007,7 +1007,7 @@ static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
 #ifdef __APPLE__
     const char *cmd = folder
         ? "osascript -e 'POSIX path of (choose folder with prompt \"Select output folder for MISRC captures\")'"
-        : "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC playback file\")'";
+        : "osascript -e 'POSIX path of (choose file with prompt \"Select FLAC / LDF playback file\")'";
 #else
     const char *cmd = folder
         ? "sh -c 'if command -v zenity >/dev/null 2>&1; then "
@@ -1015,9 +1015,9 @@ static bool gui_settings_pick_path(char *picked, size_t cap, bool folder) {
           "elif command -v kdialog >/dev/null 2>&1; then "
           "kdialog --getexistingdirectory \"$HOME\" \"Select output folder for MISRC captures\"; fi'"
         : "sh -c 'if command -v zenity >/dev/null 2>&1; then "
-          "zenity --file-selection --title=\"Select FLAC playback file\" --file-filter=\"*.flac\"; "
+          "zenity --file-selection --title=\"Select FLAC / LDF playback file\" --file-filter=\"*.flac *.ldf *.oga *.ogg\"; "
           "elif command -v kdialog >/dev/null 2>&1; then "
-          "kdialog --getopenfilename \"$HOME\" \"*.flac|FLAC files (*.flac)\"; fi'";
+          "kdialog --getopenfilename \"$HOME\" \"*.flac *.ldf *.oga *.ogg|FLAC / LDF files\"; fi'";
 #endif
     FILE *fp = popen(cmd, "r");
     if (!fp) return false;
