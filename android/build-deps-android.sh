@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Cross-build the six MISRC GUI dependencies for Android arm64-v8a (API 30)
+# Cross-build MISRC GUI dependencies for Android arm64-v8a (API 30)
 # into .deps/install-android-arm64. Mirrors scripts/build-appimage-local.sh
 # and the main-branch CI (build.yml) dep builds, but adds the NDK toolchain.
 #
 # Deps (all built static):
 #   libFLAC 1.5.0   - hard-required by meson.build (flac.pc must report 1.5.0)
+#   Zstandard 1.5.7 - static libzstd for MISRC-M/2 monitor previews
 #   FFTW 3.3.10     - single-precision (fftw3f), required by misrc_gui
 #   libsoxr 0.1.3   - optional resampler (LIBSOXR_ENABLED)
 #   libusb 1.0.27   - Android backend (highest risk; FX3/DdD/hsdaoh depend on it)
@@ -39,6 +40,11 @@ FLAC_VERSION=1.5.0
 FLAC_TARBALL="flac-${FLAC_VERSION}.tar.xz"
 FLAC_URL="https://github.com/xiph/flac/releases/download/${FLAC_VERSION}/${FLAC_TARBALL}"
 FLAC_SHA256="f2c1c76592a82ffff8413ba3c4a1299b6c7ab06c734dee03fd88630485c2b920"
+
+ZSTD_VERSION=1.5.7
+ZSTD_TARBALL="zstd-${ZSTD_VERSION}.tar.gz"
+ZSTD_URL="https://github.com/facebook/zstd/releases/download/v${ZSTD_VERSION}/${ZSTD_TARBALL}"
+ZSTD_SHA256="eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3"
 
 FFTW_VERSION=3.3.10
 FFTW_TARBALL="fftw-${FFTW_VERSION}.tar.gz"
@@ -124,6 +130,30 @@ else
   cmake --install "$DEPS_SRC_DIR/flac-build"
 fi
 record "libFLAC" "${FLAC_VERSION} (sha256 ${FLAC_SHA256})"
+
+# ---------------- Zstandard 1.5.7 (static libzstd) ----------------
+# Required by the MISRC-M/2 monitor preview; the Android cross pkg-config
+# wrapper intentionally excludes host libraries, so Android needs its own .pc.
+log "=== Zstandard ${ZSTD_VERSION} (Android static libzstd) ==="
+if [[ "$(pc_version libzstd)" == "${ZSTD_VERSION}" ]]; then
+  log "skip (libzstd.pc already ${ZSTD_VERSION})"
+else
+  download "$ZSTD_URL" "$DEPS_SRC_DIR/$ZSTD_TARBALL" "$ZSTD_SHA256"
+  rm -rf "$DEPS_SRC_DIR/zstd-src" "$DEPS_SRC_DIR/zstd-build"
+  mkdir -p "$DEPS_SRC_DIR/zstd-src"
+  tar -xf "$DEPS_SRC_DIR/$ZSTD_TARBALL" -C "$DEPS_SRC_DIR/zstd-src" --strip-components=1
+  cmake_x -S "$DEPS_SRC_DIR/zstd-src/build/cmake" -B "$DEPS_SRC_DIR/zstd-build" \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DZSTD_BUILD_STATIC=ON -DZSTD_BUILD_SHARED=OFF \
+    -DZSTD_BUILD_PROGRAMS=OFF -DZSTD_BUILD_TESTS=OFF \
+    -DZSTD_MULTITHREAD_SUPPORT=OFF
+  cmake --build "$DEPS_SRC_DIR/zstd-build" --parallel "$JOBS"
+  cmake --install "$DEPS_SRC_DIR/zstd-build"
+fi
+# Verify the Android-cross prefix has the .pc file Meson needs.
+[[ "$(pc_version libzstd)" == "${ZSTD_VERSION}" ]] || fail \
+  "Android-cross libzstd.pc ${ZSTD_VERSION} missing after Zstd install"
+record "Zstandard" "${ZSTD_VERSION} (sha256 ${ZSTD_SHA256})"
 
 # ---------------- FFTW 3.3.10 (single precision -> fftw3f) ----------------
 log "=== FFTW ${FFTW_VERSION} (fftw3f) ==="
@@ -451,7 +481,7 @@ fi
 
 # ---------------- summary ----------------
 log "=== installed .pc versions ==="
-for pc in flac fftw3f soxr libusb-1.0 libuvc hsdaoh libhsdaoh raylib; do
+for pc in flac libzstd fftw3f soxr libusb-1.0 libuvc hsdaoh libhsdaoh raylib; do
   v="$(pc_version "$pc")"
   printf '  %-14s %s\n' "$pc" "${v:-(missing)}"
 done

@@ -9,6 +9,9 @@
  */
 
 #include "gui_record.h"
+#include "../net/monitor_local_save_proxy.h"
+#include "../net/gui_monitor_local_save.h"
+#include "../net/gui_net.h" /* GUI_NET_MODE_MONITOR_SERVER */
 #include "../core/gui_app.h"
 #include "../processing/gui_extract.h"
 #include "../ui/gui_popup.h"
@@ -71,6 +74,24 @@
 #include "FLAC/metadata.h"
 #endif
 
+/* All output FILE* are either genuine stdio streams or M-Client proxies;
+ * only Local Save causes the latter to be used. */
+#define fwrite mls_proxy_write
+#define fclose mls_proxy_close
+#define fflush mls_proxy_flush
+#define ferror mls_proxy_error
+#define clearerr mls_proxy_clearerr
+#define file_open_utf8 mls_proxy_open
+
+/* Raylib GetTime() is not driven by a window in --headless-monitor-server.
+ * Use the platform monotonic clock only for that mode; leave Harry's
+ * existing Local/RF timing unchanged. */
+static double gui_record_clock(const gui_app_t *app) {
+    if (app && app->settings.net_mode == GUI_NET_MODE_MONITOR_SERVER)
+        return (double)get_time_us() / 1000000.0;
+    return GetTime();
+}
+
 // Buffer sizes
 #define BUFFER_READ_SIZE 65536
 #define GUI_RECORD_PATH_MAX (FILE_PATH_MAX + MAX_FILENAME_LEN)
@@ -86,7 +107,7 @@
 
 static void gui_record_set_output_buffer(FILE *fp) {
     if (fp) {
-        (void)setvbuf(fp, NULL, _IOFBF, GUI_RECORD_OUTPUT_STDIO_BUFFER_BYTES);
+        (void)mls_proxy_setvbuf(fp, NULL, _IOFBF, GUI_RECORD_OUTPUT_STDIO_BUFFER_BYTES);
     }
 }
 
@@ -264,7 +285,7 @@ static void gui_record_get_os_string(char *dst, size_t dst_len) {
 static bool gui_record_get_free_space_bytes(const char *path, uint64_t *free_bytes_out);
 
 bool gui_record_get_output_free_space_bytes(const gui_app_t *app, uint64_t *free_bytes_out) {
-    if (!app || !free_bytes_out || !app->settings.output_path[0]) {
+    if (!app || !free_bytes_out || (!app->settings.output_path[0] && !gui_monitor_local_save_recording())) {
         return false;
     }
     return gui_record_get_free_space_bytes(app->settings.output_path, free_bytes_out);
@@ -453,7 +474,7 @@ static void gui_record_log_write_line_locked(const char *level, const char *mess
     if (!s_capture_log_file || !message || !message[0]) return;
     char ts[32];
     gui_record_build_log_timestamp(ts, sizeof(ts));
-    fprintf(s_capture_log_file, "[%s] [%s] %s\n", ts, (level && level[0]) ? level : "INFO", message);
+    mls_proxy_printf(s_capture_log_file, "[%s] [%s] %s\n", ts, (level && level[0]) ? level : "INFO", message);
     fflush(s_capture_log_file);
 }
 
@@ -570,9 +591,9 @@ static bool gui_record_get_free_space_bytes(const char *path, uint64_t *free_byt
 }
 
 #if defined(_WIN32) || defined(_WIN64)
-#define GUI_RECORD_FSEEK(stream, offset, whence) _fseeki64((stream), (__int64)(offset), (whence))
+#define GUI_RECORD_FSEEK(stream, offset, whence) mls_proxy_seek((stream),(offset),(whence))
 #else
-#define GUI_RECORD_FSEEK(stream, offset, whence) fseeko((stream), (off_t)(offset), (whence))
+#define GUI_RECORD_FSEEK(stream, offset, whence) mls_proxy_seek((stream),(offset),(whence))
 #endif
 
 #if !defined(_WIN32) && !defined(_WIN64)
@@ -614,6 +635,13 @@ static bool gui_record_spill_open_channel_in_dir(const char *base_dir,
 #endif
 
 static bool gui_record_spill_open_channel(gui_app_t *app, int channel, char *error_msg, size_t error_msg_size) {
+    if(gui_monitor_local_save_recording()){
+        if(error_msg && error_msg_size){
+            char diag[160]={0};gui_monitor_local_save_diagnostics(diag,sizeof(diag));
+            snprintf(error_msg,error_msg_size,"Local Save backpressure (%s); server-side disk spill disabled",diag);
+        }
+        return false;
+    }
     if (!gui_record_spill_valid_channel(channel)) {
         return false;
     }
@@ -1284,6 +1312,14 @@ static int flac_writer_thread(void *ctx) {
         // encoding resumes (recovery detected below).
         if (encode_failed) {
             atomic_store(&s_record_write_error[wctx->channel], true);
+            if(gui_monitor_local_save_recording()){
+                if(wctx->app){
+                    atomic_store(&wctx->app->dropout_stop_reason,GUI_DROPOUT_BACKPRESSURE);
+                    atomic_store(&wctx->app->dropout_stop_requested,true);
+                }
+                if(from_ringbuffer)bufmgr_read_end(wctx->bufmgr,wctx->buf_id,len);
+                break;
+            }
             if (from_ringbuffer && wctx->app) {
                 // Spill the raw block before marking it consumed (the
                 // ringbuffer memory is still valid here). Blocks that came
@@ -1420,6 +1456,11 @@ static int raw_writer_thread(void *ctx) {
         // output recovers). Periodically retry the output file; if the retry
         // write succeeds, resume normal operation (which will drain the spill
         // via gui_record_get_next_block).
+        if (write_error && gui_monitor_local_save_recording()) {
+            if(wctx->app){atomic_store(&wctx->app->dropout_stop_reason,GUI_DROPOUT_BACKPRESSURE);
+               atomic_store(&wctx->app->dropout_stop_requested,true);}
+            break;
+        }
         if (write_error) {
             void *rb_buf = bufmgr_read_begin(wctx->bufmgr, wctx->buf_id, in_len, timeout_ms);
             if (!rb_buf) {
@@ -1681,6 +1722,8 @@ bool gui_record_check_disk_space_guard(gui_app_t *app, uint32_t frame_index,
     if (!app || !app->is_recording || !app->settings.output_path[0]) {
         return false;
     }
+    /* Client-owned files: the server's disk free space is irrelevant. */
+    if(gui_monitor_local_save_recording())return false;
 
     if (atomic_load(&s_disk_guard_tripped)) {
         return true;
@@ -1973,6 +2016,7 @@ static const char *raw_ext_for_bits(uint8_t bits, bool direct_native) {
 // (capture log) and gui_record_start_confirmed (writer/tap selection) so all
 // three always agree with the on-disk content.
 static bool gui_record_direct_channel_eligible(const gui_app_t *app, int channel) {
+    if(gui_monitor_local_save_recording())return false;
     if (!app || app->settings.use_flac) return false;
     if (app->selected_device < 0 || app->selected_device >= app->device_count) return false;
     if (app->devices[app->selected_device].type != DEVICE_TYPE_CXADC) return false;
@@ -2564,7 +2608,7 @@ static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_cou
     const char *labels[] = { "RF A", "RF B", "Audio quad", "Audio 1/2", "Audio 3/4",
                              "Audio 1", "Audio 2", "Audio 3", "Audio 4" };
     bool directory = false;
-    if (!file_path_info_utf8(app->settings.output_path, NULL, &directory) || !directory) {
+    if (!gui_monitor_local_save_recording() && (!file_path_info_utf8(app->settings.output_path, NULL, &directory) || !directory)) {
         gui_app_set_status(app, "Output directory does not exist or cannot be read");
         return false;
     }
@@ -2589,7 +2633,7 @@ static bool gui_record_check_output_paths(gui_app_t *app, unsigned *existing_cou
             return false;
         }
         uint64_t bytes = 0;
-        if (file_path_info_utf8(path, &bytes, &directory)) {
+        if (!gui_monitor_local_save_recording() && file_path_info_utf8(path, &bytes, &directory)) {
             if (directory) {
                 gui_app_set_status(app, "Output filename refers to a directory");
                 return false;
@@ -2918,6 +2962,11 @@ static int gui_record_start_confirmed(gui_app_t *app) {
         if (app->settings.capture_a) {
             config_a.bits_per_sample = s_ctx_a.flac_bits_per_sample;
             config_a.callback_user_data = &s_ctx_a;
+            if(gui_monitor_local_save_recording()){
+                config_a.sink_write=mls_proxy_write;
+                config_a.sink_seek=mls_proxy_seek;
+                config_a.sink_tell=mls_proxy_tell;
+            }
             s_flac_writer_a = flac_writer_create_stream(s_file_a, &config_a);
             if (!s_flac_writer_a) {
                 gui_app_set_status(app, "Failed to create FLAC encoder A");
@@ -2943,6 +2992,11 @@ static int gui_record_start_confirmed(gui_app_t *app) {
             config_b.bytes_cb = gui_flac_bytes_callback;
             config_b.bits_per_sample = s_ctx_b.flac_bits_per_sample;
             config_b.callback_user_data = &s_ctx_b;
+            if(gui_monitor_local_save_recording()){
+                config_b.sink_write=mls_proxy_write;
+                config_b.sink_seek=mls_proxy_seek;
+                config_b.sink_tell=mls_proxy_tell;
+            }
             s_flac_writer_b = flac_writer_create_stream(s_file_b, &config_b);
             if (!s_flac_writer_b) {
                 gui_app_set_status(app, "Failed to create FLAC encoder B");
@@ -2973,7 +3027,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
 
         // Mark as recording
         app->is_recording = true;
-        app->recording_start_time = GetTime();
+        app->recording_start_time = gui_record_clock(app);
 
         // Start writer threads BEFORE enabling recording in extraction thread
         // This ensures consumers are ready before producer starts filling buffers
@@ -3159,7 +3213,7 @@ static int gui_record_start_confirmed(gui_app_t *app) {
 
         // Mark as recording
         app->is_recording = true;
-        app->recording_start_time = GetTime();
+        app->recording_start_time = gui_record_clock(app);
 
         // Start writer threads BEFORE enabling recording in extraction thread
         // This ensures consumers are ready before producer starts filling buffers
@@ -3289,7 +3343,7 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
     // Finalize RF FLAC metadata in a single in-place pass: STREAMINFO duration
     // (kHz-scaled total_samples) + Vorbis comment duration tags. Both are
     // written in place via the simple iterator — no full-file temp copy.
-    if (app->settings.use_flac) {
+    if (app->settings.use_flac && !gui_monitor_local_save_recording()) {
         if (app->settings.capture_a && s_record_path_a[0]) {
             gui_record_finalize_flac_metadata(app, s_record_path_a, "CH A",
                                               flac_samples_a, s_record_sample_rate_a);
@@ -3302,7 +3356,7 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
 #endif
 
     // Print recording summary with backpressure stats
-    double stop_complete_time = GetTime();
+    double stop_complete_time = gui_record_clock(app);
     double total_duration = stop_complete_time - app->recording_start_time;
     double capture_duration = stop_request_time - app->recording_start_time;
     double processing_duration = stop_complete_time - stop_request_time;
@@ -3394,7 +3448,12 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
         gui_record_build_iso8601_timestamp(end_iso, sizeof(end_iso));
         gui_record_log_writef("INFO", "datetime_end: %s", end_iso[0] ? end_iso : "unknown");
     }
-    gui_record_log_writef("INFO", "Session complete");
+    /* FLAC/WAV close and header rewrites must succeed before COMMIT. */
+    bool local_incomplete=gui_monitor_local_save_recording() &&
+        (rec_drops!=0 || gui_monitor_local_save_failed() || gui_record_has_write_error());
+    gui_record_log_writef(local_incomplete?"ERROR":"INFO",
+        local_incomplete ? "Local Save incomplete (.partial files retained)" :
+        gui_monitor_local_save_recording() ? "Payload finalized; client COMMIT pending" : "Session complete");
     gui_record_close_session_log();
     s_record_path_a[0] = '\0';
     s_record_path_b[0] = '\0';
@@ -3408,6 +3467,16 @@ static void gui_record_finalize_stop_sync(gui_app_t *app, double stop_request_ti
     s_record_sample_rate_b = 0;
 #endif
 
+    if(gui_monitor_local_save_recording()){
+        /* Audio thread finalizes WAV after recording state clears. */
+        for(int i=0;i<500 && mls_proxy_open_count();i++)thrd_sleep_ms(10);
+        bool good=!local_incomplete && !gui_monitor_local_save_failed() &&
+            !gui_record_has_write_error() && mls_proxy_open_count()==0;
+        bool committed=gui_monitor_local_save_end(good);
+        fprintf(stderr,"[M-LOCAL] %s\n",committed ? "client files committed" :
+                "incomplete session; .partial client files retained");
+        if(!committed)gui_app_set_status(app,"Local Save incomplete; check client .partial files");
+    }
     s_recording_app = NULL;
 }
 
@@ -3435,7 +3504,7 @@ void gui_record_stop(gui_app_t *app) {
         return;
     }
     gui_record_reset_disk_guard_state();
-    double stop_request_time = GetTime();
+    double stop_request_time = gui_record_clock(app);
 
     // Direct native taps first: disable them and wait for any in-flight
     // card pushes to finish, so the writers' final drain (triggered by

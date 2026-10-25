@@ -1,4 +1,5 @@
 #include "gui_audio.h"
+#include "../net/monitor_local_save_proxy.h"
 
 #include "raylib.h"
 
@@ -16,6 +17,14 @@
 #if LIBSOXR_ENABLED
 #include <soxr.h>
 #endif
+
+/* Only M-Server Local Save wraps files. Genuine stdio remains unchanged. */
+#define fwrite mls_proxy_write
+#define fclose mls_proxy_close
+#define fflush mls_proxy_flush
+#define ferror mls_proxy_error
+#define clearerr mls_proxy_clearerr
+#define file_open_utf8 mls_proxy_open
 
 // External do_exit flag from ringbuffer.h
 extern atomic_int do_exit;

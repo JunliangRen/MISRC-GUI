@@ -1,12 +1,16 @@
 /*
  * MISRC GUI - Server/Client networking (cxadc_vhs_server-style peer mode)
  *
- * Any MISRC-GUI instance can run in one of three modes (gui_settings_t.net_mode):
+ * The legacy Local/Server/Client roles retain their existing RF protocol.
+ * Two additional monitor roles are reserved for the separate preview protocol.
+ * Any MISRC-GUI instance selects one role (gui_settings_t.net_mode):
  *   0 = Local  (default; no networking, behaves exactly as before)
  *   1 = Server (host/master: owns hardware + capture, serves HTTP control + RF/audio streams)
  *   2 = Client (slave: connects to a Server, mirrors device list/controls/state,
  *               ingests RF+audio streams into the local pipeline, and forwards its
  *               own start/stop/record/device-select actions to the server)
+ *   3 = M-Server (dedicated monitor status/control server)
+ *   4 = M-Client (dedicated monitor status/control client)
  *
  * Protocol: HTTP/1.0, GET-only (adapted from the reference cxadc-capture-server).
  *   GET /version            -> MISRC version text
@@ -42,6 +46,11 @@
 #define GUI_NET_MODE_LOCAL  0
 #define GUI_NET_MODE_SERVER 1
 #define GUI_NET_MODE_CLIENT 2
+#define GUI_NET_MODE_MONITOR_SERVER 3
+#define GUI_NET_MODE_MONITOR_CLIENT 4
+
+/* Independent monitor roles: NEVER fall back to the legacy /rf protocol. */
+#define GUI_NET_MODE_LAST GUI_NET_MODE_MONITOR_CLIENT
 
 /* One-time global init/cleanup (WSAStartup/WSACleanup on Windows; SIGPIPE ignore
  * on POSIX). Safe to call multiple times; idempotent. */
@@ -99,9 +108,9 @@ void gui_net_set_status(gui_app_t *app, const char *msg);
 /* Read the current network status line into buf (for the info window UI). */
 void gui_net_status_string(const gui_app_t *app, char *buf, size_t len);
 
-/* LAN server discovery (client mode). The client listens for UDP beacons
- * broadcast by servers and exposes the found servers for the UI to render as a
- * selectable list, replacing manual host:port entry. */
+/* LAN server discovery (Client and M-Client modes). Both display the same
+ * UDP server list. M-Client only discovers/selects hosts until the dedicated
+ * monitor backend is integrated; never use legacy RF endpoints in M-Client. */
 int  gui_net_discovered_count(void);
 bool gui_net_get_discovered(int index, char *host, size_t host_cap,
                             uint16_t *port, char *name, size_t name_cap);

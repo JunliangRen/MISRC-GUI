@@ -67,4 +67,13 @@ void gui_waveform_set_trigger_source_buffers(const int16_t *samples_ch1,
                                              const int16_t *samples_ch2,
                                              size_t count);
 
+/* M-Server uses Harry's waveform resampler/trigger CPU path. */
+#include "../net/gui_remote_display.h"
+size_t gui_waveform_server_display_points(const int16_t *src,const int16_t *a,
+    const int16_t *b,size_t count,uint32_t sample_rate,
+    const gui_rd_config_t *cfg,float out[GUI_RD_WIDTH],int32_t *trigger_pos);
+void gui_waveform_remote_apply_points(void *state,const gui_rd_channel_t *data,
+                                     uint32_t sequence);
+void gui_waveform_remote_publish_config(void *state,int channel);
+
 #endif // GUI_OSCILLOSCOPE_H

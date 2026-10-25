@@ -6,6 +6,9 @@
 
 #include <stdarg.h>
 #include <stdatomic.h>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <time.h>
+#endif
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -1048,18 +1051,35 @@ static inline void gui_upstream_mark_synced(gui_app_t *app)
 }
 
 
+/* glfwGetTime() requires GLFW initialization. The headless server never
+ * creates a window, so use CLOCK_MONOTONIC only for that launch mode. */
+static atomic_bool s_headless_runtime = ATOMIC_VAR_INIT(false);
+void gui_runtime_set_headless(bool enabled) { atomic_store(&s_headless_runtime, enabled); }
+double gui_runtime_time(void) {
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (atomic_load(&s_headless_runtime)) {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+            return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+    }
+#endif
+    return GetTime();
+}
+
 // Initialize application
 void gui_app_init(gui_app_t *app) {
     // Initialize panel registry and register all panel types
     // This must happen before any panel state is created
-    panel_registry_init();
-    gui_waveform_panel_register();
-    gui_fft_panel_register();
-    gui_cvbs_panel_register();
-    gui_histogram_panel_register();
-    gui_waterfall_panel_register();
-    gui_spectrograph_panel_register();
-    gui_demod_panel_register();
+    if (!app->headless_server) {
+        panel_registry_init();
+        gui_waveform_panel_register();
+        gui_fft_panel_register();
+        gui_cvbs_panel_register();
+        gui_histogram_panel_register();
+        gui_waterfall_panel_register();
+        gui_spectrograph_panel_register();
+        gui_demod_panel_register();
+    }
 
     // Initialize per-channel display buffers
     memset(app->display_samples_a, 0, sizeof(app->display_samples_a));
@@ -1154,8 +1174,8 @@ void gui_app_init(gui_app_t *app) {
     app->trigger_b.phosphor_color = PHOSPHOR_COLOR_HEATMAP;  // Opacity mode by default
 
     // Initialize phosphor display state
-    app->phosphor_a = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
-    app->phosphor_b = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
+    if (!app->headless_server) app->phosphor_a = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
+    if (!app->headless_server) app->phosphor_b = (phosphor_rt_t *)calloc(1, sizeof(phosphor_rt_t));
 
     // Set phosphor config (render textures are created lazily on first use)
     if (app->phosphor_a) {
@@ -1178,14 +1198,14 @@ void gui_app_init(gui_app_t *app) {
     app->panel_config_a.split = true;
     app->panel_config_a.left_view = PANEL_VIEW_WAVEFORM;
     app->panel_config_a.right_view = PANEL_VIEW_FFT;
-    app->panel_config_a.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
-    app->panel_config_a.right_state = panel_create_view_state(PANEL_VIEW_FFT);
+    if (!app->headless_server) app->panel_config_a.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
+    if (!app->headless_server) app->panel_config_a.right_state = panel_create_view_state(PANEL_VIEW_FFT);
 
     app->panel_config_b.split = true;
     app->panel_config_b.left_view = PANEL_VIEW_WAVEFORM;
     app->panel_config_b.right_view = PANEL_VIEW_FFT;
-    app->panel_config_b.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
-    app->panel_config_b.right_state = panel_create_view_state(PANEL_VIEW_FFT);
+    if (!app->headless_server) app->panel_config_b.left_state = panel_create_view_state(PANEL_VIEW_WAVEFORM);
+    if (!app->headless_server) app->panel_config_b.right_state = panel_create_view_state(PANEL_VIEW_FFT);
 
     // Note: All buffers (BUF_CAPTURE_RF, BUF_CAPTURE_AUDIO, etc.) are initialized
     // by buffer manager automatically on first use
@@ -1205,7 +1225,7 @@ void gui_app_init(gui_app_t *app) {
     gui_extract_prepare_stream(app);
 
     // Initialize display thread (allocated, started on capture start)
-    app->display_thread = (display_thread_t *)calloc(1, sizeof(display_thread_t));
+    if (!app->headless_server) app->display_thread = (display_thread_t *)calloc(1, sizeof(display_thread_t));
     if (app->display_thread) {
         if (gui_display_thread_init(app->display_thread) != 0) {
             fprintf(stderr, "Failed to initialize display thread state\n");
@@ -1236,7 +1256,7 @@ void gui_app_init(gui_app_t *app) {
     // Server/Client from the info page each session.
     // EXCEPTION: when launched with --config <path> (automated testing),
     // respect the config's net_mode instead of forcing Local.
-    if (!gui_settings_override_active()) {
+    if (!gui_settings_override_active() && !app->headless_server) {
         app->settings.net_mode = GUI_NET_MODE_LOCAL;
         gui_settings_save(&app->settings);
     }
@@ -1317,7 +1337,7 @@ void gui_app_cleanup(gui_app_t *app) {
     panel_config_cleanup(&app->panel_config_b);
 
     // Cleanup oscilloscope static resources
-    gui_oscilloscope_cleanup();
+    if (!app->headless_server) gui_oscilloscope_cleanup();
 
     // Cleanup display thread
     if (app->display_thread) {
@@ -1856,6 +1876,15 @@ int gui_app_start_capture(gui_app_t *app) {
     if (!app || gui_playback_is_starting(app)) {
         return -1;
     }
+    /* M-Server owns the local capture hardware and publishes extracted samples
+     * through the independent monitor preview transport. M-Client must not
+     * open hardware: queue a command for the verified M-Server instead.
+     * Keep Harry's existing Local/Server/Client paths unchanged. */
+    if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+        gui_net_client_request_start(app);
+        gui_net_set_status(app, "M-Client: requested capture start on M-Server");
+        return 0;
+    }
 
     // Client mode (network slave): forward the request to the server instead
     // of opening local hardware. The worker thread drains the flag and sends
@@ -1950,7 +1979,7 @@ int gui_app_start_capture(gui_app_t *app) {
                      prev_runtime_mode ? "MISRC" : "HSDAOH",
                      app->capture_mode_runtime_misrc ? "MISRC" : "HSDAOH",
                      app->user_capture_mode_misrc ? "MISRC" : "HSDAOH");
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -1998,7 +2027,7 @@ int gui_app_start_capture(gui_app_t *app) {
             // is sent (done inside gui_fx3_start), so the 5s grace period must
             // begin here, not at app init. Without this, capture_start_time stays
             // 0 and the watchdog reaps the session within 2s -> connect loop.
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -2038,7 +2067,7 @@ int gui_app_start_capture(gui_app_t *app) {
         }
         int rtl_rc = gui_rtlsdr_start(app);
         if (rtl_rc == 0) {
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -2109,7 +2138,7 @@ int gui_app_start_capture(gui_app_t *app) {
             // Same watchdog fix as FX3: capture_start_time must be set here or
             // the auto-reconnect watchdog fires within 2s (DdD streams
             // immediately on bulk submit, but the grace baseline still matters).
-            app->capture_start_time = GetTime();
+            app->capture_start_time = gui_runtime_time();
             app->reconnect_pending = false;
             app->reconnect_attempts = 0;
             {
@@ -2413,7 +2442,7 @@ windows_mf_open_hid:
         // immediate false timeout -> disconnect -> reconnect cycle.
         atomic_store(&app->last_callback_time_ms, get_time_ms());
         app->is_capturing = true;
-        app->capture_start_time = GetTime();
+        app->capture_start_time = gui_runtime_time();
         app->reconnect_pending = false;
         app->reconnect_attempts = 0;
 
@@ -2954,7 +2983,7 @@ void gui_app_clear_display(gui_app_t *app) {
         strncpy(app->status_message, message,
                 sizeof(app->status_message) - 1);
         app->status_message[sizeof(app->status_message) - 1] = '\0';
-        app->status_message_time = GetTime();
+        app->status_message_time = gui_runtime_time();
     }
 void gui_capture_poll_hsdaoh_status(gui_app_t *app)
 {

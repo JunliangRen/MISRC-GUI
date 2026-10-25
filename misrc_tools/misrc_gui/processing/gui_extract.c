@@ -8,6 +8,8 @@
  */
 
 #include "gui_extract.h"
+#include "../net/gui_monitor_transport.h"
+#include "../net/gui_remote_display.h"
 #include "gui_rf_stream_marks.h"
 #include "../core/gui_app.h"
 #include "../output/gui_record.h"
@@ -158,7 +160,7 @@ void gui_extract_prepare_stream(gui_app_t *app) {
     // No extraction producer is running here. Clear pressure from the prior
     // session so a new capture does not inherit its frozen-preview state.
     const gui_rf_block_info_t empty_info[2] = {{0}};
-    gui_video_submit_rf(app,NULL,NULL,0,0,empty_info,true);
+    if (!app->headless_server) gui_video_submit_rf(app,NULL,NULL,0,0,empty_info,true);
     app->buffers.rf_write_observer = observe_rf_write;
     app->buffers.rf_write_observer_context = app;
 }
@@ -427,10 +429,29 @@ static int extraction_thread(void *ctx) {
 
         // Signal that space is now available (buffer manager handles events internally)
 
+        /* M-Server copies the latest ORIGINAL capture block only, at <=10 Hz.
+         * Compression/resampling/FFT happen off the extraction worker in the
+         * monitor HTTP thread, never blocking RF capture on slow clients. */
+        if (gui_monitor_server_active()) {
+            static uint64_t last_preview_ms;
+            uint64_t now=get_time_ms();
+            if(now-last_preview_ms>=100u){
+                last_preview_ms=now;
+                gui_rd_capture(mapped_a,mapped_b,BUFFER_READ_SIZE,
+                    atomic_load(&s_extract_app->sample_rate),(uint32_t)frame_count);
+            }
+        }
+
         // Write extracted samples to display buffer (lossy - OK to drop for display)
         // Display thread handles CVBS decode + oscilloscope processing
         // Frame layout: [samples_a: BUFFER_READ_SIZE * 2 bytes] [samples_b: BUFFER_READ_SIZE * 2 bytes]
-        if ((frame_count % ui_stride) == 0) {
+        /* Headless M-Server builds previews directly from the captured samples
+         * (gui_rd_capture above). There is no display thread to consume the
+         * legacy BUF_DISPLAY queue; filling it wastes copies and creates a
+         * perpetually full queue with drop counters increasing indefinitely.
+         * Keep all other modes, including legacy headless Server, unchanged. */
+        if ((frame_count % ui_stride) == 0 &&
+            !(s_extract_app->headless_server && gui_monitor_server_active())) {
             size_t display_frame_size = BUFFER_READ_SIZE * sizeof(int16_t) * 2;
             uint8_t *display_buf = bufmgr_write_begin(&s_extract_app->buffers, BUF_DISPLAY,
                                                     display_frame_size, NULL);
@@ -461,8 +482,9 @@ static int extraction_thread(void *ctx) {
         }
         stamp.info[0].discontinuity |= mapping_gap;
         stamp.info[1].discontinuity |= mapping_gap;
-        gui_video_submit_rf(s_extract_app, mapped_a, mapped_b, stamp.counts[0], stamp.counts[1],
-                              stamp.info, atomic_load(&s_extract_app->rf_preview_input_supported));
+        if (!s_extract_app->headless_server)
+            gui_video_submit_rf(s_extract_app, mapped_a, mapped_b, stamp.counts[0], stamp.counts[1],
+                                  stamp.info, atomic_load(&s_extract_app->rf_preview_input_supported));
         source_offset += BUFFER_READ_SIZE;
         // Update expensive UI stats at the same dynamic stride used for display.
         if ((frame_count % ui_stride) == 0) {
