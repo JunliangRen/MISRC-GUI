@@ -114,6 +114,8 @@ AudioStream LoadAudioStream(unsigned rate,unsigned bits,unsigned channels)
     return (AudioStream){.buffer=(void*)1,.sampleRate=rate,.sampleSize=bits,.channels=channels};
 }
 bool IsAudioStreamValid(AudioStream stream) { return stream.buffer!=NULL; }
+void SetAudioStreamCallback(AudioStream stream,AudioCallback callback)
+{ assert(main_thread && stream.buffer && callback); }
 void PlayAudioStream(AudioStream stream) { assert(main_thread && stream.buffer); stream_playing=true; }
 void StopAudioStream(AudioStream stream) { assert(main_thread && stream.buffer); stream_playing=false; }
 void UnloadAudioStream(AudioStream stream) { assert(main_thread && stream.buffer); ++stream_unloads; }

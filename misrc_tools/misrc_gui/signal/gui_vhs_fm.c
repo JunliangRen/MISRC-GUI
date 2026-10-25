@@ -73,11 +73,28 @@ void gui_vhs_fm_set_mesecam(vhs_fm_decoder_t *decoder, bool enabled) {
     decoder->format = gui_vhs_fm_get_format(decoder);
     // Only SECAM VHS uses this option; keep the remembered value on other systems.
 }
+void gui_vhs_fm_set_beta_preset(vhs_fm_decoder_t *decoder, int preset) {
+    if (!decoder) return;
+    decoder->overlay.beta_preset = preset >= 0 && preset < GUI_BETA_PRESET_COUNT
+        ? (gui_beta_preset_t)preset : GUI_BETA_PRESET_BETAMAX;
+    // Route updates rebind video only when the recording preset changes.
+}
+const char *gui_vhs_fm_get_beta_preset_name(const vhs_fm_decoder_t *decoder) {
+    if (decoder && decoder->overlay.beta_preset == GUI_BETA_PRESET_ED_BETA) return "ED Beta";
+    if (decoder && decoder->overlay.beta_preset == GUI_BETA_PRESET_SUPERBETA) return "SuperBeta";
+    if (decoder && decoder->overlay.beta_preset == GUI_BETA_PRESET_BETAMAX_HIFI) return "Betamax Hi-Fi";
+    return "Betamax";
+}
 gui_rf_profile_t gui_vhs_fm_get_profile(const vhs_fm_decoder_t *decoder) {
-    if (decoder && decoder->overlay.selected_tape == 1 && decoder->overlay.beta_super)
-        return decoder->overlay.beta_hifi ? GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI : GUI_RF_PROFILE_NTSC_SUPERBETA;
-    if (decoder && decoder->overlay.selected_tape == 1)
-        return decoder->overlay.beta_hifi ? GUI_RF_PROFILE_NTSC_BETAMAX_HIFI : GUI_RF_PROFILE_NTSC_BETAMAX;
+    if (decoder && decoder->overlay.selected_tape == 1) {
+        if (decoder->overlay.beta_preset == GUI_BETA_PRESET_ED_BETA)
+            return GUI_RF_PROFILE_NTSC_ED_BETA;
+        if (decoder->overlay.beta_preset == GUI_BETA_PRESET_SUPERBETA)
+            // Keep Hi-Fi available without changing/relocking video when Audio Mon is toggled.
+            return GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;
+        return decoder->overlay.beta_preset == GUI_BETA_PRESET_BETAMAX_HIFI
+            ? GUI_RF_PROFILE_NTSC_BETAMAX_HIFI : GUI_RF_PROFILE_NTSC_BETAMAX;
+    }
     if (decoder && decoder->overlay.selected_system == 2)
         return decoder->overlay.secam_mesecam ? GUI_RF_PROFILE_MESECAM_VHS : GUI_RF_PROFILE_SECAM_VHS;
     return decoder && decoder->overlay.selected_system == 1 ? GUI_RF_PROFILE_NTSC_VHS : GUI_RF_PROFILE_PAL_VHS;
@@ -223,8 +240,12 @@ void gui_vhs_fm_render_frame(vhs_fm_decoder_t *decoder, float x, float y,
                                       (y + height - pad + 2.0f) - block_top},
                          (Color){0, 0, 0, 110});
         float ly = y + height - pad - line_h * (float)(stat_lines + 1); // above the reason line
-        snprintf(line, sizeof(line), "%s | %.3f -> 20 MHz | H:%s V:%s Color:%s",
-                 gui_rf_profile_name(gui_vhs_fm_get_profile(decoder)), decoder->stats.source_rate_hz / 1000000.0,
+        snprintf(line, sizeof(line), "%s%s | %.3f -> %.0f MHz | H:%s V:%s Color:%s",
+                 decoder->overlay.selected_tape ? "NTSC " : "",
+                 decoder->overlay.selected_tape ? gui_vhs_fm_get_beta_preset_name(decoder)
+                     : gui_rf_profile_name(gui_vhs_fm_get_profile(decoder)),
+                 decoder->stats.source_rate_hz / 1000000.0,
+                 gui_rf_profile_video_rate_hz(gui_vhs_fm_get_profile(decoder)) / 1000000.0,
                  status->h_locked ? "LOCK" : "SCAN", status->v_locked ? "LOCK" : "SCAN",
                  status->color_locked ? "LOCK" : "OFF");
         // Yellow OSD-style text (matching the reason line) over the backing

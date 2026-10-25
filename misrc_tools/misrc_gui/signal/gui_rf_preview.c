@@ -25,7 +25,6 @@
 #endif
 
 #define RF_PI 3.14159265358979323846
-#define RF_RAW_RATE 20000000.0
 #define RF_VIDEO_RATE 5000000.0
 #define RF_RING_SIZE (1u << 19)
 #define RF_RING_MASK (RF_RING_SIZE - 1u)
@@ -110,7 +109,15 @@ static const rf_profile_t rf_profiles[] = {
      * The wider sideband filter is a preview choice, not a recording spec. */
     {768,576,22,5,GUI_RF_PAL_LINE_US,4100000.0,3800000.0,7000.0,732446.875,
      5.6,7.85,GUI_RF_PAL_ACTIVE_START_US,GUI_RF_PAL_ACTIVE_END_US,100e-9,400e-9,
-     4300000.0,1300000.0,6500000.0,600000.0,2,4,0,0,0,false,RF_HYBRID_BLACK_IRE_PAL,RF_HYBRID_SPAN_IRE_PAL}
+     4300000.0,1300000.0,6500000.0,600000.0,2,4,0,0,0,false,RF_HYBRID_BLACK_IRE_PAL,RF_HYBRID_SPAN_IRE_PAL},
+    /* Sony EDV-9500: 6.8MHz sync / 9.3MHz 100IRE white, 688kHz C.
+     * Use the reduced 20MSPS preview band; upper FM sidebands are omitted.
+     * Flat preview de-emphasis deliberately omits Sony's nonlinear LCR
+     * expansion. RF/IQ bandwidths are streaming-preview engineering choices. */
+    {640,480,20,6,GUI_RF_NTSC_LINE_US,7514285.714285714,6800000.0,
+     17857.14285714286,688374.125874126,
+     5.3,7.8,GUI_RF_NTSC_ACTIVE_START_US,GUI_RF_NTSC_ACTIVE_END_US,0,0,
+     8050000.0,4200000.0,9500000.0,350000.0,2,4,0,1000000.0,.70710678,true,RF_HYBRID_BLACK_IRE_NTSC,RF_HYBRID_SPAN_IRE_NTSC}
 };
 
 _Static_assert(sizeof(rf_profiles)/sizeof(rf_profiles[0])==GUI_RF_PROFILE_COUNT,
@@ -118,6 +125,10 @@ _Static_assert(sizeof(rf_profiles)/sizeof(rf_profiles[0])==GUI_RF_PROFILE_COUNT,
 
 static bool rf_profile_valid(gui_rf_profile_t profile) {
     return profile>=GUI_RF_PROFILE_PAL_VHS && profile<GUI_RF_PROFILE_COUNT;
+}
+
+uint32_t gui_rf_profile_video_rate_hz(gui_rf_profile_t profile) {
+    return profile==GUI_RF_PROFILE_NTSC_ED_BETA ? GUI_RF_ED_BETA_RATE_HZ : GUI_RF_DECODE_RATE_HZ;
 }
 
 gui_rf_format_t gui_rf_profile_format(gui_rf_profile_t profile) {
@@ -131,26 +142,28 @@ static bool rf_secam_fm(const gui_rf_decoder_t *d);
 
 const char *gui_rf_profile_name(gui_rf_profile_t profile) {
     static const char *names[]={"PAL VHS SP","NTSC VHS SP","NTSC Betamax","NTSC Beta Hi-Fi",
-        "NTSC SuperBeta","NTSC SuperBeta Hi-Fi","SECAM VHS SP","MESECAM VHS SP"};
+        "NTSC SuperBeta","NTSC SuperBeta Hi-Fi","SECAM VHS SP","MESECAM VHS SP","NTSC ED Beta"};
     return rf_profile_valid(profile) ? names[profile] : "Unknown RF profile";
 }
 
 bool gui_rf_profile_has_hifi(gui_rf_profile_t profile) {
     return profile==GUI_RF_PROFILE_NTSC_BETAMAX_HIFI ||
-           profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI;
+           profile==GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI || profile==GUI_RF_PROFILE_NTSC_ED_BETA;
 }
 
 struct gui_rf_decoder {
     gui_rf_format_t format;
     gui_rf_profile_t profile;
     rf_profile_t p;
+    double raw_rate;
+    unsigned raw_decimation;
     bool full_frame;   /* Active/Full display mode (see set_frame_mode). */
     float *storage, *luma, *sync, *ci, *cq, *envelope, *sync_luma, *secam_fm;
     uint8_t *rgba;
     uint64_t next_raw, low_first, low_last;
     bool have_raw, have_low;
     float *mesecam_i,*mesecam_q;
-    rf_biquad_t rf_hp[6], rf_lp, yi[2], yq[2], ui[4], uq[4], luma_deemph;
+    rf_biquad_t rf_hp[6], rf_lp, yi[4], yq[4], ui[4], uq[4], luma_deemph;
 #if GUI_RF_PACKED_IQ
     rf_biquad4_t beta_iq[4];
 #endif
@@ -1457,7 +1470,8 @@ static bool rf_level_measure(const gui_rf_decoder_t *d,uint64_t first,
  * individual porches and ordinary picture changes cannot pump brightness. */
 static void rf_prepare_display_levels(gui_rf_decoder_t *d) {
     if((d->profile!=GUI_RF_PROFILE_NTSC_SUPERBETA &&
-        d->profile!=GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI && !rf_secam_fm(d)) ||
+        d->profile!=GUI_RF_PROFILE_NTSC_SUPERBETA_HIFI &&
+        d->profile!=GUI_RF_PROFILE_NTSC_ED_BETA && !rf_secam_fm(d)) ||
         d->display_levels_valid || !d->have_low ||
         d->low_last<d->display_level_search_after) return;
     uint64_t window=(uint64_t)(d->p.line_us*5.0*192.0);
@@ -1542,6 +1556,8 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
     d->profile=profile;
     d->format=gui_rf_profile_format(profile);
     d->p=rf_profiles[profile];
+    d->raw_rate=gui_rf_profile_video_rate_hz(profile);
+    d->raw_decimation=(unsigned)(d->raw_rate/RF_VIDEO_RATE);
     d->period=d->p.line_us*5.0;
     d->sync_est=d->p.sync_hz; d->blank_est=d->p.blank_hz;
     d->sync_anchor=d->p.sync_hz;d->blank_anchor=d->p.blank_hz;
@@ -1549,32 +1565,52 @@ void gui_rf_decoder_reset_profile(gui_rf_decoder_t *d, gui_rf_profile_t profile)
     d->luma_wow=1.0;
     d->fm_center=d->p.fm_center;
     d->y_cos=d->c_cos=1.0;
-    d->y_step_cos=cos(2.0*RF_PI*d->fm_center/RF_RAW_RATE);
-    d->y_step_sin=sin(2.0*RF_PI*d->fm_center/RF_RAW_RATE);
-    d->c_step_cos=cos(2.0*RF_PI*d->p.carrier_hz/RF_RAW_RATE);
-    d->c_step_sin=sin(2.0*RF_PI*d->p.carrier_hz/RF_RAW_RATE);
+    d->y_step_cos=cos(2.0*RF_PI*d->fm_center/d->raw_rate);
+    d->y_step_sin=sin(2.0*RF_PI*d->fm_center/d->raw_rate);
+    d->c_step_cos=cos(2.0*RF_PI*d->p.carrier_hz/d->raw_rate);
+    d->c_step_sin=sin(2.0*RF_PI*d->p.carrier_hz/d->raw_rate);
     for (int n=0;n<d->p.rf_highpass_sections;++n) {
         double q=d->p.rf_highpass_sections==1 ? .70710678
             : 1.0/(2.0*cos((2.0*n+1.0)*RF_PI/(4.0*d->p.rf_highpass_sections)));
-        d->rf_hp[n]=rf_filter(RF_RAW_RATE,d->p.rf_low,q,true);
+        d->rf_hp[n]=rf_filter(d->raw_rate,d->p.rf_low,q,true);
     }
-    d->rf_lp=rf_filter(RF_RAW_RATE,d->p.rf_high,.70710678,false);
+    d->rf_lp=rf_filter(d->raw_rate,d->p.rf_high,.70710678,false);
     const double qs[2]={.5411961,1.3065630};
+    /* ED filters before each reduction: Y at 20/20M, C at 20/20/5/5M.
+     * Keep absolute raw-sample phases in process(), and account for each
+     * section's actual rate when registering the common 5M picture. */
+    /* Elliptic order 4: 1.75 MHz edge, 0.2 dB ripple, 40 dB stopband at 20M. */
+    static const float ed_pre[2][5]={
+        {0.019659819678039651, 0.0077996131655782711, 0.019659819678039651, -1.3876127529628812, 0.52659077574587287},
+        {1, -1.0966208836416169, 0.99999999999999978, -1.5179442038870754, 0.83136103141623829}
+    };
     for (int n=0; n<2; ++n) {
-        d->yi[n]=d->yq[n]=rf_filter(RF_RAW_RATE,1750000.0,qs[n],false);
-        d->luma_delay+=rf_filter_delay(&d->yi[n])*.25;
+        double stage_rate=d->raw_rate;
+        if(profile==GUI_RF_PROFILE_NTSC_ED_BETA)
+            d->yi[n]=d->yq[n]=(rf_biquad_t){ed_pre[n][0],ed_pre[n][1],ed_pre[n][2],ed_pre[n][3],ed_pre[n][4],0,0};
+        else d->yi[n]=d->yq[n]=rf_filter(stage_rate,1750000.0,qs[n],false);
+        d->luma_delay+=rf_filter_delay(&d->yi[n])/(stage_rate/RF_VIDEO_RATE);
+    }
+    if(profile==GUI_RF_PROFILE_NTSC_ED_BETA) for(int n=2;n<4;++n) {
+        double rate=RF_VIDEO_RATE;
+        double cutoff=2000000.0;
+        double q=qs[n-2];
+        d->yi[n]=d->yq[n]=rf_filter(rate,cutoff,q,false);
+        d->luma_delay+=rf_filter_delay(&d->yi[n])/(rate/RF_VIDEO_RATE);
     }
     for (int n=0;n<d->p.chroma_sections;++n) {
         double q=d->p.chroma_sections==2 ? qs[n]
             : 1.0/(2.0*cos((2.0*n+1.0)*RF_PI/(4.0*d->p.chroma_sections)));
-        d->ui[n]=d->uq[n]=rf_filter(RF_RAW_RATE,d->p.chroma_lowpass,q,false);
-        d->chroma_delay+=rf_filter_delay(&d->ui[n])*.25;
+        double stage_rate=profile==GUI_RF_PROFILE_NTSC_ED_BETA ?
+            (n>=2 ? RF_VIDEO_RATE : d->raw_rate) : d->raw_rate;
+        d->ui[n]=d->uq[n]=rf_filter(stage_rate,d->p.chroma_lowpass,q,false);
+        d->chroma_delay+=rf_filter_delay(&d->ui[n])/(stage_rate/RF_VIDEO_RATE);
     }
 #if GUI_RF_PACKED_IQ
     if(d->p.beta_rotation || rf_secam_fm(d)) for(int stage=0;stage<d->p.chroma_sections;++stage) {
         for(int lane=0;lane<4;++lane) {
             const rf_biquad_t *f=lane>=2 ? (lane==2 ? &d->ui[stage] : &d->uq[stage])
-                : stage<2 ? (lane==0 ? &d->yi[stage] : &d->yq[stage]) : NULL;
+                : stage<(profile==GUI_RF_PROFILE_NTSC_ED_BETA ? 4 : 2) ? (lane==0 ? &d->yi[stage] : &d->yq[stage]) : NULL;
             if(!f) continue; // Extra Hi-Fi chroma stages have no luma stream.
             rf_biquad4_t *packed=&d->beta_iq[stage];
             packed->b0[lane]=f->b0;packed->b1[lane]=f->b1;packed->b2[lane]=f->b2;
@@ -1681,25 +1717,56 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
         snprintf(d->status.reason,sizeof(d->status.reason),"RF gap; reacquiring sync");
     }
     d->have_raw=true; d->next_raw=first_sample+count;
+    const bool ed=d->profile==GUI_RF_PROFILE_NTSC_ED_BETA;
+    /* 20M -> 5M uses an absolute four-phase schedule.
+     * Derive it once per call so arbitrary block splits retain the same
+     * absolute phase without a 64-bit division on every input sample. */
+    unsigned ed_phase=ed ? (unsigned)(first_sample%4u) : 0;
+    uint64_t ed_position=ed ? first_sample/4u+(ed_phase!=0u) : 0;
+#if GUI_RF_PACKED_IQ
+    /* ED's two independent oscillators share SSE2 lanes. Keep their state
+     * local across the block; the field renderer never changes RF state. */
+    __m128d ed_cos=_mm_set_pd(d->c_cos,d->y_cos),ed_sin=_mm_set_pd(d->c_sin,d->y_sin);
+    const __m128d ed_step_cos=_mm_set_pd(d->c_step_cos,d->y_step_cos);
+    const __m128d ed_step_sin=_mm_set_pd(d->c_step_sin,d->y_step_sin);
+#endif
     for (size_t n=0; n<count; ++n) {
         uint64_t raw_pos=first_sample+n;
+        bool picture_tick=ed && ed_phase==0u;
+        if(ed && ++ed_phase==4u) ed_phase=0;
         float raw=isfinite(samples[n]) ? samples[n] : 0.0f;
         float band=raw;
         for (int s=0;s<d->p.rf_highpass_sections;++s) band=rf_filter_sample(&d->rf_hp[s],band);
         band=rf_filter_sample(&d->rf_lp,band);
-        float yi=(float)(band*d->y_cos), yq=(float)(-band*d->y_sin);
-        float ci=(float)(raw*d->c_cos), cq=(float)(-raw*d->c_sin);
+        float yi=0,yq=0,ci=0,cq=0;
+#if GUI_RF_PACKED_IQ
+        __m128 mixed;
+        if(ed) {
+            __m128d amplitude=_mm_set_pd(raw,band);
+            mixed=_mm_unpacklo_ps(_mm_cvtpd_ps(_mm_mul_pd(amplitude,ed_cos)),
+                _mm_cvtpd_ps(_mm_sub_pd(_mm_setzero_pd(),_mm_mul_pd(amplitude,ed_sin))));
+        } else
+#endif
+        {
+            yi=(float)(band*d->y_cos); yq=(float)(-band*d->y_sin);
+            ci=(float)(raw*d->c_cos); cq=(float)(-raw*d->c_sin);
+        }
 #if GUI_RF_PACKED_IQ
         if(d->p.beta_rotation || rf_secam_fm(d)) {
-            __m128 iq=_mm_setr_ps(yi,yq,ci,cq);
+            __m128 iq=ed ? mixed : _mm_setr_ps(yi,yq,ci,cq);
             iq=rf_filter4_sample(&d->beta_iq[0],iq);
             iq=rf_filter4_sample(&d->beta_iq[1],iq);
-            __m128 luma_iq=iq;
-            for(int s=2;s<d->p.chroma_sections;++s) iq=rf_filter4_sample(&d->beta_iq[s],iq);
-            // Preserve the original two-stage luma bits through extra C stages.
-            iq=_mm_movelh_ps(luma_iq,_mm_movehl_ps(iq,iq));
-            float filtered[4];_mm_storeu_ps(filtered,iq);
-            yi=filtered[0];yq=filtered[1];ci=filtered[2];cq=filtered[3];
+            {
+                __m128 luma_iq=iq;
+                for(int s=2;s<d->p.chroma_sections;++s)
+                    if(!ed || picture_tick) iq=rf_filter4_sample(&d->beta_iq[s],iq);
+                // Ordinary Beta preserves Y through its additional C-only stages.
+                if(!ed) iq=_mm_movelh_ps(luma_iq,_mm_movehl_ps(iq,iq));
+            }
+            if(!ed || picture_tick) {
+                float filtered[4];_mm_storeu_ps(filtered,iq);
+                yi=filtered[0];yq=filtered[1];ci=filtered[2];cq=filtered[3];
+            }
         } else
 #endif
         {
@@ -1707,26 +1774,51 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
                 yi=rf_filter_sample(&d->yi[s],yi); yq=rf_filter_sample(&d->yq[s],yq);
             }
             for (int s=0;s<d->p.chroma_sections;++s) {
-                ci=rf_filter_sample(&d->ui[s],ci); cq=rf_filter_sample(&d->uq[s],cq);
+                if(!ed || s<2 || picture_tick) {
+                    ci=rf_filter_sample(&d->ui[s],ci); cq=rf_filter_sample(&d->uq[s],cq);
+                }
+            }
+            if(ed) for(int s=2;s<4;++s) if(picture_tick) {
+                yi=rf_filter_sample(&d->yi[s],yi); yq=rf_filter_sample(&d->yq[s],yq);
             }
         }
-        double yc=d->y_cos*d->y_step_cos-d->y_sin*d->y_step_sin;
-        d->y_sin=d->y_sin*d->y_step_cos+d->y_cos*d->y_step_sin; d->y_cos=yc;
-        double cc=d->c_cos*d->c_step_cos-d->c_sin*d->c_step_sin;
-        d->c_sin=d->c_sin*d->c_step_cos+d->c_cos*d->c_step_sin; d->c_cos=cc;
-        if ((raw_pos&1023u)==0u) {
-            double ym=hypot(d->y_cos,d->y_sin), cm=hypot(d->c_cos,d->c_sin);
-            if (ym>0.0) { d->y_cos/=ym; d->y_sin/=ym; }
-            if (cm>0.0) { d->c_cos/=cm; d->c_sin/=cm; }
+#if GUI_RF_PACKED_IQ
+        if(ed) {
+            __m128d next_cos=_mm_sub_pd(_mm_mul_pd(ed_cos,ed_step_cos),_mm_mul_pd(ed_sin,ed_step_sin));
+            ed_sin=_mm_add_pd(_mm_mul_pd(ed_sin,ed_step_cos),_mm_mul_pd(ed_cos,ed_step_sin));
+            ed_cos=next_cos;
+            if(!(raw_pos&1023u)) {
+                __m128d magnitude=_mm_sqrt_pd(_mm_add_pd(_mm_mul_pd(ed_cos,ed_cos),_mm_mul_pd(ed_sin,ed_sin)));
+                ed_cos=_mm_div_pd(ed_cos,magnitude);ed_sin=_mm_div_pd(ed_sin,magnitude);
+            }
+        } else
+#endif
+        {
+            double yc=d->y_cos*d->y_step_cos-d->y_sin*d->y_step_sin;
+            d->y_sin=d->y_sin*d->y_step_cos+d->y_cos*d->y_step_sin; d->y_cos=yc;
+            double cc=d->c_cos*d->c_step_cos-d->c_sin*d->c_step_sin;
+            d->c_sin=d->c_sin*d->c_step_cos+d->c_cos*d->c_step_sin; d->c_cos=cc;
+            if ((raw_pos&1023u)==0u) {
+                double ym=hypot(d->y_cos,d->y_sin), cm=hypot(d->c_cos,d->c_sin);
+                if (ym>0.0) { d->y_cos/=ym; d->y_sin/=ym; }
+                if (cm>0.0) { d->c_cos/=cm; d->c_sin/=cm; }
+            }
         }
-        if ((raw_pos&3u)!=0u) continue;
-        uint64_t pos=raw_pos/4u;
+        uint64_t pos;
+        if(ed) {
+            if(!picture_tick) continue;
+            pos=ed_position++;
+        } else {
+            if ((raw_pos&(d->raw_decimation-1u))!=0u) continue;
+            pos=raw_pos/d->raw_decimation;
+        }
         double cross=(double)d->prev_i*yq-(double)d->prev_q*yi;
         double dot=(double)d->prev_i*yi+(double)d->prev_q*yq;
-        /* Reuse the bounded phase evaluation only for MESECAM: its maximum
-         * .35Hz error is below .00005IRE. Other luma paths retain atan2f. */
+        /* ED uses a full-quadrant bounded approximation; MESECAM keeps
+         * its small-angle path. Other profiles retain atan2f. */
         double yphase=d->profile==GUI_RF_PROFILE_MESECAM_VHS
-            ? rf_mesecam_phase(cross,dot) : atan2f((float)cross,(float)dot);
+            ? rf_mesecam_phase(cross,dot) : ed ? gui_rf_preview_phase(cross,dot)
+                : atan2f((float)cross,(float)dot);
         double frequency=d->fm_center+yphase*(RF_VIDEO_RATE/(2.0*RF_PI));
         d->prev_i=yi; d->prev_q=yq;
         if (!isfinite(frequency)) frequency=d->p.blank_hz;
@@ -1777,7 +1869,8 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
             d->ci[at]=cy+(float)d->p.carrier_hz;
             d->cq[at]=hypotf(ci,cq);
         } else {d->ci[at]=ci;d->cq[at]=cq;}
-        d->envelope[at]=d->profile==GUI_RF_PROFILE_MESECAM_VHS?rf_mesecam_magnitude(yi,yq):hypotf(yi,yq);
+        d->envelope[at]=(ed || d->profile==GUI_RF_PROFILE_MESECAM_VHS)
+            ? rf_mesecam_magnitude(yi,yq) : hypotf(yi,yq);
         if (!d->have_low) {
             d->low_first=pos; d->have_low=true;
             d->level_search_after=pos+RF_LEVEL_GRACE;
@@ -1802,5 +1895,11 @@ void gui_rf_decoder_process(gui_rf_decoder_t *d, const float *samples, size_t co
             rf_reacquire_sync(d);
         d->previous_sync=d->sync_y;
     }
+#if GUI_RF_PACKED_IQ
+    if(ed) {
+        double cs[2],sn[2];_mm_storeu_pd(cs,ed_cos);_mm_storeu_pd(sn,ed_sin);
+        d->y_cos=cs[0];d->c_cos=cs[1];d->y_sin=sn[0];d->c_sin=sn[1];
+    }
+#endif
     rf_acquire_beta_levels(d);
 }
