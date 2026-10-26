@@ -52,6 +52,9 @@
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
+#if defined(__linux__) && !defined(__ANDROID__)
+#include <signal.h>
+#endif
 #if defined(__APPLE__)
 #include <unistd.h>
 #include <limits.h>
@@ -133,6 +136,11 @@ static void print_usage(const char *program_name) {
             "           auto-names) in the config so the overwrite confirmation\n"
             "           popup cannot stall the run. Progress is logged with\n"
             "           [AUTO] prefixes on stderr.\n"
+            "\n"
+            "Headless network server (Linux):\n"
+            "  --headless-server [--config <path>] [--select-device <selector>]\n"
+            "       One headless Server: legacy RF streams and MISRC-M/2 monitor\n"
+            "       status/control/preview on the same TCP port.\n"
             "\n"
             "Headless CLI capture mode:\n"
             "  Pass any capture option (e.g. --device-list, -a FILE) to run this\n"
@@ -598,6 +606,97 @@ static void app_modal_frame(void *ctx)
     SwapScreenBuffer();
 }
 
+#if defined(__linux__) && !defined(__ANDROID__)
+static volatile sig_atomic_t s_headless_stop = 0;
+static void gui_headless_signal(int signo) { (void)signo; s_headless_stop = 1; }
+
+/* One headless listener serves both RF and MISRC-M/2 monitor clients. */
+static int gui_run_role_headless_server(const char *config_path,
+                                        const char *selector, bool debug_view) {
+    s_headless_stop = 0;
+    gui_runtime_set_headless(true);
+    SetTraceLogLevel(debug_view ? LOG_INFO : LOG_WARNING);
+    if (config_path) {
+        FILE *f = fopen(config_path, "rb");
+        if (!f) {
+            fprintf(stderr, "[HEADLESS] Can't read configuration: %s\n", config_path);
+            gui_runtime_set_headless(false);
+            return 1;
+        }
+        fclose(f);
+    }
+    gui_app_t app = {0};
+    app.headless_server = true;
+    gui_settings_set_override_path(config_path);
+    gui_settings_load(&app.settings);
+    app.settings.net_mode = GUI_NET_MODE_SERVER;
+    app.settings.capture_limit_seconds = 0;
+    gui_app_init(&app);
+    if (!gui_net_active(&app)) {
+        fprintf(stderr, "[HEADLESS] Couldn't start unified server on %u\n",
+                (unsigned)app.settings.net_server_port);
+        gui_app_cleanup(&app);
+        gui_runtime_set_headless(false);
+        return 1;
+    }
+    struct sigaction sa = {0};
+    sa.sa_handler = gui_headless_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    fprintf(stderr, "[HEADLESS] Server listening on TCP %u (RF + MISRC-M/2)\n",
+            (unsigned)app.settings.net_server_port);
+    bool started_once = false;
+    double next_probe = gui_runtime_time();
+    while (!s_headless_stop && !atomic_load(&do_exit)) {
+        gui_net_poll_commands(&app);
+        if (app.is_capturing) started_once = true;
+        gui_app_poll_capture_start(&app);
+        gui_capture_poll_hsdaoh_status(&app);
+        gui_app_update_vu_meters(&app, 0.05f);
+        /* First-start only; a remote /stop must not auto-restart capture. */
+        double now = gui_runtime_time();
+        if (!started_once && now >= next_probe) {
+            gui_app_enumerate_devices(&app);
+            int idx = -1;
+            if (selector && *selector) {
+                char *end = NULL;
+                long parsed = strtol(selector, &end, 10);
+                if (end != selector && *end == '\0') {
+                    if (parsed >= 0 && parsed < app.device_count) idx = (int)parsed;
+                } else {
+                    for (int i = 0; i < app.device_count; i++) {
+                        if (gui_strcasestr_local(app.devices[i].name, selector)) { idx = i; break; }
+                    }
+                }
+            } else {
+                const device_type_t types[] = {DEVICE_TYPE_HSDAOH, DEVICE_TYPE_MISRC_CLOCKGEN,
+                                               DEVICE_TYPE_CXADC, DEVICE_TYPE_SIMPLE_CAPTURE};
+                for (size_t j = 0; j < sizeof(types)/sizeof(types[0]); j++) {
+                    idx = gui_find_first_device_of_type(&app, types[j]);
+                    if (idx >= 0) break;
+                }
+            }
+            if (idx >= 0) {
+                app.selected_device = idx;
+                if (gui_app_start_capture(&app) == 0) {
+                    started_once = true;
+                    fprintf(stderr, "[HEADLESS] Capture started: %s\n", app.devices[idx].name);
+                }
+            }
+            next_probe = now + 3.0;
+        }
+        thrd_sleep_ms(50);
+    }
+    fprintf(stderr, "[HEADLESS] Stopping unified server\n");
+    if (app.is_recording) gui_app_stop_recording(&app);
+    if (app.is_capturing) gui_app_stop_capture(&app);
+    gui_app_cleanup(&app);
+    gui_runtime_set_headless(false);
+    return 0;
+}
+#endif
+
 int main(int argc, char **argv) {
     if (!file_init_utf8_argv(&argc, &argv)) return 1;
     bool debug_view = false;
@@ -605,6 +704,7 @@ int main(int argc, char **argv) {
     bool show_version = false;
     bool smoke_test = false;
     bool auto_connect = false;
+    bool headless_server = false;
     bool has_capture_arg = false;
     const char *config_path = NULL;  /* --config <path> override */
     const char *select_device_arg = NULL;  /* --select-device <index-or-name> */
@@ -631,6 +731,10 @@ int main(int argc, char **argv) {
         }
         if (strcmp(a, "--smoke-test") == 0) {
             smoke_test = true;
+            continue;
+        }
+        if (strcmp(a, "--headless-server") == 0) {
+            headless_server = true;
             continue;
         }
         if (strcmp(a, "--auto-connect") == 0) {
@@ -708,7 +812,7 @@ int main(int argc, char **argv) {
     // Headless CLI capture mode: run as the full misrc_capture CLI (no window).
     // misrc_capture_main handles --device-list/--devices, -a/-b/-r/-x, -f, -n/-t,
     // resample/audio opts, and prints full CLI usage on an incomplete combo.
-    if (has_capture_arg) {
+    if (has_capture_arg && !headless_server) {
         return misrc_capture_main(argc, argv);
     }
 #endif
@@ -730,6 +834,19 @@ int main(int argc, char **argv) {
             return 1;
         }
         return gui_run_update_cli(update_cli_mode, update_manifest_source, update_cli_yes);
+    }
+    if (headless_server) {
+        if (has_capture_arg || auto_connect || auto_capture || auto_record_given ||
+            update_cli_mode != GUI_UPDATE_CLI_NONE) {
+            fprintf(stderr, "Headless server flags cannot be combined with capture/update/auto flags\n");
+            return 2;
+        }
+#if defined(__linux__) && !defined(__ANDROID__)
+        return gui_run_role_headless_server(config_path, select_device_arg, debug_view);
+#else
+        fprintf(stderr, "Headless server currently supported on Linux only\n");
+        return 2;
+#endif
     }
     if (auto_record_given && auto_record_seconds < 1) {
         fprintf(stderr, "--auto-record requires a positive <seconds> value\n");

@@ -14,6 +14,9 @@
 #include "gui_spectrogram.h"
 #include "../signal/gui_demod.h"
 #include "../ui/gui_ui.h"
+#include "../net/gui_net.h"
+#include "../net/gui_monitor_transport.h"
+#include "../net/gui_remote_display.h"
 #include <stdio.h>
 
 //-----------------------------------------------------------------------------
@@ -96,6 +99,33 @@ void panel_clear_view_state(panel_view_type_t type, void *state) {
 static void render_single_panel(gui_app_t *app, int channel,
                                  panel_view_type_t type, void *state,
                                  Rectangle bounds, Color color) {
+    /* M-Client reuses the EXACT Local/Harry Waveform + FFT render vtables,
+     * phosphor accumulation, grid, trigger lines, zoom and overlays.
+     * Only reduced Zstd/float32 display data comes across the network. */
+    if(app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+        if(type != PANEL_VIEW_WAVEFORM && type != PANEL_VIEW_FFT) {
+            DrawRectangleRec(bounds,COLOR_PANEL_BG);
+            DrawText("Monitor & Remote: only Waveform/FFT preview available",
+                     (int)bounds.x+12,(int)bounds.y+15,14,COLOR_TEXT_DIM);
+            return;
+        }
+        /* Static scratch: 49 KiB per snapshot, not allocated on every draw. */
+        static gui_rd_frame_t frame;
+        bool valid=gui_monitor_client_connected() && gui_rd_client_snapshot(&frame);
+        if(!valid || !state || channel >= (int)frame.channels) {
+            DrawRectangleRec(bounds,COLOR_PANEL_BG);
+            DrawText("Waiting for Server preview...",
+                     (int)bounds.x+12,(int)bounds.y+15,14,COLOR_TEXT_DIM);
+            return;
+        }
+        if(type==PANEL_VIEW_FFT)
+            gui_fft_remote_apply_float(state,frame.ch[channel].fft,
+                GUI_RD_BINS,frame.sample_rate,frame.sequence);
+        else {
+            gui_waveform_remote_apply_points(state,&frame.ch[channel],frame.sequence);
+            gui_waveform_remote_publish_config(state,channel);
+        }
+    }
     const panel_vtable_t *vtable = panel_get_vtable(type);
 
     if (vtable && vtable->render) {

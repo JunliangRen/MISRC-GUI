@@ -26,6 +26,7 @@
 #include "../output/gui_record.h"
 #include "../input/gui_capture.h" // Support hsdoah-rp2350 Error & stats
 #include "../net/gui_net.h"
+#include "../net/gui_monitor_transport.h"
 #include "../core/gui_updater.h" // Manifest-driven updater: releases page + auto-patch manifest + confirmed self-update
 #include "version.h"
 #include "../visualization/gui_custom_elements.h"
@@ -651,6 +652,8 @@ typedef enum {
     UI_TEXT_FIELD_NONE = 0,
     UI_TEXT_FIELD_OUTPUT_BASE_NAME,
     UI_TEXT_FIELD_OUTPUT_PATH,
+    UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH,
+    UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH,
     UI_TEXT_FIELD_FLAC_AFFINITY,
     UI_TEXT_FIELD_RF_TAG_A,
     UI_TEXT_FIELD_RF_TAG_B,
@@ -679,6 +682,18 @@ typedef enum {
 } ui_text_field_t;
 
 // Unified cursor-based text editing state (settings panel)
+/* The M-Client browser navigates the SERVER filesystem, never Windows disk. */
+static bool s_monitor_folder_open=false;
+static unsigned s_monitor_folder_page=0;
+static char s_monitor_folder_path[FILE_PATH_MAX]={0};
+static char s_monitor_folder_parent[FILE_PATH_MAX]={0};
+static char s_monitor_folder_edit_path[FILE_PATH_MAX]={0};
+static char s_monitor_folder_path_display[FILE_PATH_MAX]={0};
+static char s_monitor_folder_labels[12][256];
+static bool s_monitor_folder_computer=false;
+static bool s_monitor_folder_recovered=false;
+static bool s_monitor_folder_error=false;
+static bool s_monitor_folder_more=false;
 static ui_text_field_t s_active_text_field = UI_TEXT_FIELD_NONE;
 static int s_active_text_cursor = 0;
 static int s_active_text_selection_anchor = -1;
@@ -1919,15 +1934,30 @@ static void update_status_free_space(gui_app_t *app)
     }
     s_status_free_space_last_update_s = now;
 
+    bool m_client=app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT;
+    gui_monitor_record_stats_t remote={0};
+    bool have_remote=m_client && gui_monitor_client_record_stats(&remote);
+    bool remote_recording=have_remote && gui_monitor_client_peer_state()==2;
     uint64_t free_bytes = 0;
-    if (gui_record_get_output_free_space_bytes(app, &free_bytes)) {
+    bool free_valid;
+    if(m_client){
+        /* Local Save ON targets the client's disk. Otherwise the server's
+         * configured Output folder, which may not exist on Windows. */
+        bool use_local=app->settings.monitor_local_save_enabled;
+        if(remote_recording)use_local=remote.local_save;
+        free_valid=use_local
+          ? file_disk_free_space_utf8(app->settings.monitor_local_save_path,&free_bytes)
+          : have_remote && remote.server_free_valid;
+        if(!use_local && free_valid)free_bytes=remote.server_free_bytes;
+    }else free_valid=gui_record_get_output_free_space_bytes(app,&free_bytes);
+    if (free_valid) {
         s_status_free_space_cached_bytes = free_bytes;
         s_status_free_space_valid = true;
     } else {
         s_status_free_space_valid = false;
     }
 
-    if (!app->is_recording) {
+    if (!app->is_recording && !remote_recording) {
         s_status_output_last_bytes = 0;
         s_status_output_last_sample_s = 0.0;
         s_status_output_rate_bps = 0.0;
@@ -1935,6 +1965,11 @@ static void update_status_free_space(gui_app_t *app)
     }
 
     uint64_t output_bytes = gui_ui_recording_output_total_bytes(app);
+    if(m_client && have_remote){
+        output_bytes=remote.use_flac
+            ? remote.compressed[0]+remote.compressed[1]
+            : remote.raw[0]+remote.raw[1];
+    }
     if (s_status_output_last_sample_s > 0.0 && output_bytes >= s_status_output_last_bytes) {
         double elapsed_s = now - s_status_output_last_sample_s;
         if (elapsed_s > 0.0) {
@@ -2307,7 +2342,10 @@ static void gui_ui_clear_text_edit(void)
 
 static bool gui_ui_settings_locked(const gui_app_t *app)
 {
-    return app && (app->is_recording || gui_playback_is_starting((gui_app_t *)app));
+    return app && (app->is_recording ||
+        (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+         gui_monitor_client_peer_state() == 2) ||
+        gui_playback_is_starting((gui_app_t *)app));
 }
 
 // One-time per-session low-rate warning: pops a dismissible info dialog
@@ -2351,6 +2389,14 @@ static bool gui_ui_text_field_get_buffer(gui_app_t *app, ui_text_field_t field, 
         case UI_TEXT_FIELD_OUTPUT_PATH:
             *dst = app->settings.output_path;
             *cap = sizeof(app->settings.output_path);
+            return true;
+        case UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH:
+            *dst=s_monitor_folder_edit_path;
+            *cap=sizeof(s_monitor_folder_edit_path);
+            return true;
+        case UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH:
+            *dst = app->settings.monitor_local_save_path;
+            *cap = sizeof(app->settings.monitor_local_save_path);
             return true;
         case UI_TEXT_FIELD_FLAC_AFFINITY:
             *dst = app->settings.flac_affinity_cpu_list;
@@ -2486,7 +2532,12 @@ static bool gui_ui_text_field_can_edit(gui_app_t *app, ui_text_field_t field)
         case UI_TEXT_FIELD_OUTPUT_BASE_NAME:
             return app->settings.auto_names_enabled;
         case UI_TEXT_FIELD_OUTPUT_PATH:
-            return true;
+            /* Server Output path is authoritative in M-Client. Use browser. */
+            return app->settings.net_mode!=GUI_NET_MODE_MONITOR_CLIENT;
+        case UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH:
+            return app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT && s_monitor_folder_open;
+        case UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH:
+            return app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT;
         case UI_TEXT_FIELD_FLAC_AFFINITY:
             return app->settings.show_core_pinning_in_settings &&
                    app->settings.use_flac &&
@@ -2553,7 +2604,10 @@ static bool gui_ui_text_field_char_allowed(ui_text_field_t field, int ch)
         // Hostname or IP: allow printable ASCII except quote (JSON-safe).
         return (ch >= 32 && ch < 127 && ch != '\"');
     }
-    return gui_text_path_char_allowed(ch, field == UI_TEXT_FIELD_OUTPUT_PATH);
+    return gui_text_path_char_allowed(ch,
+            field == UI_TEXT_FIELD_OUTPUT_PATH ||
+            field == UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH ||
+            field == UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH);
 }
 
 static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *font_id)
@@ -2563,6 +2617,8 @@ static void gui_ui_text_field_font(ui_text_field_t field, int *font_size, int *f
     switch (field) {
         case UI_TEXT_FIELD_OUTPUT_BASE_NAME:
         case UI_TEXT_FIELD_OUTPUT_PATH:
+        case UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH:
+        case UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH:
             size = FONT_SIZE_NORMAL;
             id = 0;
             break;
@@ -2749,6 +2805,8 @@ static bool gui_ui_text_insert_filtered(ui_text_field_t field, char *dst, size_t
     bool valid = true;
     bool path_field = field == UI_TEXT_FIELD_OUTPUT_BASE_NAME ||
                       field == UI_TEXT_FIELD_OUTPUT_PATH ||
+                      field == UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH ||
+                      field == UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH ||
                       (field >= UI_TEXT_FIELD_RF_TAG_A && field <= UI_TEXT_FIELD_AUDIO_LABEL_4);
     for (const char *p = src; *p; ) {
         int size = 0;
@@ -3139,12 +3197,17 @@ static void gui_ui_handle_active_text_edit(gui_app_t *app)
     }
 
     gui_ui_text_clamp_state(dst);
-    if (changed) {
+    if (changed && s_active_text_field != UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH) {
         gui_settings_save(&app->settings);
     }
 
     if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || IsKeyPressed(KEY_ESCAPE)) {
-        gui_settings_save(&app->settings);
+        if(s_active_text_field==UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH){
+            if(!IsKeyPressed(KEY_ESCAPE)){
+                s_monitor_folder_page=0;
+                gui_monitor_client_browse_folders(s_monitor_folder_edit_path,0);
+            }
+        }else gui_settings_save(&app->settings);
         gui_ui_clear_text_edit();
     }
 }
@@ -3161,6 +3224,12 @@ static CustomLayoutElement s_metadata_icon_element;
 
 // Render settings panel (floating modal)
 static void render_settings_panel(gui_app_t *app) {
+    if(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT){
+        char server_path[FILE_PATH_MAX];
+        if(gui_monitor_client_output_path(server_path,sizeof(server_path)) &&
+           !gui_ui_is_text_field_active(UI_TEXT_FIELD_OUTPUT_PATH))
+            snprintf(app->settings.output_path,sizeof(app->settings.output_path),"%s",server_path);
+    }
     if (!app->settings_panel_open) return;
     int settings_max_width = gui_ui_modal_max_extent(gui_ui_get_layout_width(), 1080);
     int settings_max_height = gui_ui_modal_max_extent(gui_ui_get_layout_height(), 780);
@@ -3297,6 +3366,75 @@ static void render_settings_panel(gui_app_t *app) {
             }
         }
 
+/* Local Save controls are M-Client-exclusive. Never silently record
+ * on the M-Server when the client-owned receiver cannot be attached. */
+if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+    CLAY(CLAY_ID("MonitorLocalSaveRow"), {
+        .layout = { .sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(32)},
+                    .layoutDirection=CLAY_LEFT_TO_RIGHT,
+                    .childAlignment={.y=CLAY_ALIGN_Y_CENTER}, .childGap=10 }
+    }) {
+        CLAY_TEXT(CLAY_STRING("Local Save:"),
+            CLAY_TEXT_CONFIG({ .fontSize=FONT_SIZE_NORMAL, .textColor=to_clay_color(COLOR_TEXT) }));
+        CLAY(CLAY_ID("MonitorLocalSaveToggle"), {
+            .layout={ .sizing={CLAY_SIZING_FIXED(104),CLAY_SIZING_FIXED(28)},
+                      .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER} },
+            .backgroundColor=to_clay_color(app->settings.monitor_local_save_enabled ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON),
+            .cornerRadius=CLAY_CORNER_RADIUS(4)
+        }) {
+            CLAY_TEXT(app->settings.monitor_local_save_enabled ? CLAY_STRING("ON") : CLAY_STRING("OFF"),
+                CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+        }
+        CLAY_TEXT(CLAY_STRING("client-owned recording; .partial until commit"),
+            CLAY_TEXT_CONFIG({ .fontSize=FONT_SIZE_STATS, .textColor=to_clay_color(COLOR_TEXT_DIM) }));
+    }
+    // Display only the currently selected recording destination. The
+    // alternate path remains saved, but is hidden until its mode is selected.
+    if (app->settings.monitor_local_save_enabled) {
+    // Local Save is M-Client-only; its destination must be editable on
+    // the CLIENT computer. Never reuse OutputPathBox / settings.output_path:
+    // those describe the separate capture-output configuration.
+    CLAY_TEXT(CLAY_STRING("Local folder (this computer; click to edit):"),
+        CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+    CLAY(CLAY_ID("MonitorLocalSavePathRow"), {
+        .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(32)},
+                 .layoutDirection=CLAY_LEFT_TO_RIGHT,
+                 .childAlignment={.y=CLAY_ALIGN_Y_CENTER},.childGap=8}
+    }) {
+        CLAY(CLAY_ID("MonitorLocalSavePathBox"), {
+            .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(32)},
+                     .childAlignment={.x=CLAY_ALIGN_X_LEFT,.y=CLAY_ALIGN_Y_CENTER},
+                     .padding={10,10,0,0}},
+            .backgroundColor=to_clay_color((Color){25,25,30,255}),
+            .cornerRadius=CLAY_CORNER_RADIUS(4),
+            .clip={.horizontal=true}
+        }) {
+            const char *local_path=app->settings.monitor_local_save_path;
+            if (gui_ui_is_text_field_active(UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH)) {
+                gui_ui_render_active_text(UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH,
+                    local_path, FONT_SIZE_NORMAL, 0, COLOR_TEXT);
+            } else {
+                CLAY_TEXT(make_string(local_path[0] ? local_path : "Click here or Choose..."),
+                    CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,
+                                      .textColor=to_clay_color(local_path[0] ? COLOR_TEXT : COLOR_TEXT_DIM)}));
+            }
+        }
+        CLAY(CLAY_ID("MonitorLocalSaveChooseFolder"), {
+            .layout={.sizing={CLAY_SIZING_FIXED(96),CLAY_SIZING_FIXED(30)},
+                     .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+            .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(4)
+        }) {
+            CLAY_TEXT(CLAY_STRING("Choose..."),
+                CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT)}));
+        }
+    }
+    } // Local Save ON: client directory row only
+}
+
+// Show the server/normal Output folder only when Local Save is not selected.
+// Non-M-Client modes retain their original folder controls unconditionally.
+if (app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT ||
+    !app->settings.monitor_local_save_enabled) {
 // Output path display + choose button
 CLAY(CLAY_ID("SettingsOutputPath"), {
     .layout = {
@@ -3305,7 +3443,9 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
         .childGap = 6
     }
 }) {
-    CLAY_TEXT(CLAY_STRING("Output folder:"),
+    CLAY_TEXT(app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT
+        ? CLAY_STRING("Server Output folder:")
+        : CLAY_STRING("Output folder:"),
         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
     CLAY(CLAY_ID("OutputPathRow"), {
@@ -3348,6 +3488,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
         }
     }
 }
+} // Local Save OFF (or non-M-Client): server/normal output directory
 
 
         // Scrollable settings body
@@ -4199,9 +4340,13 @@ static void render_version_info_window(gui_app_t *app)
 
     const char *state_label;
     Color state_col;
-    if (app->is_recording)      { state_label = "Recording";  state_col = COLOR_CLIP_RED;   }
-    else if (app->is_capturing) { state_label = "Capturing";  state_col = COLOR_SYNC_GREEN; }
-    else                        { state_label = "Idle";       state_col = COLOR_TEXT_DIM;   }
+    int m_peer = (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+                  gui_monitor_client_connected()) ? gui_monitor_client_peer_state() : -1;
+    if (m_peer == 2 || (m_peer < 0 && app->is_recording))
+        { state_label = "Recording"; state_col = COLOR_CLIP_RED; }
+    else if (m_peer == 1 || (m_peer < 0 && app->is_capturing))
+        { state_label = "Capturing"; state_col = COLOR_SYNC_GREEN; }
+    else { state_label = "Idle"; state_col = COLOR_TEXT_DIM; }
     snprintf(vi_state, sizeof(vi_state), "%s", state_label);
 
     if (app->device_count > 0 &&
@@ -4592,12 +4737,12 @@ static void render_version_info_window(gui_app_t *app)
         // Server hosts the HTTP control + RF/audio stream; Client connects to a
         // host and mirrors its device list/controls/capture state (master/slave).
         // v1 is LAN-only, no auth/encryption (mirrors the reference cxadc server).
-        CLAY_TEXT(CLAY_STRING("Network (Server/Client):"),
+        CLAY_TEXT(CLAY_STRING("Network mode:"),
             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_HEADING, .textColor = to_clay_color(COLOR_TEXT) }));
 
         {
             int mode = app->settings.net_mode;
-            if (mode < GUI_NET_MODE_LOCAL || mode > GUI_NET_MODE_CLIENT) mode = GUI_NET_MODE_LOCAL;
+            if (mode < GUI_NET_MODE_LOCAL || mode > GUI_NET_MODE_LAST) mode = GUI_NET_MODE_LOCAL;
             const char *mode_label = gui_net_mode_name(mode);
             Color mode_bg = (mode == GUI_NET_MODE_LOCAL) ? COLOR_BUTTON : COLOR_BUTTON_ACTIVE;
             CLAY(CLAY_ID("VersionInfoNetModeRow"), {
@@ -4609,7 +4754,7 @@ static void render_version_info_window(gui_app_t *app)
                 }
                 CLAY(CLAY_ID("VersionInfoNetModeToggle"), {
                     .layout = {
-                        .sizing = { CLAY_SIZING_FIXED(90), CLAY_SIZING_FIXED(28) },
+                        .sizing = { CLAY_SIZING_FIXED(180), CLAY_SIZING_FIXED(28) },
                         .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
                     },
                     .backgroundColor = to_clay_color(mode_bg),
@@ -4618,9 +4763,15 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT(make_string(mode_label),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
                 }
-                CLAY_TEXT(CLAY_STRING("click to cycle Local / Server / Client"),
+                CLAY_TEXT(CLAY_STRING("click to cycle (4 modes)"),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             }
+        }
+
+        if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+            CLAY_TEXT(CLAY_STRING("Monitor waveform + FFT (Zstd-1)"),
+                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS,
+                    .textColor = to_clay_color(COLOR_TEXT_DIM) }));
         }
 
         // Server: port field.
@@ -4654,8 +4805,10 @@ static void render_version_info_window(gui_app_t *app)
             }
         }
 
-        // Client: discovered-server list (primary) + compact manual host:port fallback.
-        if (app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+        // The legacy Client and discovery-only M-Client share the same UI.
+        // M-Client must never connect through the legacy RF ingest backend.
+        if (app->settings.net_mode == GUI_NET_MODE_CLIENT ||
+            app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
             CLAY_TEXT(CLAY_STRING("Discovered servers:"),
                 CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             {
@@ -4706,8 +4859,13 @@ static void render_version_info_window(gui_app_t *app)
                         CLAY_TEXT(make_string(disc_more_label),
                             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     }
-                    CLAY_TEXT(CLAY_STRING("click a server to connect (LAN only, no auth)"),
-                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+                        CLAY_TEXT(CLAY_STRING("click a server to connect (MISRC-M/2 monitor protocol)"),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    } else {
+                        CLAY_TEXT(CLAY_STRING("click a server to connect (LAN only, no auth)"),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                    }
                 }
             }
             // Compact manual host:port fallback (fixed widths so the window stays narrow).
@@ -4761,8 +4919,9 @@ static void render_version_info_window(gui_app_t *app)
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                 }
                 bool net_connected = gui_net_active(app);
+                bool connection_running=gui_net_client_connection_running(app);
                 Color connect_bg = net_connected ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
-                const char *connect_label = net_connected ? "Disconnect" : "Connect";
+                const char *connect_label = connection_running ? "Disconnect" : "Connect";
                 CLAY(CLAY_ID("VersionInfoNetConnectButton"), {
                     .layout = {
                         .sizing = { CLAY_SIZING_FIXED(96), CLAY_SIZING_FIXED(28) },
@@ -4774,8 +4933,13 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT(make_string(connect_label),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT) }));
                 }
-                CLAY_TEXT(CLAY_STRING("toggle client connection"),
-                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+                    CLAY_TEXT(CLAY_STRING("Phosphor preview (Zstd-1)"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                } else {
+                    CLAY_TEXT(CLAY_STRING("toggle client connection"),
+                        CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+                }
             }
         }
 
@@ -5904,7 +6068,8 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
                                        audio_meter_height,
                                        audio_meter_gap);
         }
-        bool playback_mode = gui_ui_selected_device_is_playback(app);
+        bool playback_mode = app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT &&
+                             gui_ui_selected_device_is_playback(app);
         bool playback_running = playback_mode && gui_playback_is_running(app);
         playback_state_t playback_state = playback_running
             ? gui_playback_get_state(app)
@@ -5912,9 +6077,14 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
         bool playback_paused = (playback_state == PLAYBACK_STATE_PAUSED);
 
         // Record button (capture) / Play-Pause button (playback mode)
-        bool record_finalizing = gui_record_is_finalizing();
-        Color record_color = record_finalizing ? (Color){184, 118, 20, 255} : (app->is_recording ? COLOR_CLIP_RED : COLOR_BUTTON);
-        const char *record_label = record_finalizing ? "Finalize" : (app->is_recording ? "Stop Rec" : "Record");
+        bool monitor_client = app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT;
+        int remote_state = monitor_client && gui_monitor_client_connected()
+                          ? gui_monitor_client_peer_state() : 0;
+        bool record_active = monitor_client ? remote_state == 2 : app->is_recording;
+        bool can_record = monitor_client ? remote_state >= 1 : app->is_capturing;
+        bool record_finalizing = !monitor_client && gui_record_is_finalizing();
+        Color record_color = record_finalizing ? (Color){184, 118, 20, 255} : (record_active ? COLOR_CLIP_RED : COLOR_BUTTON);
+        const char *record_label = record_finalizing ? "Finalize" : (record_active ? "Stop Rec" : "Record");
         // Flash the finalize icon red if a persistent output-file write error
         // is active (e.g. file locked by another app) so the user knows the
         // recording had write issues. Blink at ~1 Hz between the finalize
@@ -5931,13 +6101,13 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
         if (!playback_mode && toolbar_very_narrow) {
             if (record_finalizing) {
                 record_display_label = "Fin";
-            } else if (app->is_recording) {
+            } else if (record_active) {
                 record_display_label = "Stop";
             } else {
                 record_display_label = "Rec";
             }
         }
-        if (!app->is_capturing) record_color = (Color){ 50, 50, 55, 255 };
+        if (!can_record) record_color = (Color){ 50, 50, 55, 255 };
         CLAY(CLAY_ID("RecordButton"), {
             .layout = {
                 .sizing = { CLAY_SIZING_FIXED(record_button_width), CLAY_SIZING_FIXED(32) },
@@ -5946,7 +6116,7 @@ static void render_toolbar(gui_app_t *app, bool ddd_compact_labels) {
             .backgroundColor = to_clay_color(record_color),
             .cornerRadius = CLAY_CORNER_RADIUS(4)
         }) {
-            Color text_color = app->is_capturing ? COLOR_TEXT : COLOR_TEXT_DIM;
+            Color text_color = can_record ? COLOR_TEXT : COLOR_TEXT_DIM;
             CLAY_TEXT(make_string(record_display_label),
                 CLAY_TEXT_CONFIG({ .fontSize = toolbar_text_size, .textColor = to_clay_color(text_color) }));
         }
@@ -6186,7 +6356,8 @@ static Clay_ElementDeclaration gui_ui_channel_menu(Clay_ElementId button_id,
 // Render per-channel stats panel (trigger controls moved to waveform panel overlay)
 static void render_channel_stats(gui_app_t *app, int channel,
                                    const gui_channel_stats_values_t *values,
-                                   const gui_channel_stats_layout_t *layout) {
+                                   const gui_channel_stats_layout_t *layout,
+                                   const gui_monitor_record_stats_t *m_record) {
     // Only the sidebar width grows more slowly than the global zoom.
     // Text, controls and their hit areas retain the normal UI scale.
     float stats_width = layout->width;
@@ -6333,9 +6504,15 @@ static void render_channel_stats(gui_app_t *app, int channel,
         {
             uint64_t raw_bytes = values->raw_bytes;
             uint64_t comp_bytes = values->compressed_bytes;
-            bool show_record_stats = app->is_capturing && (app->is_recording || raw_bytes > 0 || comp_bytes > 0 || app->last_recording_duration_s > 0.0);
+            bool remote_recording=m_record && gui_monitor_client_peer_state()==2;
+            bool remote_active=m_record && gui_monitor_client_peer_state()>0;
+            bool remote_ch_enabled=!m_record || (channel==0?m_record->capture_a:m_record->capture_b);
+            bool show_record_stats = remote_active
+                ? (remote_ch_enabled && (remote_recording || raw_bytes>0 || comp_bytes>0 || m_record->elapsed_ms>0))
+                : (app->is_capturing && (app->is_recording || raw_bytes > 0 || comp_bytes > 0 || app->last_recording_duration_s > 0.0));
             if (show_record_stats) {
-                double shown_duration = app->is_recording ? (GetTime() - app->recording_start_time) : app->last_recording_duration_s;
+                double shown_duration = m_record ? (double)m_record->elapsed_ms/1000.0
+                    : (app->is_recording ? (GetTime() - app->recording_start_time) : app->last_recording_duration_s);
                 int d_hours = (int)(shown_duration / 3600.0);
                 int d_mins = ((int)(shown_duration / 60.0)) % 60;
                 int d_secs = ((int)(shown_duration)) % 60;
@@ -6351,7 +6528,7 @@ static void render_channel_stats(gui_app_t *app, int channel,
                     double raw_mb = (double)raw_bytes / 1000000.0;
                     snprintf(buf_rec_raw, 32, "RAW: %.2f MB", raw_mb);
                 }
-                if (comp_bytes > 0 || app->settings.use_flac) {
+                if (comp_bytes > 0 || (m_record ? m_record->use_flac : app->settings.use_flac)) {
                     double ratio = (comp_bytes > 0) ? ((double)raw_bytes / (double)comp_bytes) : 0.0;
                     if (comp_bytes >= 1000000000ULL) {
                         double comp_gb = (double)comp_bytes / 1000000000.0;
@@ -6385,6 +6562,33 @@ static void render_channel_stats(gui_app_t *app, int channel,
                     CLAY(CLAY_IDI("RecRatioRow", channel), { .layout = STAT_ROW_LAYOUT }) {
                         CLAY_TEXT(make_string(buf_rec_ratio),
                             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .fontId = 1, .textColor = to_clay_color(channel_value_color) }));
+                    }
+                }
+                if (m_record) {
+                    /* Live remote record buffer and safety counters, with
+                     * persistent bounded strings (Clay uses frame pointers). */
+                    static char m_rec_buffers[2][88];
+                    snprintf(m_rec_buffers[channel],sizeof(m_rec_buffers[channel]),
+                        "REC_%c: %u%%  W:%u D:%u",
+                        channel?'B':'A',m_record->rec_fill_pct[channel],
+                        m_record->rec_waits[channel],m_record->rec_drops[channel]);
+                    CLAY(CLAY_IDI("MClientRecordBuffer",channel),{.layout=STAT_ROW_LAYOUT}){
+                        CLAY_TEXT(make_string(m_rec_buffers[channel]),
+                            CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.fontId=1,
+                                .textColor=to_clay_color(m_record->rec_fill_pct[channel]>=80?COLOR_CLIP_RED:channel_value_color)}));
+                    }
+                    if (channel==0 && m_record->local_save) {
+                        static char m_send_buffer[96];
+                        unsigned percent=m_record->send_queue_capacity
+                            ? (unsigned)((m_record->send_queue_bytes*100)/m_record->send_queue_capacity):0;
+                        if(percent>100)percent=100;
+                        snprintf(m_send_buffer,sizeof(m_send_buffer),"Send: %u%%  %.1f/64 MiB",
+                            percent,(double)m_record->send_queue_bytes/1048576.0);
+                        CLAY(CLAY_ID("MClientLocalSendBuffer"),{.layout=STAT_ROW_LAYOUT}){
+                            CLAY_TEXT(make_string(m_send_buffer),
+                                CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.fontId=1,
+                                    .textColor=to_clay_color(percent>=80?COLOR_CLIP_RED:channel_value_color)}));
+                        }
                     }
                 }
             }
@@ -6855,6 +7059,9 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
     Clay_SizingAxis channel_a_height = CLAY_SIZING_GROW(0);
     bool playback_mode = gui_ui_selected_device_is_playback(app);
 
+    bool m_client_stats=app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT;
+    gui_monitor_record_stats_t m_record={0};
+    bool have_m_record=m_client_stats && gui_monitor_client_record_stats(&m_record);
     gui_channel_stats_values_t stats[2] = {
         { atomic_load(&app->clip_count_a_pos), atomic_load(&app->clip_count_a_neg),
           app->vu_a.peak_pos, app->vu_a.peak_neg,
@@ -6863,6 +7070,14 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
           app->vu_b.peak_pos, app->vu_b.peak_neg,
           atomic_load(&app->recording_raw_b), atomic_load(&app->recording_compressed_b) }
     };
+    if (have_m_record) {
+        for (int ch=0;ch<2;ch++) {
+            stats[ch].clip_pos=m_record.clip_pos[ch];
+            stats[ch].clip_neg=m_record.clip_neg[ch];
+            stats[ch].raw_bytes=m_record.raw[ch];
+            stats[ch].compressed_bytes=m_record.compressed[ch];
+        }
+    }
     // Drive the on-disk size readout from stat() of the actual output file so
     // it is 1:1 with `ls`/file-manager (kills the writer-atomic > file
     // "over" report from the FILE* buffer lead, and the decimal-MB unit below
@@ -6908,8 +7123,8 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
     s_vu_a_element.type = CUSTOM_LAYOUT_ELEMENT_TYPE_VU_METER;
     s_vu_a_element.customData.vu_meter.meter = &app->vu_a;
     s_vu_a_element.customData.vu_meter.label = "CH A";
-    s_vu_a_element.customData.vu_meter.is_clipping_pos = atomic_load(&app->clip_count_a_pos) > 0;
-    s_vu_a_element.customData.vu_meter.is_clipping_neg = atomic_load(&app->clip_count_a_neg) > 0;
+    s_vu_a_element.customData.vu_meter.is_clipping_pos = (have_m_record ? m_record.clip_pos[0] : atomic_load(&app->clip_count_a_pos)) > 0;
+    s_vu_a_element.customData.vu_meter.is_clipping_neg = (have_m_record ? m_record.clip_neg[0] : atomic_load(&app->clip_count_a_neg)) > 0;
     s_vu_a_element.customData.vu_meter.channel_color = COLOR_CHANNEL_A;
 
     s_osc_a_element.type = CUSTOM_LAYOUT_ELEMENT_TYPE_CHANNEL_PANEL;
@@ -6919,8 +7134,8 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
     s_vu_b_element.type = CUSTOM_LAYOUT_ELEMENT_TYPE_VU_METER;
     s_vu_b_element.customData.vu_meter.meter = &app->vu_b;
     s_vu_b_element.customData.vu_meter.label = "CH B";
-    s_vu_b_element.customData.vu_meter.is_clipping_pos = atomic_load(&app->clip_count_b_pos) > 0;
-    s_vu_b_element.customData.vu_meter.is_clipping_neg = atomic_load(&app->clip_count_b_neg) > 0;
+    s_vu_b_element.customData.vu_meter.is_clipping_pos = (have_m_record ? m_record.clip_pos[1] : atomic_load(&app->clip_count_b_pos)) > 0;
+    s_vu_b_element.customData.vu_meter.is_clipping_neg = (have_m_record ? m_record.clip_neg[1] : atomic_load(&app->clip_count_b_neg)) > 0;
     s_vu_b_element.customData.vu_meter.channel_color = COLOR_CHANNEL_B;
 
     s_osc_b_element.type = CUSTOM_LAYOUT_ELEMENT_TYPE_CHANNEL_PANEL;
@@ -7028,7 +7243,7 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
             }) {}
 
             // Stats panel A
-            render_channel_stats(app, 0, &stats[0], &stats_layout);
+            render_channel_stats(app, 0, &stats[0], &stats_layout, have_m_record?&m_record:NULL);
         }
 
         // Channel B row: VU meter + waveform + stats
@@ -7063,7 +7278,7 @@ static void render_channels_panel(gui_app_t *app, gui_ui_channel_spacing_t spaci
                 }) {}
 
                 // Stats panel B
-                render_channel_stats(app, 1, &stats[1], &stats_layout);
+                render_channel_stats(app, 1, &stats[1], &stats_layout, have_m_record?&m_record:NULL);
             }
         }
     }
@@ -7185,9 +7400,14 @@ static bool render_main_panels(gui_app_t *app) {
     const char *errors_label = status_compact_labels ? errors_label_compact : errors_label_full;
     update_status_free_space(app);
 
-    bool show_record_indicator = app->is_recording && !status_quarter_scale;
+    gui_monitor_record_stats_t m_status={0};
+    bool m_status_valid=app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT &&
+        gui_monitor_client_record_stats(&m_status);
+    bool m_recording=m_status_valid && gui_monitor_client_peer_state()==2;
+    bool show_record_indicator = (app->is_recording || m_recording) && !status_quarter_scale;
     if (show_record_indicator) {
-        double rec_duration = GetTime() - app->recording_start_time;
+        double rec_duration = m_recording ? (double)m_status.elapsed_ms/1000.0
+                                         : GetTime() - app->recording_start_time;
         int rec_hours = (int)(rec_duration / 3600);
         int rec_mins  = ((int)(rec_duration / 60)) % 60;
         int rec_secs  = ((int)rec_duration) % 60;
@@ -7218,7 +7438,7 @@ static bool render_main_panels(gui_app_t *app) {
             char runway_hms[24];
             format_status_free_space_label(free_only_full, sizeof(free_only_full), s_status_free_space_cached_bytes);
             format_status_free_space_compact_label(free_only_compact, sizeof(free_only_compact), s_status_free_space_cached_bytes);
-            if (app->is_recording) {
+            if (app->is_recording || m_recording) {
                 bool runway_known = s_status_output_rate_bps > 0.0;
                 if (runway_known) {
                     double runway_s = (double)s_status_free_space_cached_bytes / s_status_output_rate_bps;
@@ -7250,7 +7470,7 @@ static bool render_main_panels(gui_app_t *app) {
             } else if (s_status_free_space_cached_bytes < STATUS_FREE_SPACE_WARN_BYTES) {
                 free_space_color = COLOR_METER_YELLOW;
             }
-        } else if (app->is_recording) {
+        } else if (app->is_recording || m_recording) {
             snprintf(status_free_space_display_full, sizeof(status_free_space_display_full),
                      "Free: N/A | Runway --:--:--");
             if (status_tiny) {
@@ -7300,7 +7520,7 @@ static bool render_main_panels(gui_app_t *app) {
     }
 
     uint32_t status_sample_rate_raw = atomic_load(&app->sample_rate);
-    uint64_t status_samples_raw = atomic_load(&app->samples_a);
+    uint64_t status_samples_raw = m_status_valid ? m_status.samples_a : atomic_load(&app->samples_a);
 
     /* Tiered right-side value text: tier 0 is the full readout, higher tiers
      * shorten it under width pressure instead of hiding the readout. All
@@ -7333,8 +7553,10 @@ static bool render_main_panels(gui_app_t *app) {
 
     int status_rf_pct = 0;
     int status_aud_pct = 0;
-    uint32_t missed = app->is_capturing ? atomic_load(&app->missed_frame_count) : 0;
-    uint32_t errors = app->is_capturing ? atomic_load(&app->error_count) : 0;
+    uint32_t missed = m_status_valid ? gui_monitor_client_peer_missed() :
+        (app->is_capturing ? atomic_load(&app->missed_frame_count) : 0);
+    uint32_t errors = m_status_valid ? gui_monitor_client_peer_errors() :
+        (app->is_capturing ? atomic_load(&app->error_count) : 0);
     const char *fault_captions[4] = { "", "M!", "E!", "M! E!" };
     int fault_caption_width[4] = { 0, 0, 0, 0 };
     for (int i = 1; i < 4; i++) {
@@ -7347,7 +7569,7 @@ static bool render_main_panels(gui_app_t *app) {
      * width budget. Buffer fill and fault colors may still update normally. */
     {
         format_status_counter(status_frames_display, sizeof(status_frames_display),
-                              atomic_load(&app->frame_count));
+                              (m_status_valid ? gui_monitor_client_peer_frames() : atomic_load(&app->frame_count)));
         format_status_counter(status_missed_display, sizeof(status_missed_display),
                               missed);
         format_status_counter(status_errors_display, sizeof(status_errors_display),
@@ -7357,12 +7579,14 @@ static bool render_main_panels(gui_app_t *app) {
         size_t status_rf_size = app->buffers.buffers[BUF_CAPTURE_RF].buffer_size;
         status_rf_pct = status_rf_size > 0
             ? (int)(((status_rf_tail - status_rf_head) * 100) / status_rf_size) : 0;
+        if(m_status_valid)status_rf_pct=(int)m_status.rf_fill_pct;
         snprintf(status_rf_buf_display, sizeof(status_rf_buf_display), "%d%%", status_rf_pct);
         size_t status_aud_head = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].head);
         size_t status_aud_tail = atomic_load(&app->buffers.buffers[BUF_CAPTURE_AUDIO].tail);
         size_t status_aud_size = app->buffers.buffers[BUF_CAPTURE_AUDIO].buffer_size;
         status_aud_pct = status_aud_size > 0
             ? (int)(((status_aud_tail - status_aud_head) * 100) / status_aud_size) : 0;
+        if(m_status_valid)status_aud_pct=(int)m_status.aud_fill_pct;
         snprintf(status_aud_buf_display, sizeof(status_aud_buf_display), "%d%%", status_aud_pct);
     }
 
@@ -7839,7 +8063,7 @@ static bool render_main_panels(gui_app_t *app) {
                 }
             }) {
                 if (show_sync_status) {
-                    bool synced = atomic_load(&app->stream_synced);
+                    bool synced = m_status_valid ? m_status.stream_synced : atomic_load(&app->stream_synced);
                     Color sync_color = synced ? COLOR_SYNC_GREEN : COLOR_SYNC_RED;
                     CLAY(CLAY_ID("SyncStatus"), {
                         .layout = {
@@ -8131,6 +8355,164 @@ static void render_ui_scale_hud(void)
     }
 }
 
+/* Remote folder picker with server-absolute navigation.  The save directory
+ * never restricts browsing: Linux root is '/', Windows root lists drives. */
+static void render_monitor_folder_picker(gui_app_t *app){
+    if(!s_monitor_folder_open||!(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT)||!app->settings_panel_open)return;
+    int n=gui_monitor_client_folder_count();
+    char remote_path[FILE_PATH_MAX],remote_parent[FILE_PATH_MAX];
+    bool recovered=false,computer=false,failed=false,more=false;
+    if(gui_monitor_client_folder_state(remote_path,sizeof(remote_path),
+          remote_parent,sizeof(remote_parent),&computer,&recovered,&failed,&more)){
+        if(!failed){
+            snprintf(s_monitor_folder_path,sizeof(s_monitor_folder_path),"%s",remote_path);
+            snprintf(s_monitor_folder_parent,sizeof(s_monitor_folder_parent),"%s",remote_parent);
+            s_monitor_folder_computer=computer;
+            s_monitor_folder_recovered=recovered;
+        }
+        s_monitor_folder_error=failed;
+        s_monitor_folder_more=more;
+    }
+    more=s_monitor_folder_more;
+    int w=gui_ui_modal_max_extent(gui_ui_get_layout_width(),900);
+    int h=gui_ui_modal_max_extent(gui_ui_get_layout_height(),690);
+    if(!gui_ui_is_text_field_active(UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH))
+        snprintf(s_monitor_folder_edit_path,sizeof(s_monitor_folder_edit_path),"%s",s_monitor_folder_path);
+    /* More of the address stays visible than in the old filename-tail helper;
+     * the full path is always available for editing by clicking the bar. */
+    const char *address=s_monitor_folder_computer?"Server drives":s_monitor_folder_path;
+    size_t addr_len=strlen(address);
+    if(addr_len<=96){
+        snprintf(s_monitor_folder_path_display,sizeof(s_monitor_folder_path_display),"%s",address);
+    }else{
+        size_t start=addr_len-93;
+        while(start<addr_len&&((unsigned char)address[start]&0xc0)==0x80)start++;
+        snprintf(s_monitor_folder_path_display,sizeof(s_monitor_folder_path_display),"...%s",address+start);
+    }
+    CLAY(CLAY_ID("RemoteBrowseShade"), {
+        .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_GROW(0)}},
+        .floating={.attachTo=CLAY_ATTACH_TO_ROOT,.zIndex=1500,
+                   .attachPoints={.element=CLAY_ATTACH_POINT_LEFT_TOP,.parent=CLAY_ATTACH_POINT_LEFT_TOP}},
+        .backgroundColor=(Clay_Color){0,0,0,190}
+    }){}
+    CLAY(CLAY_ID("RemoteBrowseDialog"), {
+        .layout={.sizing={CLAY_SIZING_FIXED(w),CLAY_SIZING_FIXED(h)},
+                 .layoutDirection=CLAY_TOP_TO_BOTTOM,.padding={20,20,16,16},.childGap=10},
+        .floating={.attachTo=CLAY_ATTACH_TO_ROOT,.zIndex=1501,
+                   .attachPoints={.element=CLAY_ATTACH_POINT_CENTER_CENTER,.parent=CLAY_ATTACH_POINT_CENTER_CENTER}},
+        .backgroundColor=to_clay_color(COLOR_PANEL_BG),.cornerRadius=CLAY_CORNER_RADIUS(10)
+    }){
+        CLAY_TEXT(CLAY_STRING("Choose recording folder on server"),
+            CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_TITLE,.textColor=to_clay_color(COLOR_TEXT)}));
+        CLAY(CLAY_ID("RemoteBrowseCurrent"),{
+            .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(48)},
+                     .padding={10,10,8,8},.childAlignment={.y=CLAY_ALIGN_Y_CENTER}},
+            .backgroundColor=(Clay_Color){24,26,32,255},.cornerRadius=CLAY_CORNER_RADIUS(5)
+        }){
+            if(gui_ui_is_text_field_active(UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH)){
+                gui_ui_render_active_text(UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH,s_monitor_folder_edit_path,
+                    FONT_SIZE_NORMAL,0,COLOR_TEXT);
+            }else{
+                CLAY_TEXT(make_string(s_monitor_folder_path_display),
+                    CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT)}));
+            }
+        }
+        CLAY(CLAY_ID("RemoteBrowseNavigation"),{
+            .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(36)},
+                     .layoutDirection=CLAY_LEFT_TO_RIGHT,.childGap=8}
+        }){
+            CLAY(CLAY_ID("RemoteBrowseUp"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(60),CLAY_SIZING_FIXED(34)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Up"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT)}));}
+            CLAY(CLAY_ID("RemoteBrowseRoot"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(175),CLAY_SIZING_FIXED(34)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Filesystem / Drives"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT)}));}
+            CLAY(CLAY_ID("RemoteBrowseHome"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(75),CLAY_SIZING_FIXED(34)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Home"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT)}));}
+            CLAY(CLAY_ID("RemoteBrowseRecordings"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(175),CLAY_SIZING_FIXED(34)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Current recording"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT)}));}
+            CLAY(CLAY_ID("RemoteBrowseRefresh"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(80),CLAY_SIZING_FIXED(34)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Refresh"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT)}));}
+        }
+        CLAY_TEXT(CLAY_STRING("Click the address above to type any server path; press Enter to open it."),
+            CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+        if(s_monitor_folder_error){
+            CLAY_TEXT(CLAY_STRING("Folder listing failed (access denied or connection lost). Use Up, Home, or Drives."),
+                CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+        }else if(s_monitor_folder_recovered){
+            CLAY_TEXT(CLAY_STRING("Previous folder was unavailable; showing the server filesystem root."),
+                CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+        }
+        CLAY(CLAY_ID("RemoteBrowseContents"),{
+            .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_GROW(0)},
+                     .layoutDirection=CLAY_TOP_TO_BOTTOM,.childGap=3,.padding={6,6,6,6}},
+            .backgroundColor=(Clay_Color){24,26,32,255},.cornerRadius=CLAY_CORNER_RADIUS(5)
+        }){
+            if(n==-1)CLAY_TEXT(CLAY_STRING("Loading server folders..."),
+                 CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+            else if(n==0)CLAY_TEXT(CLAY_STRING("No subfolders (you may choose this folder)"),
+                 CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+            for(int i=0;i<n&&i<12;i++){
+                if(!gui_monitor_client_folder_name(i,s_monitor_folder_labels[i],sizeof(s_monitor_folder_labels[i])))continue;
+                CLAY(CLAY_IDI("RemoteBrowseItem",i),{
+                    .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(25)},
+                             .padding={10,8,0,0},.childAlignment={.y=CLAY_ALIGN_Y_CENTER}},
+                    .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(3)
+                }){
+                    CLAY_TEXT(CLAY_STRING("[DIR]"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT_DIM)}));
+                    CLAY_TEXT(make_string(s_monitor_folder_labels[i]),
+                        CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_STATS,.textColor=to_clay_color(COLOR_TEXT)}));
+                }
+            }
+        }
+        CLAY(CLAY_ID("RemoteBrowsePager"),{
+            .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(32)},
+                     .layoutDirection=CLAY_LEFT_TO_RIGHT,.childGap=10}
+        }){
+            CLAY(CLAY_ID("RemoteBrowsePrev"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(100),CLAY_SIZING_FIXED(30)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(4)
+            }){CLAY_TEXT(CLAY_STRING("Previous"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT)}));}
+            CLAY(CLAY_ID("RemoteBrowseNext"),{
+                .layout={.sizing={CLAY_SIZING_FIXED(100),CLAY_SIZING_FIXED(30)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(4)
+            }){CLAY_TEXT(more?CLAY_STRING("Next >"):CLAY_STRING("Last page"),
+                CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT)}));}
+        }
+        CLAY(CLAY_ID("RemoteBrowseActions"),{
+            .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(36)},
+                     .layoutDirection=CLAY_LEFT_TO_RIGHT,.childGap=14}
+        }){
+            CLAY(CLAY_ID("RemoteBrowseCancel"),{
+                .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(36)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Cancel"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT)}));}
+            CLAY(CLAY_ID("RemoteBrowseSelect"),{
+                .layout={.sizing={CLAY_SIZING_GROW(0),CLAY_SIZING_FIXED(36)},
+                         .childAlignment={.x=CLAY_ALIGN_X_CENTER,.y=CLAY_ALIGN_Y_CENTER}},
+                .backgroundColor=to_clay_color(COLOR_BUTTON_ACTIVE),.cornerRadius=CLAY_CORNER_RADIUS(5)
+            }){CLAY_TEXT(CLAY_STRING("Use this folder"),CLAY_TEXT_CONFIG({.fontSize=FONT_SIZE_NORMAL,.textColor=to_clay_color(COLOR_TEXT)}));}
+        }
+    }
+}
+
+
 // Main layout function
 void gui_render_layout(gui_app_t *app) {
     gui_ui_sync_capture_mode_state(app);
@@ -8151,6 +8533,7 @@ void gui_render_layout(gui_app_t *app) {
 
     // Settings panel overlay (if open)
     render_settings_panel(app);
+    render_monitor_folder_picker(app);
 
     // Record-limit popup overlay (if open)
     if (!gui_ui_selected_device_is_playback(app)) {
@@ -8642,6 +9025,86 @@ void gui_handle_interactions(gui_app_t *app) {
 
     // Handle clicks
     if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+        if(s_monitor_folder_open&&(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT)){
+            if(gui_ui_is_text_field_active(UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH) &&
+               !Clay_PointerOver(CLAY_ID("RemoteBrowseCurrent")) &&
+               !Clay_PointerOver(CLAY_ID("RemoteBrowseSelect"))){
+                /* Navigation cancels an unfinished address edit, not a save. */
+                snprintf(s_monitor_folder_edit_path,sizeof(s_monitor_folder_edit_path),"%s",s_monitor_folder_path);
+                gui_ui_clear_text_edit();
+            }
+            if(Clay_PointerOver(CLAY_ID("RemoteBrowseCurrent"))){
+                gui_ui_begin_text_edit(app,UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH,
+                    CLAY_ID("RemoteBrowseCurrent"),10.0f,10.0f);
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseCancel")) ||
+               Clay_PointerOver(CLAY_ID("RemoteBrowseShade"))){
+                /* Close first so text-edit cleanup cannot navigate. */
+                s_monitor_folder_open=false;
+                if(gui_ui_is_text_field_active(UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH))
+                    gui_ui_clear_text_edit();
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseRoot"))){
+                s_monitor_folder_page=0;
+                gui_monitor_client_browse_folders("",0);
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseHome"))){
+                s_monitor_folder_page=0;
+                gui_monitor_client_browse_folders("~",0);
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseRecordings"))){
+                s_monitor_folder_page=0;
+                gui_monitor_client_browse_folders(app->settings.output_path,0);
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseRefresh"))){
+                gui_monitor_client_browse_folders(s_monitor_folder_path,(unsigned)s_monitor_folder_page);
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseUp"))){
+                s_monitor_folder_page=0;
+                gui_monitor_client_browse_folders(s_monitor_folder_parent,0);
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowsePrev"))){
+                if(s_monitor_folder_page>0){
+                    --s_monitor_folder_page;
+                    gui_monitor_client_browse_folders(s_monitor_folder_path,(unsigned)s_monitor_folder_page);
+                }
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseNext"))){
+                if(s_monitor_folder_more){
+                    ++s_monitor_folder_page;
+                    gui_monitor_client_browse_folders(s_monitor_folder_path,(unsigned)s_monitor_folder_page);
+                }
+            }else if(Clay_PointerOver(CLAY_ID("RemoteBrowseSelect"))){
+                if(gui_ui_is_text_field_active(UI_TEXT_FIELD_MONITOR_SERVER_BROWSER_PATH)){
+                    gui_ui_clear_text_edit();
+                    gui_ui_set_click_consumed();return;
+                }
+                /* Computer is virtual; cannot be used as a recording folder. */
+                if(!s_monitor_folder_computer && !s_monitor_folder_error &&
+                   gui_monitor_client_folder_count()>=0){
+                    gui_monitor_client_select_output(s_monitor_folder_path);
+                    gui_app_set_status(app,"Server Output folder change requested; awaiting server confirmation");
+                    s_monitor_folder_open=false;
+                }
+            }else{
+                int count=gui_monitor_client_folder_count();
+                for(int i=0;i<count&&i<12;i++){
+                    if(!Clay_PointerOver(CLAY_IDI("RemoteBrowseItem",i)))continue;
+                    char name[256];
+                    if(gui_monitor_client_folder_name(i,name,sizeof(name))){
+                        char selected[FILE_PATH_MAX];
+                        if(s_monitor_folder_computer){
+                            snprintf(selected,sizeof(selected),"%s",name);
+                        }else{
+                            size_t len=strlen(s_monitor_folder_path);
+                            bool trailing=len&&(s_monitor_folder_path[len-1]=='/'||s_monitor_folder_path[len-1]=='\\');
+                            const char sep=(strchr(s_monitor_folder_path,'\\')||
+                                           (len>=2&&s_monitor_folder_path[1]==':'))?'\\':'/';
+                            int written=snprintf(selected,sizeof(selected),"%s%s%s",s_monitor_folder_path,
+                                trailing?"":(sep=='\\'?"\\":"/"),name);
+                            if(written<0||(size_t)written>=sizeof(selected))break;
+                        }
+                        s_monitor_folder_page=0;
+                        gui_monitor_client_browse_folders(selected,0);
+                    }
+                    break;
+                }
+            }
+            gui_ui_set_click_consumed();
+            return;
+        }
         // Version info popup modal interactions (consume before toolbar underneath)
         if (s_version_info_window_open) {
             if (Clay_PointerOver(CLAY_ID("VersionInfoCheckUpdateButton"))) {
@@ -8862,7 +9325,7 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
                 return;
             }
-            // Network (Server/Client) mode cycle: Local -> Server -> Client -> Local.
+            // Preserve legacy mode ids; append preview-only roles after Client.
             if (Clay_PointerOver(CLAY_ID("VersionInfoNetModeToggle"))) {
                 if (gui_playback_is_starting(app)) {
                     gui_app_set_status(app, "Network mode is locked while playback prepares");
@@ -8870,24 +9333,29 @@ void gui_handle_interactions(gui_app_t *app) {
                     return;
                 }
                 int cur = app->settings.net_mode;
-                if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_CLIENT) cur = GUI_NET_MODE_LOCAL;
-                int next = (cur == GUI_NET_MODE_LOCAL) ? GUI_NET_MODE_SERVER
-                         : (cur == GUI_NET_MODE_SERVER) ? GUI_NET_MODE_CLIENT
-                         : GUI_NET_MODE_LOCAL;
+                if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_LAST) cur = GUI_NET_MODE_LOCAL;
+                /* Keep numeric mode 3 as a saved-config alias only:
+                 * Local -> Server -> Client -> Monitor & Remote -> Local. */
+                int next = (cur == GUI_NET_MODE_MONITOR_SERVER) ? GUI_NET_MODE_LOCAL
+                    : (cur == GUI_NET_MODE_CLIENT) ? GUI_NET_MODE_MONITOR_CLIENT
+                    : (cur == GUI_NET_MODE_MONITOR_CLIENT) ? GUI_NET_MODE_LOCAL
+                    : cur + 1;
                 app->settings.net_mode = next;
                 gui_ui_clear_text_edit();
                 gui_settings_save(&app->settings);
                 (void)gui_net_apply_mode(app);
                 // Returning to Local restores the local hardware device list
                 // (client mode had replaced it with the server's mirrored list).
-                if (next == GUI_NET_MODE_LOCAL) {
+                if (next == GUI_NET_MODE_LOCAL || cur == GUI_NET_MODE_CLIENT ||
+                    cur == GUI_NET_MODE_MONITOR_CLIENT) {
                     gui_app_enumerate_devices(app);
                 }
                 gui_ui_set_click_consumed();
                 return;
             }
-            // Click a discovered server to connect to it (client mode).
-            if (app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+            // Select a discovered server in either client mode.
+            if (app->settings.net_mode == GUI_NET_MODE_CLIENT ||
+                app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
                 int disc_n = gui_net_discovered_count();
                 int disc_visible = disc_n;
                 if (disc_visible > VERSION_INFO_NET_DISCOVERY_MAX_ROWS) {
@@ -8905,7 +9373,8 @@ void gui_handle_interactions(gui_app_t *app) {
             // Connect/Disconnect button: toggles the client worker while
             // staying in Client mode (discovery remains active when disconnected).
             if (Clay_PointerOver(CLAY_ID("VersionInfoNetConnectButton")) &&
-                app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                (app->settings.net_mode == GUI_NET_MODE_CLIENT ||
+                 app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT)) {
                 gui_ui_clear_text_edit();
                 gui_settings_save(&app->settings);
                 gui_net_client_toggle_connection(app);
@@ -8922,7 +9391,8 @@ void gui_handle_interactions(gui_app_t *app) {
             }
             // Click-to-edit the client host field.
             if (Clay_PointerOver(CLAY_ID("VersionInfoNetClientHostField")) &&
-                app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                (app->settings.net_mode == GUI_NET_MODE_CLIENT ||
+                 app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT)) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_NET_CLIENT_HOST,
                                        CLAY_ID("VersionInfoNetClientHostField"), 8.0f, 8.0f);
                 gui_ui_set_click_consumed();
@@ -8930,7 +9400,8 @@ void gui_handle_interactions(gui_app_t *app) {
             }
             // Click-to-edit the client port field.
             if (Clay_PointerOver(CLAY_ID("VersionInfoNetClientPortField")) &&
-                app->settings.net_mode == GUI_NET_MODE_CLIENT) {
+                (app->settings.net_mode == GUI_NET_MODE_CLIENT ||
+                 app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT)) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_NET_CLIENT_PORT,
                                        CLAY_ID("VersionInfoNetClientPortField"), 6.0f, 6.0f);
                 gui_ui_set_click_consumed();
@@ -9479,7 +9950,8 @@ void gui_handle_interactions(gui_app_t *app) {
         // Check record button - UI indicates record-write to disk finialization
         // Mitigate app appearing hung
         if (Clay_PointerOver(CLAY_ID("RecordButton"))) {
-            if (gui_ui_selected_device_is_playback(app)) {
+            if (app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT &&
+                gui_ui_selected_device_is_playback(app)) {
                 if (app->is_capturing && gui_playback_is_running(app)) {
                     gui_playback_toggle_pause(app);
                     if (gui_playback_get_state(app) == PLAYBACK_STATE_PAUSED) {
@@ -9487,6 +9959,21 @@ void gui_handle_interactions(gui_app_t *app) {
                     } else {
                         gui_app_set_status(app, "Playback resumed");
                     }
+                }
+                gui_ui_set_click_consumed();
+                return;
+            }
+            if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+                if (!gui_monitor_client_connected()) {
+                    gui_app_set_status(app,"Monitor & Remote: connect to Server before recording");
+                } else if (gui_monitor_client_peer_state() == 2) {
+                    gui_net_client_request_record(app,false);
+                    gui_app_set_status(app,"Server: stop recording requested");
+                } else if (gui_monitor_client_peer_state() == 1) {
+                    gui_net_client_request_record(app,true);
+                    gui_app_set_status(app,"Server: start recording requested (server disk)");
+                } else {
+                    gui_app_set_status(app,"Server capture is not running");
                 }
                 gui_ui_set_click_consumed();
                 return;
@@ -9512,12 +9999,20 @@ void gui_handle_interactions(gui_app_t *app) {
 
         // Clip reset buttons (per-channel stats)
         if (Clay_PointerOver(CLAY_IDI("ResetClipBtn", 0))) {
-            atomic_store(&app->clip_count_a_pos, 0);
-            atomic_store(&app->clip_count_a_neg, 0);
+            if(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT)
+                gui_monitor_client_reset_clips(0);
+            else {
+                atomic_store(&app->clip_count_a_pos, 0);
+                atomic_store(&app->clip_count_a_neg, 0);
+            }
         }
         if (Clay_PointerOver(CLAY_IDI("ResetClipBtn", 1))) {
-            atomic_store(&app->clip_count_b_pos, 0);
-            atomic_store(&app->clip_count_b_neg, 0);
+            if(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT)
+                gui_monitor_client_reset_clips(1);
+            else {
+                atomic_store(&app->clip_count_b_pos, 0);
+                atomic_store(&app->clip_count_b_neg, 0);
+            }
         }
         if (gui_ui_selected_device_is_cxadc(app, NULL)) {
             const int dc_step = 1;
@@ -9898,6 +10393,8 @@ void gui_handle_interactions(gui_app_t *app) {
             }
 
             if (app->settings_panel_open &&
+                (app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT ||
+                 !app->settings.monitor_local_save_enabled) &&
                 Clay_PointerOver(CLAY_ID("OutputPathBox")) &&
                 !gui_ui_click_consumed())
             {
@@ -10001,7 +10498,67 @@ void gui_handle_interactions(gui_app_t *app) {
                 }
             }
 
-            if (Clay_PointerOver(CLAY_ID("ChooseOutputFolderButton"))) {
+            if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+                Clay_PointerOver(CLAY_ID("MonitorLocalSaveToggle")) &&
+                !gui_ui_click_consumed()) {
+                /* Never change destination mode during an active remote recording. */
+                if(gui_monitor_client_peer_state()==2)
+                    gui_app_set_status(app,"Stop recording before switching Local Save");
+                else {
+                    app->settings.monitor_local_save_enabled = !app->settings.monitor_local_save_enabled;
+                    // The other path field is now hidden, so close any active
+                    // text edit before switching the visible destination.
+                    gui_ui_clear_text_edit();
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app,app->settings.monitor_local_save_enabled ?
+                        "Local Save ON: next recording goes to this computer" :
+                        "Local Save OFF: next recording goes to the Server");
+                }
+                gui_ui_set_click_consumed();return;
+            }
+            if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+                app->settings.monitor_local_save_enabled &&
+                Clay_PointerOver(CLAY_ID("MonitorLocalSavePathBox")) &&
+                !gui_ui_click_consumed()) {
+                gui_ui_begin_text_edit(app, UI_TEXT_FIELD_MONITOR_LOCAL_SAVE_PATH,
+                                       CLAY_ID("MonitorLocalSavePathBox"), 10.0f, 10.0f);
+                gui_ui_set_click_consumed();
+            }
+            if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
+                app->settings.monitor_local_save_enabled &&
+                Clay_PointerOver(CLAY_ID("MonitorLocalSaveChooseFolder"))) {
+                gui_settings_t tmp=app->settings;
+                // Picker returns its chosen path via tmp.output_path. Start
+                // empty so selecting a folder equal to the Output folder is
+                // not incorrectly treated as a cancelled picker operation.
+                tmp.output_path[0]='\0';
+                /* Picker operates on the client computer, NOT server paths. */
+                if (gui_settings_choose_output_folder(&tmp)) {
+                    snprintf(app->settings.monitor_local_save_path,
+                             sizeof(app->settings.monitor_local_save_path),
+                             "%s",tmp.output_path);
+                    gui_settings_save(&app->settings);
+                    gui_app_set_status(app,"Monitor & Remote local recording folder saved");
+                } else gui_app_set_status(app,"Folder selection cancelled or unavailable; click local path to type it");
+                gui_ui_set_click_consumed();
+                return;
+            }
+            if ((app->settings.net_mode != GUI_NET_MODE_MONITOR_CLIENT ||
+                 !app->settings.monitor_local_save_enabled) &&
+                Clay_PointerOver(CLAY_ID("ChooseOutputFolderButton"))) {
+                if(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT){
+                    if(!gui_monitor_client_connected())
+                        gui_app_set_status(app,"Connect to Server before browsing its folders");
+                    else{
+                        s_monitor_folder_open=true;
+                        s_monitor_folder_page=0;
+                        s_monitor_folder_error=false;s_monitor_folder_computer=false;
+                        s_monitor_folder_recovered=false;s_monitor_folder_more=false;
+                        snprintf(s_monitor_folder_path,sizeof(s_monitor_folder_path),"%s",app->settings.output_path);
+                        gui_monitor_client_browse_folders(s_monitor_folder_path,0);
+                    }
+                    gui_ui_set_click_consumed();return;
+                }
 #if defined(__ANDROID__)
                 /* Async SAF picker: launch and return; the per-frame poll in
                  * gui_handle_interactions applies the result. Never block the

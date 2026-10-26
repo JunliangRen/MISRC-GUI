@@ -1,3 +1,4 @@
+#include "../net/gui_monitor_settings.h"
 /*
  * MISRC GUI - Settings Persistence
  * 16/02/25 - Remediate Win settings not saving - %appdata%
@@ -620,7 +621,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
 
     // Server/Client networking defaults (cxadc_vhs_server-style). Stock mode
     // is Local (no networking). Default port 8080 mirrors the reference server.
-    settings->net_mode = 0;                     // 0=Local, 1=Server, 2=Client
+    settings->net_mode = 0;                     // 0=Local, 1=unified Server, 2=Client, 3=old Server ID, 4=M-Client
     settings->net_server_port = 8080;
     snprintf(settings->net_server_port_str, sizeof(settings->net_server_port_str), "%u",
              (unsigned)settings->net_server_port);
@@ -640,10 +641,27 @@ static void gui_settings_write_string(FILE *f, const char *key, const char *valu
     fprintf(f, "\"%s\n", comma ? "," : "");
 }
 
+/* Preserve local capture preferences: remote M-Server fields must never be
+ * persisted over the Windows user's independent Local/Client profile. */
+static gui_settings_t s_monitor_local_profile;
+static bool s_monitor_local_profile_valid=false;
 // Simple JSON-like format for settings
 // 16.02.25 - Remediate Win save
+void gui_settings_restore_monitor_profile(gui_settings_t *settings){
+    if(settings && s_monitor_local_profile_valid)
+        gui_monitor_settings_copy(settings,&s_monitor_local_profile);
+}
 void gui_settings_save(const gui_settings_t *settings) {
     if (!settings) return;
+    gui_settings_t persisted;
+    if(settings->net_mode==4 && s_monitor_local_profile_valid){
+        persisted=*settings;
+        gui_monitor_settings_copy(&persisted,&s_monitor_local_profile);
+        settings=&persisted;
+    }else if(settings->net_mode!=4){
+        gui_monitor_settings_copy(&s_monitor_local_profile,settings);
+        s_monitor_local_profile_valid=true;
+    }
     
     const char* path = get_settings_file_path();
     if (!gui_settings_ensure_parent_dirs(path)) {
@@ -783,6 +801,8 @@ void gui_settings_save(const gui_settings_t *settings) {
     gui_settings_write_string(f, "net_client_host", settings->net_client_host, true);
     fprintf(f, "  \"net_client_port\": %u,\n", (unsigned)settings->net_client_port);
     gui_settings_write_string(f, "net_client_port_str", settings->net_client_port_str, true);
+    gui_settings_write_string(f, "monitor_local_save_path", settings->monitor_local_save_path, true);
+    fprintf(f,"  \"monitor_local_save_enabled\": %s,\n",settings->monitor_local_save_enabled?"true":"false");
     gui_settings_write_string(f, "playback_file_a", settings->playback_file_a, true);
     gui_settings_write_string(f, "playback_file_b", settings->playback_file_b, true);
     gui_settings_write_string(f, "playback_audio_file", settings->playback_audio_file, false);
@@ -1080,6 +1100,8 @@ void gui_settings_load(gui_settings_t *settings) {
     
     // Start with defaults
     gui_settings_init_defaults(settings);
+    gui_monitor_settings_copy(&s_monitor_local_profile,settings);
+    s_monitor_local_profile_valid=true;
     
     const char* path = get_settings_file_path();
     FILE* f = file_open_utf8(path, "rb");
@@ -1513,7 +1535,7 @@ void gui_settings_load(gui_settings_t *settings) {
     // Server/Client networking (cxadc_vhs_server-style peer mode).
     if ((value = find_value(content, "net_mode")) != NULL) {
         int mode = atoi(value);
-        if (mode < 0 || mode > 2) mode = 0;
+        if (mode < 0 || mode > 4) mode = 0;
         settings->net_mode = mode;
     }
     if ((value = find_value(content, "net_server_port")) != NULL) {
@@ -1534,6 +1556,12 @@ void gui_settings_load(gui_settings_t *settings) {
     }
     if ((value = find_value(content, "net_client_port_str")) != NULL) {
         gui_settings_load_string(settings->net_client_port_str, sizeof(settings->net_client_port_str), value);
+    }
+    if ((value = find_value(content,"monitor_local_save_enabled")) != NULL) {
+        settings->monitor_local_save_enabled = (strncmp(value,"true",4)==0 || atoi(value)==1);
+    }
+    if ((value = find_value(content, "monitor_local_save_path")) != NULL) {
+        gui_settings_load_string(settings->monitor_local_save_path, sizeof(settings->monitor_local_save_path), value);
     }
     // Re-sync port string mirrors if the numeric port was loaded but the
     // string mirror was absent/empty (older settings files).
@@ -1563,6 +1591,8 @@ void gui_settings_load(gui_settings_t *settings) {
 
     // Keep auto-derived names in sync on startup (RF prefixes are conditional on empty RF tags).
     gui_settings_refresh_auto_names(settings);
+    gui_monitor_settings_copy(&s_monitor_local_profile,settings);
+    s_monitor_local_profile_valid=true;
 
     free(content);
 }

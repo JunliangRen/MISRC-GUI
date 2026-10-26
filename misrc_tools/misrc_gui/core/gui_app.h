@@ -382,13 +382,18 @@ typedef struct {
 
     // Server/Client networking (cxadc_vhs_server-style peer mode).
     // net_mode: 0=Local (default, no networking), 1=Server (host/master),
-    // 2=Client (connect to a host server, slave).
+    // 2=Client (connect to a host server, slave),
+    // 3=M-Server and 4=M-Client (separate preview-only protocol).
     int  net_mode;
     uint16_t net_server_port;                 // Port to listen on when Server.
     char net_server_port_str[16];             // Editable string mirror of net_server_port.
     char net_client_host[128];                // Host to connect to when Client.
     char net_client_port_str[16];             // Editable string mirror of net_client_port.
     uint16_t net_client_port;                 // Port to connect to when Client.
+    /* M-Client ONLY: local output selection. Does not activate file transfer.
+     * Never include this path in monitor HTTP commands or server settings. */
+    char monitor_local_save_path[FILE_PATH_MAX];
+    bool monitor_local_save_enabled;  /* M-Client only; never synced to M-Server */
 } gui_settings_t;
 
 typedef enum {
@@ -575,6 +580,9 @@ typedef struct gui_app {
     // between UI interactions and the display thread.
     atomic_flag panel_config_lock;
 
+    // True only for headless (no-raylib-window) legacy server launch.
+    bool headless_server;
+
     // Server/Client networking state (opaque; implemented in net/gui_net.c).
     // NULL when net_mode == Local. Owned by gui_app_t; created/destroyed by
     // gui_net_apply_mode(). Accessed from the UI/main thread only for control;
@@ -590,7 +598,13 @@ typedef struct gui_app {
     atomic_bool net_cmd_record_on;      // /record?on=1 requested
     atomic_bool net_cmd_record_off;     // /record?on=0 requested
     atomic_bool net_cmd_select_device;  // /device?N requested (arg in net_cmd_device_index)
-    atomic_int  net_cmd_device_index;   // Device index argument for select_device.
+    atomic_int  net_cmd_device_index;   // Legacy Client device argument.
+    /* The unified Server keeps monitor-specific commands separate. Otherwise
+     * a legacy /device request could restart a running capture (M behaviour),
+     * or a legacy /record could accidentally use M-Client Local Save. */
+    atomic_bool net_cmd_monitor_select_device;
+    atomic_int  net_cmd_monitor_device_index;
+    atomic_int  net_cmd_monitor_record; // 0=none, 1=server ON, 2=Local Save ON, 3=OFF
 
     // Net mirrored state snapshot (written by client mirror thread, read by UI).
     // Server mode also writes these so the local UI reflects remote-driven state.
@@ -623,6 +637,8 @@ static inline void gui_app_count_system_errors(gui_app_t *app, uint32_t count) {
 }
 
 // Application lifecycle
+void gui_runtime_set_headless(bool enabled);
+double gui_runtime_time(void);
 void gui_app_init(gui_app_t *app);
 void gui_app_cleanup(gui_app_t *app);
 
@@ -656,6 +672,8 @@ void gui_app_set_status(gui_app_t *app, const char *message);
 // Settings persistence
 void gui_settings_load(gui_settings_t *settings);
 void gui_settings_save(const gui_settings_t *settings);
+/* Restore local recording profile after leaving M-Client; never touches other modes. */
+void gui_settings_restore_monitor_profile(gui_settings_t *settings);
 void gui_settings_init_defaults(gui_settings_t *settings);
 // Override the settings file path (e.g. from --config <path>). When set,
 // gui_settings_load/save use this path instead of the platform default.

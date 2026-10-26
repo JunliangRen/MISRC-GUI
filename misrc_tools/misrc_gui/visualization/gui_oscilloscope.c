@@ -6,6 +6,7 @@
  */
 
 #include "gui_oscilloscope.h"
+#include "../../common/threading.h"
 #include "gui_phosphor_rt.h"
 #include "gui_fft.h"
 #include "../signal/gui_trigger.h"
@@ -136,6 +137,7 @@ typedef struct {
     // Initialization flag
     bool initialized;
     bool trigger_source_defaulted_by_channel;
+    uint32_t remote_last_sequence; /* M-Client only */
 } waveform_panel_state_t;
 
 typedef struct {
@@ -1875,4 +1877,68 @@ static const panel_vtable_t s_waveform_vtable = {
 
 void gui_waveform_panel_register(void) {
     panel_register(PANEL_VIEW_WAVEFORM, &s_waveform_vtable);
+}
+
+/* v5: server uses EXACT Local waveform processing (including SOXR + trigger),
+ * but produces normalized display samples without creating a graphics window.
+ * HTTP request threads serialize this CPU-only renderer because the Local
+ * resampler uses static temporary scratch buffers. */
+static atomic_flag s_rd_wave_lock=ATOMIC_FLAG_INIT;
+size_t gui_waveform_server_display_points(const int16_t *src,const int16_t *a,
+        const int16_t *b,size_t count,uint32_t rate,const gui_rd_config_t *cfg,
+        float out[GUI_RD_WIDTH],int32_t *trigger_pos){
+    if(!src||!out||!cfg||!trigger_pos||!count)return 0;
+    while(atomic_flag_test_and_set_explicit(&s_rd_wave_lock,memory_order_acquire))thrd_sleep_ms(1);
+    /* Keep resamplers cached across frames; no GPU resources used. */
+    static waveform_panel_state_t states[2];
+    static bool ready[2]={false,false};
+    int ch=(src==b)?1:0;
+    waveform_panel_state_t *st=&states[ch];
+    if(!ready[ch]){
+        atomic_flag_clear(&st->data_lock);
+        atomic_init(&st->display_width,GUI_RD_WIDTH);
+        ready[ch]=true;
+    }
+    atomic_store(&st->display_width,(int)cfg->width);
+    waveform_runtime_cfg_t local={
+        .zoom_scale=cfg->zoom,
+        .trigger_enabled=cfg->trigger_enabled!=0,
+        .trigger_level=(int16_t)cfg->trigger_level,
+        .trigger_mode=(trigger_mode_t)cfg->trigger_mode,
+        .trigger_source=(trigger_source_t)cfg->trigger_source,
+    };
+    waveform_sample_t temp[GUI_RD_WIDTH];size_t n=0;int tr=-1;
+    gui_waveform_set_trigger_source_buffers(a,b,count);
+    bool ok=waveform_process_display(st,&local,src,count,rate,temp,&n,&tr);
+    gui_waveform_set_trigger_source_buffers(NULL,NULL,0);
+    if(ok){for(size_t i=0;i<n;i++)out[i]=temp[i].value;}
+    *trigger_pos=ok?tr:-1;
+    atomic_flag_clear_explicit(&s_rd_wave_lock,memory_order_release);
+    return ok?n:0;
+}
+void gui_waveform_remote_apply_points(void *state_ptr,const gui_rd_channel_t *ch,uint32_t sequence){
+    if(!state_ptr||!ch)return;
+    waveform_panel_state_t *state=state_ptr;
+    if(state->remote_last_sequence==sequence || ch->count==0)return;
+    waveform_state_lock(state);
+    for(size_t i=0;i<ch->count;i++)state->display_samples[i].value=ch->waveform[i];
+    state->display_samples_available=ch->count;
+    state->trigger_display_pos=ch->trigger_pos;
+    state->remote_last_sequence=sequence;
+    state->config_dirty=false;
+    waveform_state_unlock(state);
+}
+void gui_waveform_remote_publish_config(void *state_ptr,int ch){
+    if(!state_ptr)return;
+    waveform_panel_state_t *state=state_ptr;
+    gui_rd_config_t cfg;
+    waveform_state_lock(state);
+    cfg.zoom=state->zoom_scale;
+    cfg.width=(uint32_t)atomic_load(&state->display_width);
+    cfg.trigger_enabled=state->trigger_enabled;
+    cfg.trigger_level=state->trigger_level;
+    cfg.trigger_mode=state->trigger_mode;
+    cfg.trigger_source=state->trigger_source;
+    waveform_state_unlock(state);
+    gui_rd_publish_request(ch,cfg);
 }
