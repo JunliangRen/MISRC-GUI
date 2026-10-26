@@ -139,9 +139,8 @@ static void print_usage(const char *program_name) {
             "\n"
             "Headless network server (Linux):\n"
             "  --headless-server [--config <path>] [--select-device <selector>]\n"
-            "       Starts Harry's legacy full-RF network Server without a window.\n"
-            "  --headless-monitor-server [--config <path>]\n"
-            "       Independent M-Server monitor status/control (preview not yet available).\n"
+            "       One headless Server: legacy RF streams and MISRC-M/2 monitor\n"
+            "       status/control/preview on the same TCP port.\n"
             "\n"
             "Headless CLI capture mode:\n"
             "  Pass any capture option (e.g. --device-list, -a FILE) to run this\n"
@@ -611,9 +610,9 @@ static void app_modal_frame(void *ctx)
 static volatile sig_atomic_t s_headless_stop = 0;
 static void gui_headless_signal(int signo) { (void)signo; s_headless_stop = 1; }
 
-/* All existing net/http functions and RF stream endpoints stay untouched. */
-static int gui_run_role_headless_server(int requested_mode,const char *config_path,
-                                         const char *selector, bool debug_view) {
+/* One headless listener serves both RF and MISRC-M/2 monitor clients. */
+static int gui_run_role_headless_server(const char *config_path,
+                                        const char *selector, bool debug_view) {
     s_headless_stop = 0;
     gui_runtime_set_headless(true);
     SetTraceLogLevel(debug_view ? LOG_INFO : LOG_WARNING);
@@ -630,12 +629,11 @@ static int gui_run_role_headless_server(int requested_mode,const char *config_pa
     app.headless_server = true;
     gui_settings_set_override_path(config_path);
     gui_settings_load(&app.settings);
-    app.settings.net_mode = requested_mode;
+    app.settings.net_mode = GUI_NET_MODE_SERVER;
     app.settings.capture_limit_seconds = 0;
     gui_app_init(&app);
     if (!gui_net_active(&app)) {
-        fprintf(stderr, "[HEADLESS] Couldn't start %s server on %u\n",
-                requested_mode==GUI_NET_MODE_SERVER?"RF":"monitor",
+        fprintf(stderr, "[HEADLESS] Couldn't start unified server on %u\n",
                 (unsigned)app.settings.net_server_port);
         gui_app_cleanup(&app);
         gui_runtime_set_headless(false);
@@ -646,8 +644,7 @@ static int gui_run_role_headless_server(int requested_mode,const char *config_pa
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
-    fprintf(stderr, "[HEADLESS] %s Server listening on TCP %u\n",
-            requested_mode==GUI_NET_MODE_SERVER?"Legacy full-RF":"M-Monitor status/control",
+    fprintf(stderr, "[HEADLESS] Server listening on TCP %u (RF + MISRC-M/2)\n",
             (unsigned)app.settings.net_server_port);
     bool started_once = false;
     double next_probe = gui_runtime_time();
@@ -691,8 +688,7 @@ static int gui_run_role_headless_server(int requested_mode,const char *config_pa
         }
         thrd_sleep_ms(50);
     }
-    fprintf(stderr, "[HEADLESS] Stopping %s server\n",
-            requested_mode==GUI_NET_MODE_SERVER?"legacy RF":"monitor");
+    fprintf(stderr, "[HEADLESS] Stopping unified server\n");
     if (app.is_recording) gui_app_stop_recording(&app);
     if (app.is_capturing) gui_app_stop_capture(&app);
     gui_app_cleanup(&app);
@@ -709,7 +705,6 @@ int main(int argc, char **argv) {
     bool smoke_test = false;
     bool auto_connect = false;
     bool headless_server = false;
-    bool headless_monitor_server = false;
     bool has_capture_arg = false;
     const char *config_path = NULL;  /* --config <path> override */
     const char *select_device_arg = NULL;  /* --select-device <index-or-name> */
@@ -740,10 +735,6 @@ int main(int argc, char **argv) {
         }
         if (strcmp(a, "--headless-server") == 0) {
             headless_server = true;
-            continue;
-        }
-        if (strcmp(a, "--headless-monitor-server") == 0) {
-            headless_monitor_server = true;
             continue;
         }
         if (strcmp(a, "--auto-connect") == 0) {
@@ -821,7 +812,7 @@ int main(int argc, char **argv) {
     // Headless CLI capture mode: run as the full misrc_capture CLI (no window).
     // misrc_capture_main handles --device-list/--devices, -a/-b/-r/-x, -f, -n/-t,
     // resample/audio opts, and prints full CLI usage on an incomplete combo.
-    if (has_capture_arg && !headless_server && !headless_monitor_server) {
+    if (has_capture_arg && !headless_server) {
         return misrc_capture_main(argc, argv);
     }
 #endif
@@ -844,20 +835,14 @@ int main(int argc, char **argv) {
         }
         return gui_run_update_cli(update_cli_mode, update_manifest_source, update_cli_yes);
     }
-    if (headless_server || headless_monitor_server) {
-        if (headless_server && headless_monitor_server) {
-            fprintf(stderr, "Choose only one headless server mode\n");
-            return 2;
-        }
+    if (headless_server) {
         if (has_capture_arg || auto_connect || auto_capture || auto_record_given ||
             update_cli_mode != GUI_UPDATE_CLI_NONE) {
             fprintf(stderr, "Headless server flags cannot be combined with capture/update/auto flags\n");
             return 2;
         }
 #if defined(__linux__) && !defined(__ANDROID__)
-        return gui_run_role_headless_server(headless_monitor_server ?
-                      GUI_NET_MODE_MONITOR_SERVER : GUI_NET_MODE_SERVER,
-                      config_path, select_device_arg, debug_view);
+        return gui_run_role_headless_server(config_path, select_device_arg, debug_view);
 #else
         fprintf(stderr, "Headless server currently supported on Linux only\n");
         return 2;

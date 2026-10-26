@@ -1,23 +1,26 @@
-# MISRC-GUI: M-Server and M-Client monitor modes
+# MISRC-GUI: Unified Server and M-Client monitor mode
 
-This extension adds two monitor-only network roles while retaining the original
-Local, Server, and Client modes and their full-RF transport. The M-Server is
-responsible for capture, processing, recording and filesystem access. The
-M-Client renders a low-bandwidth preview and sends recording/control commands.
+The existing **Server** now hosts both the original full-RF transport and the
+MISRC-M/2 monitor transport **on the same TCP port**. There is no separate
+M-Server mode or monitor listener. The Server owns capture, processing,
+recording, and filesystem access. The M-Client renders a low-bandwidth preview
+and sends recording/control commands. The legacy Client is unchanged.
 
 ## Modes and compatibility
 
 | `net_mode` | Mode | Behaviour |
 |---:|---|---|
 | 0 | Local | Existing local capture mode |
-| 1 | Server | Existing full-RF network server |
+| 1 | Server | Unified full-RF and MISRC-M/2 monitor server |
 | 2 | Client | Existing full-RF network client |
-| 3 | M-Server | Capture/record locally; provide monitor status, control and preview |
+| 3 | old M-Server config ID | Automatically mapped to Server (1); not selectable in the UI |
 | 4 | M-Client | Remote monitoring and control; no local capture hardware required |
 
-M-Server advertises `MISRC-M` separately from the original `MISRC` discovery
-service. The monitor handshake requires **`MISRC-M/2`**. Old and new network
-roles are not interchangeable; update both monitor endpoints together.
+The unified Server broadcasts both `MISRC` (legacy) and `MISRC-M` (monitor)
+UDP discovery markers pointing to the **same TCP port**. The received HTTP path
+selects the protocol: `/monitor/...` is handled by the monitor backend,
+while `/rf`, `/baseband`, `/stats`, etc. retain the legacy implementation.
+M-Client insists on a **`MISRC-M/2`** handshake and never receives raw RF.
 
 ## Preview and status
 
@@ -28,8 +31,8 @@ roles are not interchangeable; update both monitor endpoints together.
   per-channel raw/encoded bytes, drop/error counts, clip values, REC A/B buffer
   occupancy, Local Save network queue fill and available recording disk space.
 - `GET /monitor/start`, `/monitor/stop`, `/monitor/record?on=1|0`, and
-  `/monitor/reset-clips?channel=0|1` control the M-Server.
-- M-Client receives the M-Server device catalogue; pseudo-devices such as
+  `/monitor/reset-clips?channel=0|1` control the Server.
+- M-Client receives the Server device catalogue; pseudo-devices such as
   Simulated and Playback legitimately use `index=-1`.
 
 **Preview is not a raw-RF transport.** Encoded recordings are transferred only
@@ -41,7 +44,7 @@ In M-Client Settings, only the active destination is displayed:
 
 - **Local Save OFF:** Record writes to the server's Output folder. The
   M-Client's folder browser navigates the *server* filesystem, including
-  Home/Up/root or Windows drive selection. The M-Server validates and persists
+  Home/Up/root or Windows drive selection. The Server validates and persists
   the chosen directory.
 - **Local Save ON:** Record writes directly to the client's selected local
   folder using a separate persistent transfer connection (no SMB mount).
@@ -53,7 +56,7 @@ The two paths are stored independently. Local Save controls appear **only**
 in M-Client mode. The 64 MiB encoded-send queue is bounded; insufficient
 network/disk throughput can cause backpressure or a partial/aborted recording.
 
-M-Client mirrors an allowlisted set of 68 recording settings from the M-Server
+M-Client mirrors an allowlisted set of 68 recording settings from the Server
 and can update them over dedicated `/monitor/settings` controls. Client-local
 window/layout settings, network mode and Local Save destination are not sent
 to the server. Server device selection uses `/monitor/devices` and
@@ -61,7 +64,7 @@ to the server. Server device selection uses `/monitor/devices` and
 during active recording. On leaving M-Client, the local configuration profile
 is restored.
 
-## Dedicated monitor endpoints
+## Monitor endpoints on the shared server
 
 - `/monitor/settings` and `/monitor/settings/set`: recording configuration
 - `/monitor/devices` and `/monitor/device`: server device catalogue/selection
@@ -69,8 +72,9 @@ is restored.
   directory listing and output directory selection
 - `/monitor/local-save/attach`: persistent file receiver handshake
 
-The monitor transport and Local Save streaming code are separate from the
-legacy Server/Client RF streaming protocol.
+Monitor endpoint handlers and Local Save are separate from the legacy RF
+handlers, but use the same TCP listener. The attached Local Save socket
+transfers ownership to the dedicated recording worker after the HTTP request.
 
 ## Build and usage
 
@@ -83,23 +87,25 @@ must cross-compile the bundled/static Zstandard dependency using
 # Linux build
 bash scripts/build-local.sh
 
-# Start M-Server without a desktop
-./build-local/misrc_gui --headless-monitor-server
+# Start the unified Server without a desktop
+./build-local/misrc_gui --headless-server
 
 # Inspect its status from a second terminal
+curl -fsS http://127.0.0.1:8080/stats
+curl -fsS http://127.0.0.1:8080/monitor/hello
 curl -fsS http://127.0.0.1:8080/monitor/status
 ```
 
 On Windows, run `scripts\build-local.ps1` in PowerShell; select **M-Client**
-and connect to the M-Server in the discovered server list.
+and connect to the Server in the discovered server list.
 
 **Security:** monitor HTTP and file transfer endpoints have no built-in
 TLS/authentication. Expose these ports only on a trusted LAN or authenticated
 VPN, never to the public Internet.
 
-**Compatibility and review scope:** New behaviour is intended for M-Server and
-M-Client. Integration requires conditional changes in shared GUI/recording code
-and shared FLAC writer callbacks; normal recording uses existing stdio
-fallbacks. The legacy headless `--headless-server` option is also present in
-this current codebase. Reviewers should inspect those shared interfaces when
-assessing backward compatibility of the original modes.
+**Compatibility and review scope:** The UI cycles Local / Server / Client /
+M-Client. Existing JSON `net_mode: 3` loads as Server for backward compatibility.
+`--headless-server` is the sole headless network-server flag. Local/legacy
+client, RF streaming and normal recording should be regression-tested alongside
+monitor preview, controls, remote settings and Local Save. See
+`misrc_tools/test/unified_server_smoke.py` for the protocol smoke test.

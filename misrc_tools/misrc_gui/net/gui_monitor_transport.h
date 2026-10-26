@@ -1,5 +1,5 @@
-/* Independently versioned, low-bandwidth monitor control transport.
- * Legacy RF Server/Client remain in gui_net.c. */
+/* Versioned low-bandwidth monitor endpoints on the shared RF/monitor Server.
+ * The monitor client still uses a separate protocol, never raw RF ingest. */
 #ifndef GUI_MONITOR_TRANSPORT_H
 #define GUI_MONITOR_TRANSPORT_H
 #include "../core/gui_app.h"
@@ -9,6 +9,10 @@
 /* M-Server/M-Client display preview: original phosphor renderer data,
  * Zstd-1 on-wire, <=10 fps. Encoding and decoding: gui_remote_display.h. */
 int gui_monitor_server_start(gui_app_t *app, uint16_t port);
+/* The caller owns the accepted socket unless this returns true: Local Save
+ * then takes ownership and closes it when the receiver shuts down. */
+bool gui_monitor_server_handle_request(uintptr_t socket_handle,
+                                       gui_app_t *app, const char *request_headers);
 void gui_monitor_server_stop(void);
 bool gui_monitor_server_active(void);
 uint16_t gui_monitor_server_port(void);
@@ -52,5 +56,4 @@ bool gui_monitor_client_output_path(char *out,size_t cap);
 void gui_monitor_server_poll_settings(gui_app_t *app);
 /* Main-thread-only: mirror M-Server recording config and device list. */
 void gui_monitor_client_sync_main(gui_app_t *app);
-bool gui_monitor_server_consume_local_start(void);
 #endif

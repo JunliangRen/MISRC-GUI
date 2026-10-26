@@ -1247,6 +1247,9 @@ void gui_app_init(gui_app_t *app) {
     atomic_store(&app->net_cmd_record_off, false);
     atomic_store(&app->net_cmd_select_device, false);
     atomic_store(&app->net_cmd_device_index, 0);
+    atomic_store(&app->net_cmd_monitor_select_device, false);
+    atomic_store(&app->net_cmd_monitor_device_index, -1);
+    atomic_store(&app->net_cmd_monitor_record, 0);
     atomic_store(&app->net_connected, false);
     atomic_store(&app->net_error, false);
     gui_net_init_globals();

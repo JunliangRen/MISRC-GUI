@@ -598,7 +598,13 @@ typedef struct gui_app {
     atomic_bool net_cmd_record_on;      // /record?on=1 requested
     atomic_bool net_cmd_record_off;     // /record?on=0 requested
     atomic_bool net_cmd_select_device;  // /device?N requested (arg in net_cmd_device_index)
-    atomic_int  net_cmd_device_index;   // Device index argument for select_device.
+    atomic_int  net_cmd_device_index;   // Legacy Client device argument.
+    /* The unified Server keeps monitor-specific commands separate. Otherwise
+     * a legacy /device request could restart a running capture (M behaviour),
+     * or a legacy /record could accidentally use M-Client Local Save. */
+    atomic_bool net_cmd_monitor_select_device;
+    atomic_int  net_cmd_monitor_device_index;
+    atomic_int  net_cmd_monitor_record; // 0=none, 1=server ON, 2=Local Save ON, 3=OFF
 
     // Net mirrored state snapshot (written by client mirror thread, read by UI).
     // Server mode also writes these so the local UI reflects remote-driven state.

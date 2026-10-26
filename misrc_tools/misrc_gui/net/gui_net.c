@@ -500,7 +500,7 @@ const char *gui_net_mode_name(int mode) {
     switch (mode) {
         case GUI_NET_MODE_SERVER: return "Server";
         case GUI_NET_MODE_CLIENT: return "Client";
-        case GUI_NET_MODE_MONITOR_SERVER: return "M-Server";
+        case GUI_NET_MODE_MONITOR_SERVER: return "Server"; /* saved config compatibility */
         case GUI_NET_MODE_MONITOR_CLIENT: return "M-Client";
         default: return "Local";
     }
@@ -515,14 +515,9 @@ void gui_net_set_status(gui_app_t *app, const char *msg) {
 
 void gui_net_status_string(const gui_app_t *app, char *buf, size_t len) {
     if (!buf || len == 0) return;
-    if (app && app->settings.net_mode == GUI_NET_MODE_MONITOR_SERVER && gui_monitor_server_active()) {
-        snprintf(buf,len,"M-Server on :%u (waveform/FFT + status/control)",
-                 (unsigned)gui_monitor_server_port());
-        return;
-    }
     if (s_server) {
         if (atomic_load(&s_server->running)) {
-            snprintf(buf, len, "Listening on :%u", (unsigned)s_server->port);
+            snprintf(buf, len, "Listening on :%u (RF + MISRC-M/2 monitor)", (unsigned)s_server->port);
         } else {
             snprintf(buf, len, "Server failed to listen on :%u", (unsigned)s_server->port);
         }
@@ -589,8 +584,7 @@ void gui_net_status_string(const gui_app_t *app, char *buf, size_t len) {
             return;
         }
     }
-    if (app && (app->settings.net_mode == GUI_NET_MODE_MONITOR_SERVER ||
-                app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT)) {
+    if (app && app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
         snprintf(buf, len, "Monitor backend pending (no RF fallback)");
         return;
     }
@@ -833,10 +827,20 @@ static int server_client_thread(void *arg) {
      * thread forever on a blocking call. */
     net_set_timeouts(fd, 5000, 5000);
 
-    char buf[0x1000];
+    /* Monitor folder URLs can contain percent-escaped, 4096-byte UTF-8
+     * paths. Do not truncate them at the legacy 4 KiB HTTP header limit. */
+    char buf[16384];
     int len = net_read_headers(fd, buf, sizeof(buf));
     if (len <= 0) {
         net_close(fd);
+        return 0;
+    }
+    /* Dispatch by requested protocol. Both clients connect to the same
+     * TCP port; monitor requests do not enter the legacy RF handler. */
+    if (strncmp(buf, "GET /monitor/", 13) == 0) {
+        bool socket_transferred = gui_monitor_server_handle_request(
+            (uintptr_t)fd, app, buf);
+        if (!socket_transferred) net_close(fd);
         return 0;
     }
     char method[8] = {0};
@@ -907,8 +911,10 @@ static int server_beacon_thread(void *arg) {
     char name[128] = {0};
     gethostname(name, sizeof(name) - 1);
     name[sizeof(name) - 1] = '\0';
-    char pkt[256];
+    char pkt[256], monitor_pkt[256];
     int plen = snprintf(pkt, sizeof(pkt), "MISRC\n%u\n%s", (unsigned)srv->port, name);
+    int mlen = snprintf(monitor_pkt, sizeof(monitor_pkt), "MISRC-M\n%u\n%s",
+                        (unsigned)srv->port, name);
     struct sockaddr_in dst;
     memset(&dst, 0, sizeof(dst));
     dst.sin_family = AF_INET;
@@ -916,6 +922,8 @@ static int server_beacon_thread(void *arg) {
     dst.sin_port = htons(NET_DISCOVERY_PORT);
     while (!atomic_load(&srv->beacon_stop)) {
         sendto(fd, pkt, plen, 0, (struct sockaddr *)&dst, sizeof(dst));
+        /* Each client mode sees only its own marker, same TCP destination. */
+        sendto(fd, monitor_pkt, mlen, 0, (struct sockaddr *)&dst, sizeof(dst));
         /* Sleep 2s in 100ms slices so beacon_stop is seen promptly on stop. */
         for (int i = 0; i < 20 && !atomic_load(&srv->beacon_stop); i++) {
             thrd_sleep_ms(100);
@@ -1814,6 +1822,10 @@ int gui_net_apply_mode(gui_app_t *app) {
     if (!app) return -1;
     gui_net_init_globals();
     int want = app->settings.net_mode;
+    /* Accept older saved M-Server (3) configurations as the unified Server. */
+    if (want == GUI_NET_MODE_MONITOR_SERVER) {
+        app->settings.net_mode = want = GUI_NET_MODE_SERVER;
+    }
     /* Stop whatever is running if it doesn't match the desired mode. */
     if (s_server && want != GUI_NET_MODE_SERVER) {
         server_stop(s_server);
@@ -1822,22 +1834,8 @@ int gui_net_apply_mode(gui_app_t *app) {
                       (want == GUI_NET_MODE_MONITOR_CLIENT && s_client->monitor_only))) {
         client_stop(s_client);
     }
-    if (want != GUI_NET_MODE_MONITOR_SERVER) gui_monitor_server_stop();
+    if (want != GUI_NET_MODE_SERVER) gui_monitor_server_stop();
     if (want != GUI_NET_MODE_MONITOR_CLIENT) gui_monitor_client_stop();
-    /* M-Server has an independent HTTP/control protocol. No RF streaming. */
-    if (want == GUI_NET_MODE_MONITOR_SERVER) {
-        long p=atol(app->settings.net_server_port_str);
-        if(p<1||p>65535)p=app->settings.net_server_port;
-        if(p<1||p>65535)p=8080;
-        app->settings.net_server_port=(uint16_t)p;
-        if(gui_monitor_server_active() && gui_monitor_server_port()!=(uint16_t)p)
-            gui_monitor_server_stop();
-        if(!gui_monitor_server_active() && gui_monitor_server_start(app,(uint16_t)p)!=0){
-            gui_net_set_status(app,"M-Server: failed to bind monitor TCP port");return -1;
-        }
-        gui_net_set_status(app,"M-Server online (MISRC-M/1, waveform/FFT preview)");
-        return 0;
-    }
     if (want == GUI_NET_MODE_MONITOR_CLIENT) {
         /* Discovery and monitor handshake are independent of Harry's RF client. */
         if (!s_client && client_start(app, "", app->settings.net_client_port, true) != 0) {
@@ -1863,6 +1861,7 @@ int gui_net_apply_mode(gui_app_t *app) {
         if (s_server) {
             /* Already running: restart only if the listen port changed. */
             if (s_server->port != (uint16_t)p) {
+                gui_monitor_server_stop();
                 server_stop(s_server);
                 if (server_start(app, (uint16_t)p) != 0) {
                     gui_net_set_status(app, "Failed to restart network server");
@@ -1881,6 +1880,17 @@ int gui_net_apply_mode(gui_app_t *app) {
             snprintf(msg, sizeof(msg), "Network server listening on :%u", (unsigned)p);
             gui_net_set_status(app, msg);
         }
+        /* Shared listener: monitor initializes its snapshots and Local Save,
+         * but never binds its own TCP socket. A port change re-inits it. */
+        if (gui_monitor_server_active() && gui_monitor_server_port() != (uint16_t)p)
+            gui_monitor_server_stop();
+        if (!gui_monitor_server_active() &&
+            gui_monitor_server_start(app, (uint16_t)p) != 0) {
+            if (s_server) server_stop(s_server);
+            gui_net_set_status(app, "Failed to enable monitor endpoints");
+            return -1;
+        }
+        gui_net_set_status(app, "Server online (RF + MISRC-M/2 monitor)");
     } else if (want == GUI_NET_MODE_CLIENT) {
         long p = atol(app->settings.net_client_port_str);
         if (p < 1 || p > 65535) { p = (long)app->settings.net_client_port; }
@@ -1966,17 +1976,28 @@ void gui_net_poll_commands(gui_app_t *app) {
                 gui_app_stop_capture(app);
             }
         }
+        /* Distinct command channels preserve each protocol's semantics when
+         * both kinds of client are connected to this Server at once. */
+        int monitor_record = atomic_exchange(&app->net_cmd_monitor_record, 0);
+        if (monitor_record == 3 && app->is_recording) {
+            fprintf(stderr, "[M-SERVER] executing /monitor/record off\n");
+            gui_app_stop_recording(app);
+        } else if ((monitor_record == 1 || monitor_record == 2) &&
+                   app->is_capturing && !app->is_recording) {
+            bool local = monitor_record == 2;
+            fprintf(stderr, "[M-SERVER] executing /monitor/record on (local=%d)\n", local);
+            if (!local || gui_monitor_local_save_begin() == 0) {
+                if (gui_app_start_recording(app) != 0 && local)
+                    (void)gui_monitor_local_save_end(false);
+            } else {
+                gui_app_set_status(app, "Local Save rejected: receiver unavailable");
+                fprintf(stderr, "[M-LOCAL] Record rejected: receiver unavailable\n");
+            }
+        }
         if (atomic_exchange(&app->net_cmd_record_on, false)) {
             if (app->is_capturing && !app->is_recording) {
                 fprintf(stderr, "[NET] server: executing /record on\n");
-                bool local=gui_monitor_server_active() && gui_monitor_server_consume_local_start();
-                if(!local || gui_monitor_local_save_begin()==0){
-                    if(gui_app_start_recording(app)!=0 && local)
-                        (void)gui_monitor_local_save_end(false);
-                }else{
-                    gui_app_set_status(app,"Local Save rejected: receiver unavailable");
-                    fprintf(stderr,"[M-LOCAL] Record rejected: receiver unavailable\n");
-                }
+                (void)gui_app_start_recording(app); /* legacy always records to server */
             }
         }
         if (atomic_exchange(&app->net_cmd_record_off, false)) {
@@ -1985,18 +2006,22 @@ void gui_net_poll_commands(gui_app_t *app) {
                 gui_app_stop_recording(app);
             }
         }
+        if (atomic_exchange(&app->net_cmd_monitor_select_device, false)) {
+            int n = atomic_exchange(&app->net_cmd_monitor_device_index, -1);
+            if (!app->is_recording && n >= 0 && n < app->device_count) {
+                bool restart = app->is_capturing;
+                if (restart) gui_app_stop_capture(app);
+                app->selected_device = n;
+                app->settings.device_index = n;
+                gui_settings_save(&app->settings);
+                if (restart) (void)gui_app_start_capture(app);
+                fprintf(stderr, "[M-SERVER] Selected capture device: %d\n", n);
+            }
+        }
         if (atomic_exchange(&app->net_cmd_select_device, false)) {
             int n = atomic_exchange(&app->net_cmd_device_index, 0);
-            if (gui_monitor_server_active() && !app->is_recording &&
-                n >= 0 && n < app->device_count) {
-                bool restart=app->is_capturing;
-                if(restart)gui_app_stop_capture(app);
-                app->selected_device=n;
-                app->settings.device_index=n;
-                gui_settings_save(&app->settings);
-                if(restart)(void)gui_app_start_capture(app);
-                fprintf(stderr,"[M-SERVER] Selected capture device: %d\n",n);
-            }else if (!app->is_capturing && !gui_playback_is_starting(app) &&
+            /* Keep the original RF /device rule: idle-only selection. */
+            if (!app->is_capturing && !gui_playback_is_starting(app) &&
                 n >= 0 && n < app->device_count) {
                 fprintf(stderr, "[NET] server: executing /device %d\n", n);
                 app->selected_device = n;

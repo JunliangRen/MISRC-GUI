@@ -53,7 +53,6 @@ typedef int mon_sock_t;
 #define MON_PREVIEW_PERIOD_MS 100u
 #define MON_REMOTE_PATH GUI_REMOTE_FS_PATH
 #define MON_BROWSER_WIRE 40000u
-static atomic_bool g_local_start_requested;
 static atomic_uint g_preview_transfers;
 static atomic_uint_fast64_t g_preview_wire_bytes;
 
@@ -73,11 +72,9 @@ static int mon_arg(const char *query,const char *key,int fallback) {
 }
 static struct {
     gui_app_t *app;
-    mon_sock_t socket_fd;
-    thrd_t server_thread, beacon_thread;
     uint16_t port;
-    atomic_bool stopping, active;
-} g_server = { .socket_fd = MON_BAD };
+    atomic_bool active;
+} g_server;
 static struct {
     gui_app_t *app;
     char host[128];
@@ -509,22 +506,13 @@ static void mon_answer_preview(mon_sock_t fd,const char *query){
     }
     free(wire);
 }
-static bool mon_handle(mon_sock_t fd, gui_app_t *app) {
-    char req[MON_REMOTE_PATH*3+400];
-    /* A long UTF-8 server path can span multiple TCP segments. Read the
-     * entire request line (bounded), not just the first recv(). */
-    size_t used=0;
-    for(;;){
-#ifdef _WIN32
-        int n=recv(fd,req+used,(int)(sizeof(req)-1-used),0);
-#else
-        ssize_t n=recv(fd,req+used,sizeof(req)-1-used,0);
-#endif
-        if(n<=0)return false;
-        used+=(size_t)n;req[used]=0;
-        if(strchr(req,'\n'))break;
-        if(used>=sizeof(req)-1){mon_answer(fd,400,"text/plain","request too long\n");return false;}
-    }
+/* Called by the ONE HTTP listener in gui_net.c after it has read the full
+ * request headers. Return true only when Local Save takes socket ownership. */
+bool gui_monitor_server_handle_request(uintptr_t socket_handle,
+                                       gui_app_t *app, const char *request_line) {
+    mon_sock_t fd = (mon_sock_t)socket_handle;
+    if (!gui_monitor_server_active() || !app || !request_line) return false;
+    const char *req = request_line;
     char path[MON_REMOTE_PATH*3+300];
     if(sscanf(req,"GET %12587s",path)!=1) {
         mon_answer(fd,400,"text/plain","invalid request\n");return false;
@@ -603,8 +591,8 @@ static bool mon_handle(mon_sock_t fd, gui_app_t *app) {
         if(idx<0||idx>=app->device_count||app->is_recording){
             mon_answer(fd,409,"text/plain","invalid device or recording active\n");return false;
         }
-        atomic_store(&app->net_cmd_device_index,idx);
-        atomic_store(&app->net_cmd_select_device,true);
+        atomic_store(&app->net_cmd_monitor_device_index,idx);
+        atomic_store(&app->net_cmd_monitor_select_device,true);
         mon_answer(fd,200,"text/plain","device queued\n");return false;
     }
     if(strcmp(path,"/monitor/reset-clips")==0){
@@ -693,90 +681,35 @@ static bool mon_handle(mon_sock_t fd, gui_app_t *app) {
         if(on && !strcmp(query,"on=1&local=1") && !gui_monitor_local_save_server_ready()) {
             mon_answer(fd,409,"text/plain","no M-Client local receiver\n");return false;
         }
-        if(on){
-            atomic_store(&g_local_start_requested,!strcmp(query,"on=1&local=1"));
-            atomic_store(&app->net_cmd_record_on,true);
-        }else atomic_store(&app->net_cmd_record_off,true);
+        atomic_store(&app->net_cmd_monitor_record,
+                     on ? (!strcmp(query,"on=1&local=1") ? 2 : 1) : 3);
         mon_answer(fd,200,"text/plain","record queued\n");return false;
     }
     mon_answer(fd,404,"text/plain","monitor endpoint not found\n");
     return false;
 }
-static int mon_server_thread(void *arg) {
-    (void)arg;
-    while(!atomic_load(&g_server.stopping)) {
-        fd_set fds;FD_ZERO(&fds);FD_SET(g_server.socket_fd,&fds);
-        struct timeval tv={0,200000};
-        int k=select((int)g_server.socket_fd+1,&fds,NULL,NULL,&tv);
-        if(k<=0)continue;
-        struct sockaddr_in src;
-#ifdef _WIN32
-        int len=sizeof(src);
-#else
-        socklen_t len=sizeof(src);
-#endif
-        mon_sock_t fd=accept(g_server.socket_fd,(struct sockaddr*)&src,&len);
-        if(fd==MON_BAD)continue;
-        mon_timeouts(fd,1000);
-        if(!mon_handle(fd,g_server.app))mon_close(fd);
-    }
-    return 0;
-}
-static int mon_beacon_thread(void *arg) {
-    (void)arg;
-    mon_sock_t fd=socket(AF_INET,SOCK_DGRAM,0);
-    if(fd==MON_BAD)return 0;
-    int yes=1;
-    setsockopt(fd,SOL_SOCKET,SO_BROADCAST,(const char*)&yes,sizeof(yes));
-    char host[80]={0},pkt[160];
-    (void)gethostname(host,sizeof(host)-1);
-    if(!host[0])snprintf(host,sizeof(host),"Monitor");
-    int plen=snprintf(pkt,sizeof(pkt),"MISRC-M\n%u\n%s",(unsigned)g_server.port,host);
-    struct sockaddr_in dst={0};
-    dst.sin_family=AF_INET;dst.sin_port=htons(8091);dst.sin_addr.s_addr=INADDR_BROADCAST;
-    while(!atomic_load(&g_server.stopping)) {
-        sendto(fd,pkt,plen,0,(struct sockaddr*)&dst,sizeof(dst));
-        for(int i=0;i<20&&!atomic_load(&g_server.stopping);i++)thrd_sleep_ms(100);
-    }
-    mon_close(fd);return 0;
-}
+/* Shared-server initialization only. The legacy Server owns the TCP
+ * listener and broadcasts both discovery protocol identifiers on UDP 8091. */
 int gui_monitor_server_start(gui_app_t *app,uint16_t port) {
     if(!app||!port)return -1;
     if(atomic_load(&g_server.active))
         return g_server.app==app&&g_server.port==port?0:-1;
-    mon_sock_t fd=socket(AF_INET,SOCK_STREAM,0);
-    if(fd==MON_BAD)return -1;
-    int yes=1;
-    setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,(const char*)&yes,sizeof(yes));
-    struct sockaddr_in addr={0};
-    addr.sin_family=AF_INET;addr.sin_port=htons(port);addr.sin_addr.s_addr=INADDR_ANY;
-    if(bind(fd,(struct sockaddr*)&addr,sizeof(addr))!=0 || listen(fd,8)!=0){mon_close(fd);return -1;}
     gui_monitor_local_save_server_init();
-    atomic_store(&g_local_start_requested,false);
     memset(&g_cfg_server,0,sizeof(g_cfg_server));
     mon_cfg_snapshot(app);
     g_server.app=app;g_server.port=port;
     fs_lock();g_fs_server.pending_valid=false;
     snprintf(g_fs_server.current,sizeof(g_fs_server.current),"%s",app->settings.output_path);
-    fs_unlock();g_server.socket_fd=fd;
-    atomic_store(&g_server.stopping,false);
-    if(thrd_create(&g_server.server_thread,mon_server_thread,NULL)!=thrd_success){mon_close(fd);g_server.socket_fd=MON_BAD;return -1;}
+    fs_unlock();
     atomic_store(&g_server.active,true);
-    if(thrd_create(&g_server.beacon_thread,mon_beacon_thread,NULL)!=thrd_success){
-        atomic_store(&g_server.stopping,true);thrd_join(g_server.server_thread,NULL);
-        mon_close(fd);g_server.socket_fd=MON_BAD;atomic_store(&g_server.active,false);return -1;
-    }
-    fprintf(stderr,"[M-SERVER] Monitor protocol MISRC-M/2 listening on TCP %u (Zstd-1 phosphor/FFT preview + status/control)\n",(unsigned)port);
+    fprintf(stderr,"[M-SERVER] Monitor MISRC-M/2 endpoints enabled on shared TCP %u (Zstd-1 preview + control)\n",(unsigned)port);
     return 0;
 }
 void gui_monitor_server_stop(void){
     if(!atomic_load(&g_server.active))return;
-    atomic_store(&g_server.stopping,true);
-    thrd_join(g_server.server_thread,NULL);
-    thrd_join(g_server.beacon_thread,NULL);
+    atomic_store(&g_server.active,false);
     gui_monitor_local_save_server_shutdown();
-    mon_close(g_server.socket_fd);g_server.socket_fd=MON_BAD;
-    g_server.app=NULL;atomic_store(&g_server.active,false);
+    g_server.app=NULL;g_server.port=0;
 }
 bool gui_monitor_server_active(void){return atomic_load(&g_server.active);}
 uint16_t gui_monitor_server_port(void){return g_server.port;}
@@ -1261,6 +1194,3 @@ bool gui_monitor_client_output_path(char *out,size_t cap){
 }
 
 /* Called on the capture server's main thread before consuming Record ON. */
-bool gui_monitor_server_consume_local_start(void){
-    return atomic_exchange(&g_local_start_requested,false);
-}

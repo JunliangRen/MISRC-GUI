@@ -83,11 +83,10 @@
 #define clearerr mls_proxy_clearerr
 #define file_open_utf8 mls_proxy_open
 
-/* Raylib GetTime() is not driven by a window in --headless-monitor-server.
- * Use the platform monotonic clock only for that mode; leave Harry's
- * existing Local/RF timing unchanged. */
+/* Headless mode has no raylib window to advance GetTime(). Use the
+ * monotonic clock for either recording protocol on the unified headless server. */
 static double gui_record_clock(const gui_app_t *app) {
-    if (app && app->settings.net_mode == GUI_NET_MODE_MONITOR_SERVER)
+    if (app && app->headless_server)
         return (double)get_time_us() / 1000000.0;
     return GetTime();
 }

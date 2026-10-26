@@ -621,7 +621,7 @@ void gui_settings_init_defaults(gui_settings_t *settings) {
 
     // Server/Client networking defaults (cxadc_vhs_server-style). Stock mode
     // is Local (no networking). Default port 8080 mirrors the reference server.
-    settings->net_mode = 0;                     // 0=Local, 1=Server, 2=Client, 3=M-Server, 4=M-Client
+    settings->net_mode = 0;                     // 0=Local, 1=unified Server, 2=Client, 3=old Server ID, 4=M-Client
     settings->net_server_port = 8080;
     snprintf(settings->net_server_port_str, sizeof(settings->net_server_port_str), "%u",
              (unsigned)settings->net_server_port);

@@ -4737,7 +4737,7 @@ static void render_version_info_window(gui_app_t *app)
         // Server hosts the HTTP control + RF/audio stream; Client connects to a
         // host and mirrors its device list/controls/capture state (master/slave).
         // v1 is LAN-only, no auth/encryption (mirrors the reference cxadc server).
-        CLAY_TEXT(CLAY_STRING("Network (Local / RF / Monitor):"),
+        CLAY_TEXT(CLAY_STRING("Network (Local / Server / Client / M-Client):"),
             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_HEADING, .textColor = to_clay_color(COLOR_TEXT) }));
 
         {
@@ -4763,21 +4763,19 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT(make_string(mode_label),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
                 }
-                CLAY_TEXT(CLAY_STRING("click to cycle (5 modes)"),
+                CLAY_TEXT(CLAY_STRING("click to cycle (4 modes)"),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             }
         }
 
-        if (app->settings.net_mode == GUI_NET_MODE_MONITOR_SERVER ||
-            app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+        if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
             CLAY_TEXT(CLAY_STRING("Monitor waveform + FFT (Zstd-1)"),
                 CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS,
                     .textColor = to_clay_color(COLOR_TEXT_DIM) }));
         }
 
         // Server: port field.
-        if (app->settings.net_mode == GUI_NET_MODE_SERVER ||
-            app->settings.net_mode == GUI_NET_MODE_MONITOR_SERVER) {
+        if (app->settings.net_mode == GUI_NET_MODE_SERVER) {
             CLAY(CLAY_ID("VersionInfoNetServerPortRow"), {
                 .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIXED(32) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
             }) {
@@ -9336,7 +9334,12 @@ void gui_handle_interactions(gui_app_t *app) {
                 }
                 int cur = app->settings.net_mode;
                 if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_LAST) cur = GUI_NET_MODE_LOCAL;
-                int next = (cur == GUI_NET_MODE_LAST) ? GUI_NET_MODE_LOCAL : (cur + 1);
+                /* Keep numeric mode 3 as a saved-config alias only:
+                 * Local -> Server -> Client -> M-Client -> Local. */
+                int next = (cur == GUI_NET_MODE_MONITOR_SERVER) ? GUI_NET_MODE_LOCAL
+                    : (cur == GUI_NET_MODE_CLIENT) ? GUI_NET_MODE_MONITOR_CLIENT
+                    : (cur == GUI_NET_MODE_MONITOR_CLIENT) ? GUI_NET_MODE_LOCAL
+                    : cur + 1;
                 app->settings.net_mode = next;
                 gui_ui_clear_text_edit();
                 gui_settings_save(&app->settings);
@@ -9380,8 +9383,7 @@ void gui_handle_interactions(gui_app_t *app) {
             }
             // Click-to-edit the server port field.
             if (Clay_PointerOver(CLAY_ID("VersionInfoNetServerPortField")) &&
-                (app->settings.net_mode == GUI_NET_MODE_SERVER ||
-                 app->settings.net_mode == GUI_NET_MODE_MONITOR_SERVER)) {
+                app->settings.net_mode == GUI_NET_MODE_SERVER) {
                 gui_ui_begin_text_edit(app, UI_TEXT_FIELD_NET_SERVER_PORT,
                                        CLAY_ID("VersionInfoNetServerPortField"), 6.0f, 6.0f);
                 gui_ui_set_click_consumed();

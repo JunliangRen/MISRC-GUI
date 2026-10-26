@@ -1,16 +1,16 @@
 /*
  * MISRC GUI - Server/Client networking (cxadc_vhs_server-style peer mode)
  *
- * The legacy Local/Server/Client roles retain their existing RF protocol.
- * Two additional monitor roles are reserved for the separate preview protocol.
+ * Server handles both legacy RF and low-bandwidth monitor requests on one port.
+ * The monitor client has its own restricted preview protocol.
  * Any MISRC-GUI instance selects one role (gui_settings_t.net_mode):
  *   0 = Local  (default; no networking, behaves exactly as before)
  *   1 = Server (host/master: owns hardware + capture, serves HTTP control + RF/audio streams)
  *   2 = Client (slave: connects to a Server, mirrors device list/controls/state,
  *               ingests RF+audio streams into the local pipeline, and forwards its
  *               own start/stop/record/device-select actions to the server)
- *   3 = M-Server (dedicated monitor status/control server)
- *   4 = M-Client (dedicated monitor status/control client)
+ *   3 = reserved old M-Server config ID (mapped to Server 1)
+ *   4 = M-Client (low-bandwidth monitor status/control client)
  *
  * Protocol: HTTP/1.0, GET-only (adapted from the reference cxadc-capture-server).
  *   GET /version            -> MISRC version text
@@ -46,10 +46,10 @@
 #define GUI_NET_MODE_LOCAL  0
 #define GUI_NET_MODE_SERVER 1
 #define GUI_NET_MODE_CLIENT 2
-#define GUI_NET_MODE_MONITOR_SERVER 3
+#define GUI_NET_MODE_MONITOR_SERVER 3 /* old config ID; maps to Server */
 #define GUI_NET_MODE_MONITOR_CLIENT 4
 
-/* Independent monitor roles: NEVER fall back to the legacy /rf protocol. */
+/* Monitor client NEVER falls back to legacy /rf. No separate server mode. */
 #define GUI_NET_MODE_LAST GUI_NET_MODE_MONITOR_CLIENT
 
 /* One-time global init/cleanup (WSAStartup/WSACleanup on Windows; SIGPIPE ignore
