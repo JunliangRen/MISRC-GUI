@@ -124,12 +124,21 @@ The record timer system is self fail proof, you cannot set a time lower than you
 
 <img width="473" height="388" alt="image" src="assets/images/MISRC_GUI_Window_Info_Current.png" />
 
+
+The GUI is built with several layers of fallback and prevention measures to stop hardware issues on an OS level from interfering with your capture such as spillover if there is a slowdown in drive or encoding performance, the recommended amount of RAM ideally is 8GB DDR3 2400Mhz or better, of course on faster ARM64 chips this becomes less of a concern but production stations should have ideally no less then 16GB total. 
+
 - A/B  Swap for older V1.5a users
 - V4L2 Device discovery for Linux
 - Core Pinning (Linux Only)
 - Memory Budget (Allows you to limit/raise the buffers for higher stability on low end or high end systems) 
+- Mode Selection
 
-The GUI is built with several layers of fallback and prevention measures to stop hardware issues on an OS level from interfering with your capture such as spillover if there is a slowdown in drive or encoding performance, the recommended amount of RAM ideally is 8GB DDR3 2400Mhz or better, of course on faster ARM64 chips this becomes less of a concern but production stations should have ideally no less then 16GB total. 
+### Operation Modes
+
+Local - Entirely local capture standalone.
+Server - Broadcasts current capture and feed to network.
+Client - Takes selected remote feeds from any servers discoverable on the network.
+Remote & Monitor - Low bandwidth remote control mode for start/stop and plugin feed view and audio monitoring.
 
 
 ## Record & Audio Monitoring
@@ -559,3 +568,4 @@ bash misrc_tools/test/capture_stability_ci.sh misrc_gui misrc_extract /tmp/ci-ar
 - August 24th 2026 - SDR Update (RTLSDR support + Waterfall/Spectro view modes) 
 - September 10th 2026 - CXADC refresh, Capture server/client/local modes integrated. 
 - September 22nd 2026 - CXADC rate/cycle modes, --auto-connect testing flag, FLAC level/threads warnings, clockgen audio cleanup.
+- October 2026 - CVBS Decoder & FM Tape Decoder plugins overhalled, true cli server mode added. 
