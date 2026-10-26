@@ -679,7 +679,7 @@ bool gui_monitor_server_handle_request(uintptr_t socket_handle,
        (!strcmp(query,"on=1")||!strcmp(query,"on=0")||!strcmp(query,"on=1&local=1"))) {
         bool on=query[3]=='1';
         if(on && !strcmp(query,"on=1&local=1") && !gui_monitor_local_save_server_ready()) {
-            mon_answer(fd,409,"text/plain","no M-Client local receiver\n");return false;
+            mon_answer(fd,409,"text/plain","no Monitor & Remote local receiver\n");return false;
         }
         atomic_store(&app->net_cmd_monitor_record,
                      on ? (!strcmp(query,"on=1&local=1") ? 2 : 1) : 3);
@@ -934,7 +934,7 @@ static int mon_client_thread(void *ctx){
                 int idx=atomic_load(&app->net_cmd_device_index);
                 char device_url[96];snprintf(device_url,sizeof(device_url),"/monitor/device?index=%d",idx);
                 if(mon_get(g_client.host,g_client.port,device_url,response,sizeof(response))!=0)
-                    gui_app_set_status(app,"M-Server device selection refused (stop recording first)");
+                    gui_app_set_status(app,"Server device selection refused (stop recording first)");
             }
             static unsigned output_tick=0;
             if((output_tick++%10)==0)mon_worker_output();
@@ -946,7 +946,7 @@ static int mon_client_thread(void *ctx){
                     char reset_path[64];
                     snprintf(reset_path,sizeof(reset_path),"/monitor/reset-clips?channel=%d",ch);
                     if(mon_get(g_client.host,g_client.port,reset_path,response,sizeof(response))!=0)
-                        gui_app_set_status(app,"M-Server clip reset failed");
+                        gui_app_set_status(app,"Server clip reset failed");
                 }
             }
             if(atomic_exchange(&app->net_cmd_start,false))
@@ -962,7 +962,7 @@ static int mon_client_thread(void *ctx){
                         fprintf(stderr,"[M-LOCAL] Receiver start failed; recording NOT started\n");
                     }else if(mon_get(g_client.host,g_client.port,"/monitor/record?on=1&local=1",
                                     response,sizeof(response))!=0){
-                        gui_app_set_status(app,"Local Save request rejected by M-Server");
+                        gui_app_set_status(app,"Local Save request rejected by Server");
                         gui_monitor_local_save_client_stop();
                     }
                 }else (void)mon_get(g_client.host,g_client.port,"/monitor/record?on=1",response,sizeof(response));

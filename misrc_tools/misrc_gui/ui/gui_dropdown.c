@@ -113,7 +113,7 @@ static bool handle_device_dropdown(gui_app_t *app) {
                     if (gui_net_is_client(app)) {
                         if(app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT &&
                            gui_monitor_client_peer_state() == 2){
-                            gui_net_set_status(app,"Stop M-Server recording before changing device");
+                            gui_net_set_status(app,"Stop Server recording before changing device");
                         }else{
                             app->selected_device = i;
                             gui_net_client_request_device(app, i);

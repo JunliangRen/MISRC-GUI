@@ -490,7 +490,7 @@ int gui_monitor_local_save_server_attach(uintptr_t socket_handle){
   return -1;
  }
  s_attached_thread=true;
- fprintf(stderr,"[M-LOCAL] M-Client file receiver attached\n");
+ fprintf(stderr,"[M-LOCAL] Monitor & Remote file receiver attached\n");
  return 0;
 }
 void gui_monitor_local_save_server_shutdown(void){

@@ -3374,7 +3374,7 @@ if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
                     .layoutDirection=CLAY_LEFT_TO_RIGHT,
                     .childAlignment={.y=CLAY_ALIGN_Y_CENTER}, .childGap=10 }
     }) {
-        CLAY_TEXT(CLAY_STRING("Local Save (M-Client only):"),
+        CLAY_TEXT(CLAY_STRING("Local Save:"),
             CLAY_TEXT_CONFIG({ .fontSize=FONT_SIZE_NORMAL, .textColor=to_clay_color(COLOR_TEXT) }));
         CLAY(CLAY_ID("MonitorLocalSaveToggle"), {
             .layout={ .sizing={CLAY_SIZING_FIXED(104),CLAY_SIZING_FIXED(28)},
@@ -3444,7 +3444,7 @@ CLAY(CLAY_ID("SettingsOutputPath"), {
     }
 }) {
     CLAY_TEXT(app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT
-        ? CLAY_STRING("Server Output folder (M-Server):")
+        ? CLAY_STRING("Server Output folder:")
         : CLAY_STRING("Output folder:"),
         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
 
@@ -4737,7 +4737,7 @@ static void render_version_info_window(gui_app_t *app)
         // Server hosts the HTTP control + RF/audio stream; Client connects to a
         // host and mirrors its device list/controls/capture state (master/slave).
         // v1 is LAN-only, no auth/encryption (mirrors the reference cxadc server).
-        CLAY_TEXT(CLAY_STRING("Network (Local / Server / Client / M-Client):"),
+        CLAY_TEXT(CLAY_STRING("Network mode:"),
             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_HEADING, .textColor = to_clay_color(COLOR_TEXT) }));
 
         {
@@ -4754,7 +4754,7 @@ static void render_version_info_window(gui_app_t *app)
                 }
                 CLAY(CLAY_ID("VersionInfoNetModeToggle"), {
                     .layout = {
-                        .sizing = { CLAY_SIZING_FIXED(90), CLAY_SIZING_FIXED(28) },
+                        .sizing = { CLAY_SIZING_FIXED(180), CLAY_SIZING_FIXED(28) },
                         .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
                     },
                     .backgroundColor = to_clay_color(mode_bg),
@@ -4860,7 +4860,7 @@ static void render_version_info_window(gui_app_t *app)
                             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     }
                     if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
-                        CLAY_TEXT(CLAY_STRING("click an M-Server to connect (monitor protocol only)"),
+                        CLAY_TEXT(CLAY_STRING("click a server to connect (MISRC-M/2 monitor protocol)"),
                             CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
                     } else {
                         CLAY_TEXT(CLAY_STRING("click a server to connect (LAN only, no auth)"),
@@ -9335,7 +9335,7 @@ void gui_handle_interactions(gui_app_t *app) {
                 int cur = app->settings.net_mode;
                 if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_LAST) cur = GUI_NET_MODE_LOCAL;
                 /* Keep numeric mode 3 as a saved-config alias only:
-                 * Local -> Server -> Client -> M-Client -> Local. */
+                 * Local -> Server -> Client -> Monitor & Remote -> Local. */
                 int next = (cur == GUI_NET_MODE_MONITOR_SERVER) ? GUI_NET_MODE_LOCAL
                     : (cur == GUI_NET_MODE_CLIENT) ? GUI_NET_MODE_MONITOR_CLIENT
                     : (cur == GUI_NET_MODE_MONITOR_CLIENT) ? GUI_NET_MODE_LOCAL
@@ -9965,15 +9965,15 @@ void gui_handle_interactions(gui_app_t *app) {
             }
             if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
                 if (!gui_monitor_client_connected()) {
-                    gui_app_set_status(app,"M-Client: connect to M-Server before recording");
+                    gui_app_set_status(app,"Monitor & Remote: connect to Server before recording");
                 } else if (gui_monitor_client_peer_state() == 2) {
                     gui_net_client_request_record(app,false);
-                    gui_app_set_status(app,"M-Server: stop recording requested");
+                    gui_app_set_status(app,"Server: stop recording requested");
                 } else if (gui_monitor_client_peer_state() == 1) {
                     gui_net_client_request_record(app,true);
-                    gui_app_set_status(app,"M-Server: start recording requested (server disk)");
+                    gui_app_set_status(app,"Server: start recording requested (server disk)");
                 } else {
-                    gui_app_set_status(app,"M-Server capture is not running");
+                    gui_app_set_status(app,"Server capture is not running");
                 }
                 gui_ui_set_click_consumed();
                 return;
@@ -10511,8 +10511,8 @@ void gui_handle_interactions(gui_app_t *app) {
                     gui_ui_clear_text_edit();
                     gui_settings_save(&app->settings);
                     gui_app_set_status(app,app->settings.monitor_local_save_enabled ?
-                        "Local Save ON: next recording goes to this M-Client" :
-                        "Local Save OFF: next recording goes to the M-Server");
+                        "Local Save ON: next recording goes to this computer" :
+                        "Local Save OFF: next recording goes to the Server");
                 }
                 gui_ui_set_click_consumed();return;
             }
@@ -10538,7 +10538,7 @@ void gui_handle_interactions(gui_app_t *app) {
                              sizeof(app->settings.monitor_local_save_path),
                              "%s",tmp.output_path);
                     gui_settings_save(&app->settings);
-                    gui_app_set_status(app,"M-Client local recording folder saved");
+                    gui_app_set_status(app,"Monitor & Remote local recording folder saved");
                 } else gui_app_set_status(app,"Folder selection cancelled or unavailable; click local path to type it");
                 gui_ui_set_click_consumed();
                 return;
@@ -10548,7 +10548,7 @@ void gui_handle_interactions(gui_app_t *app) {
                 Clay_PointerOver(CLAY_ID("ChooseOutputFolderButton"))) {
                 if(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT){
                     if(!gui_monitor_client_connected())
-                        gui_app_set_status(app,"Connect to M-Server before browsing its folders");
+                        gui_app_set_status(app,"Connect to Server before browsing its folders");
                     else{
                         s_monitor_folder_open=true;
                         s_monitor_folder_page=0;

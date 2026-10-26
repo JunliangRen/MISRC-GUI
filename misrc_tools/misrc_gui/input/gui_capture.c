@@ -47,6 +47,8 @@
 #include "../processing/gui_display_thread.h"
 #include "../output/gui_audio.h"
 #include "../net/gui_net.h"
+#include "../net/gui_monitor_transport.h"
+#include "../net/gui_remote_display.h"
 #include <hsdaoh.h>
 #include "../../common/hsdaoh_compat.h"
 #if defined(_WIN32)
@@ -1885,7 +1887,7 @@ int gui_app_start_capture(gui_app_t *app) {
      * Keep Harry's existing Local/Server/Client paths unchanged. */
     if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
         gui_net_client_request_start(app);
-        gui_net_set_status(app, "M-Client: requested capture start on M-Server");
+        gui_net_set_status(app, "Monitor & Remote: requested capture start on Server");
         return 0;
     }
 
@@ -2914,6 +2916,22 @@ void gui_app_update_vu_meters(gui_app_t *app, float dt) {
     uint16_t peak_a_neg = atomic_load(&app->peak_a_neg);
     uint16_t peak_b_pos = atomic_load(&app->peak_b_pos);
     uint16_t peak_b_neg = atomic_load(&app->peak_b_neg);
+
+    /* Monitor & Remote receives no raw RF samples. The preview already
+     * carries the server's bipolar 12-bit peaks; use them instead of the
+     * local (always zero) extraction atomics. Preserve normal VU smoothing,
+     * peak hold and normalization below. If disconnected or capture is idle,
+     * the preview mailbox is invalid and the levels decay back to zero. */
+    if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
+        uint16_t remote_peaks[2][2] = {{0}};
+        if (gui_monitor_client_connected()) {
+            (void)gui_rd_client_peaks(remote_peaks);
+        }
+        peak_a_pos = remote_peaks[0][0];
+        peak_a_neg = remote_peaks[0][1];
+        peak_b_pos = remote_peaks[1][0];
+        peak_b_neg = remote_peaks[1][1];
+    }
 
     // Convert to normalized levels (0-1), using 2048 as full scale
     float level_a_pos = (float)peak_a_pos / 2048.0f;

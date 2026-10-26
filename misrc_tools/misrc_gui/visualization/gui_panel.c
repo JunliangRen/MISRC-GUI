@@ -105,7 +105,7 @@ static void render_single_panel(gui_app_t *app, int channel,
     if(app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
         if(type != PANEL_VIEW_WAVEFORM && type != PANEL_VIEW_FFT) {
             DrawRectangleRec(bounds,COLOR_PANEL_BG);
-            DrawText("M-Client: only Waveform/FFT preview available",
+            DrawText("Monitor & Remote: only Waveform/FFT preview available",
                      (int)bounds.x+12,(int)bounds.y+15,14,COLOR_TEXT_DIM);
             return;
         }
@@ -114,7 +114,7 @@ static void render_single_panel(gui_app_t *app, int channel,
         bool valid=gui_monitor_client_connected() && gui_rd_client_snapshot(&frame);
         if(!valid || !state || channel >= (int)frame.channels) {
             DrawRectangleRec(bounds,COLOR_PANEL_BG);
-            DrawText("Waiting for M-Server preview...",
+            DrawText("Waiting for Server preview...",
                      (int)bounds.x+12,(int)bounds.y+15,14,COLOR_TEXT_DIM);
             return;
         }

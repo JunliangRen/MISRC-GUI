@@ -501,7 +501,7 @@ const char *gui_net_mode_name(int mode) {
         case GUI_NET_MODE_SERVER: return "Server";
         case GUI_NET_MODE_CLIENT: return "Client";
         case GUI_NET_MODE_MONITOR_SERVER: return "Server"; /* saved config compatibility */
-        case GUI_NET_MODE_MONITOR_CLIENT: return "M-Client";
+        case GUI_NET_MODE_MONITOR_CLIENT: return "Monitor & Remote";
         default: return "Local";
     }
 }
@@ -526,25 +526,23 @@ void gui_net_status_string(const gui_app_t *app, char *buf, size_t len) {
     if (s_client) {
         if (s_client->monitor_only) {
             if (gui_monitor_client_connected()) {
-                snprintf(buf,len,"M-Client connected %s:%u (peer %s; waveform/FFT preview)",
-                         app->settings.net_client_host,(unsigned)app->settings.net_client_port,
-                         gui_monitor_client_peer_state()==2?"recording":
-                         gui_monitor_client_peer_state()==1?"capturing":"idle");
+                snprintf(buf, len, "Monitor & Remote connected %s:%u",
+                         app->settings.net_client_host, (unsigned)app->settings.net_client_port);
             } else if (gui_monitor_client_running()) {
                 int reason=gui_monitor_client_last_error();
                 if(reason==2){
-                    snprintf(buf,len,"M-Client: incompatible MISRC-M/1 server (requires M/2)");
+                    snprintf(buf,len,"Monitor & Remote: incompatible MISRC-M/1 server (requires M/2)");
                 } else if(reason==3){
-                    snprintf(buf,len,"M-Client: invalid server protocol (requires MISRC-M/2)");
+                    snprintf(buf,len,"Monitor & Remote: invalid server protocol (requires MISRC-M/2)");
                 } else if(reason==1){
-                    snprintf(buf,len,"M-Client: cannot reach %s:%u",
+                    snprintf(buf,len,"Monitor & Remote: cannot reach %s:%u",
                              app->settings.net_client_host,(unsigned)app->settings.net_client_port);
                 } else {
-                    snprintf(buf,len,"M-Client verifying %s:%u (MISRC-M/2 required)",
+                    snprintf(buf,len,"Monitor & Remote verifying %s:%u (MISRC-M/2 required)",
                              app->settings.net_client_host,(unsigned)app->settings.net_client_port);
                 }
             } else {
-                snprintf(buf,len,"M-Client: %d M-server(s) discovered; select or Connect",
+                snprintf(buf,len,"Monitor & Remote: %d server(s) discovered; select or Connect",
                          gui_net_discovered_count());
             }
             return;
@@ -1839,7 +1837,7 @@ int gui_net_apply_mode(gui_app_t *app) {
     if (want == GUI_NET_MODE_MONITOR_CLIENT) {
         /* Discovery and monitor handshake are independent of Harry's RF client. */
         if (!s_client && client_start(app, "", app->settings.net_client_port, true) != 0) {
-            gui_net_set_status(app, "M-Client LAN discovery failed");
+            gui_net_set_status(app, "Monitor & Remote LAN discovery failed");
             return -1;
         }
         long p=atol(app->settings.net_client_port_str);
@@ -1850,7 +1848,7 @@ int gui_net_apply_mode(gui_app_t *app) {
            !gui_monitor_client_matches(app->settings.net_client_host,(uint16_t)p)) {
             (void)gui_monitor_client_start(app,app->settings.net_client_host,(uint16_t)p);
         }
-        gui_net_set_status(app,"M-Client: monitor discovery and status protocol ready");
+        gui_net_set_status(app,"Monitor & Remote: discovery and status ready");
         return 0;
     }
     if (want == GUI_NET_MODE_SERVER) {
@@ -2154,9 +2152,9 @@ void gui_net_select_discovered(gui_app_t *app, int index) {
     if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT && s_client->monitor_only) {
         /* Only the independent /monitor/status handshake can connect. */
         if(gui_monitor_client_start(app,host,port)==0)
-            snprintf(msg,sizeof(msg),"M-Client connecting to %s:%u (%s)",host,(unsigned)port,name);
+            snprintf(msg,sizeof(msg),"Monitor & Remote connecting to %s:%u (%s)",host,(unsigned)port,name);
         else
-            snprintf(msg,sizeof(msg),"M-Client failed to connect to %s:%u",host,(unsigned)port);
+            snprintf(msg,sizeof(msg),"Monitor & Remote failed to connect to %s:%u",host,(unsigned)port);
     } else if (app->settings.net_mode == GUI_NET_MODE_CLIENT && !s_client->monitor_only) {
         (void)gui_net_apply_mode(app);
         snprintf(msg, sizeof(msg), "Connecting to discovered server %s:%u (%s)", host, (unsigned)port, name);
@@ -2191,14 +2189,14 @@ void gui_net_client_toggle_connection(gui_app_t *app) {
     if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
         if(gui_monitor_client_running()) {
             gui_monitor_client_stop();
-            gui_net_set_status(app,"M-Client disconnected (discovery still active)");
+            gui_net_set_status(app,"Monitor & Remote disconnected (discovery still active)");
         } else if(app->settings.net_client_host[0]) {
             long p=atol(app->settings.net_client_port_str);
             if(p<1||p>65535)p=app->settings.net_client_port;
             if(p<1||p>65535)p=8080;
             if(gui_monitor_client_start(app,app->settings.net_client_host,(uint16_t)p)==0)
-                gui_net_set_status(app,"M-Client: verifying monitor server");
-        } else gui_net_set_status(app,"Select a discovered M-Server or enter host:port");
+                gui_net_set_status(app,"Monitor & Remote: verifying server");
+        } else gui_net_set_status(app,"Select a discovered Server or enter host:port");
         return;
     }
     if (app->settings.net_mode != GUI_NET_MODE_CLIENT) {

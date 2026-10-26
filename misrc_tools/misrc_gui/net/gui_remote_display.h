@@ -38,6 +38,9 @@ bool gui_rd_server_build(const gui_rd_config_t cfg[2],void **wire,size_t *wire_s
 /* Client: strict checked Zstd frame, fixed frame bytes, magic and version. */
 bool gui_rd_client_accept(const void *wire,size_t wire_size);
 bool gui_rd_client_snapshot(gui_rd_frame_t *out);
+/* Copy only the received per-channel bipolar peaks for the VU meter.
+ * The monitor client does not ingest RF locally; unused channels are zero. */
+bool gui_rd_client_peaks(uint16_t out[2][2]);
 void gui_rd_client_clear(void);
 /* Waveform panel requests are published on render thread and read atomically. */
 void gui_rd_publish_request(int channel,gui_rd_config_t cfg);

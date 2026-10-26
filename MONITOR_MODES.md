@@ -1,9 +1,9 @@
-# MISRC-GUI: Unified Server and M-Client monitor mode
+# MISRC-GUI: Unified Server and Monitor & Remote
 
 The existing **Server** now hosts both the original full-RF transport and the
 MISRC-M/2 monitor transport **on the same TCP port**. There is no separate
 M-Server mode or monitor listener. The Server owns capture, processing,
-recording, and filesystem access. The M-Client renders a low-bandwidth preview
+recording, and filesystem access. The Monitor & Remote client renders a low-bandwidth preview
 and sends recording/control commands. The legacy Client is unchanged.
 
 ## Modes and compatibility
@@ -14,36 +14,36 @@ and sends recording/control commands. The legacy Client is unchanged.
 | 1 | Server | Unified full-RF and MISRC-M/2 monitor server |
 | 2 | Client | Existing full-RF network client |
 | 3 | old M-Server config ID | Automatically mapped to Server (1); not selectable in the UI |
-| 4 | M-Client | Remote monitoring and control; no local capture hardware required |
+| 4 | Monitor & Remote | Remote monitoring and control; no local capture hardware required |
 
 The unified Server broadcasts both `MISRC` (legacy) and `MISRC-M` (monitor)
 UDP discovery markers pointing to the **same TCP port**. The received HTTP path
 selects the protocol: `/monitor/...` is handled by the monitor backend,
 while `/rf`, `/baseband`, `/stats`, etc. retain the legacy implementation.
-M-Client insists on a **`MISRC-M/2`** handshake and never receives raw RF.
+Monitor & Remote insists on a **`MISRC-M/2`** handshake and never receives raw RF.
 
 ## Preview and status
 
 - `/monitor/preview` sends bounded Zstd-1-compressed `MRD5` frames containing
   4096 waveform samples and 2049 FFT bins per channel at up to 10 Hz.
-  The existing phosphor waveform/FFT GUI renders these data on the M-Client.
+  The existing phosphor waveform/FFT GUI renders these data in Monitor & Remote mode.
 - `/monitor/status` reports capture state, synchronization, recording progress,
   per-channel raw/encoded bytes, drop/error counts, clip values, REC A/B buffer
   occupancy, Local Save network queue fill and available recording disk space.
 - `GET /monitor/start`, `/monitor/stop`, `/monitor/record?on=1|0`, and
   `/monitor/reset-clips?channel=0|1` control the Server.
-- M-Client receives the Server device catalogue; pseudo-devices such as
+- Monitor & Remote receives the Server device catalogue; pseudo-devices such as
   Simulated and Playback legitimately use `index=-1`.
 
 **Preview is not a raw-RF transport.** Encoded recordings are transferred only
-when M-Client Local Save is explicitly enabled.
+when Monitor & Remote Local Save is explicitly enabled.
 
 ## Recording destinations
 
-In M-Client Settings, only the active destination is displayed:
+In Monitor & Remote Settings, only the active destination is displayed:
 
 - **Local Save OFF:** Record writes to the server's Output folder. The
-  M-Client's folder browser navigates the *server* filesystem, including
+  Monitor & Remote folder browser navigates the *server* filesystem, including
   Home/Up/root or Windows drive selection. The Server validates and persists
   the chosen directory.
 - **Local Save ON:** Record writes directly to the client's selected local
@@ -53,15 +53,15 @@ In M-Client Settings, only the active destination is displayed:
   failures do not silently fall back to server recording.
 
 The two paths are stored independently. Local Save controls appear **only**
-in M-Client mode. The 64 MiB encoded-send queue is bounded; insufficient
+in Monitor & Remote mode. The 64 MiB encoded-send queue is bounded; insufficient
 network/disk throughput can cause backpressure or a partial/aborted recording.
 
-M-Client mirrors an allowlisted set of 68 recording settings from the Server
+Monitor & Remote mirrors an allowlisted set of 68 recording settings from the Server
 and can update them over dedicated `/monitor/settings` controls. Client-local
 window/layout settings, network mode and Local Save destination are not sent
 to the server. Server device selection uses `/monitor/devices` and
 `/monitor/device`. Device changes and recording-setting changes are refused
-during active recording. On leaving M-Client, the local configuration profile
+during active recording. On leaving Monitor & Remote, the local configuration profile
 is restored.
 
 ## Monitor endpoints on the shared server
@@ -96,7 +96,7 @@ curl -fsS http://127.0.0.1:8080/monitor/hello
 curl -fsS http://127.0.0.1:8080/monitor/status
 ```
 
-On Windows, run `scripts\build-local.ps1` in PowerShell; select **M-Client**
+On Windows, run `scripts\build-local.ps1` in PowerShell; select **Monitor & Remote**
 and connect to the Server in the discovered server list.
 
 **Security:** monitor HTTP and file transfer endpoints have no built-in
@@ -104,8 +104,7 @@ TLS/authentication. Expose these ports only on a trusted LAN or authenticated
 VPN, never to the public Internet.
 
 **Compatibility and review scope:** The UI cycles Local / Server / Client /
-M-Client. Existing JSON `net_mode: 3` loads as Server for backward compatibility.
+Monitor & Remote. Existing JSON `net_mode: 3` loads as Server for backward compatibility.
 `--headless-server` is the sole headless network-server flag. Local/legacy
 client, RF streaming and normal recording should be regression-tested alongside
-monitor preview, controls, remote settings and Local Save. See
-`misrc_tools/test/unified_server_smoke.py` for the protocol smoke test.
+monitor preview, controls, remote settings and Local Save.

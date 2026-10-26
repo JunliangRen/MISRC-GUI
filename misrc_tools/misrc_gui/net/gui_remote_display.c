@@ -153,4 +153,19 @@ bool gui_rd_client_snapshot(gui_rd_frame_t *out){
     memcpy(out,&client_frame,sizeof(*out));
     atomic_flag_clear_explicit(&client_lock,memory_order_release);return true;
 }
+bool gui_rd_client_peaks(uint16_t out[2][2]){
+    if(!out)return false;
+    memset(out,0,2*2*sizeof(uint16_t));
+    if(!atomic_load_explicit(&client_valid,memory_order_acquire))return false;
+    while(atomic_flag_test_and_set_explicit(&client_lock,memory_order_acquire))thrd_sleep_ms(1);
+    bool valid=atomic_load_explicit(&client_valid,memory_order_relaxed);
+    if(valid){
+        for(int ch=0;ch<(int)client_frame.channels&&ch<2;ch++){
+            out[ch][0]=client_frame.ch[ch].peak_pos;
+            out[ch][1]=client_frame.ch[ch].peak_neg;
+        }
+    }
+    atomic_flag_clear_explicit(&client_lock,memory_order_release);
+    return valid;
+}
 void gui_rd_client_clear(void){atomic_store(&client_valid,false);}
