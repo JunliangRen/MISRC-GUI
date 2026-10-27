@@ -725,16 +725,25 @@ static int simulated_capture_thread(void *ctx) {
                                                 line_in_frame, field,
                                                 sample_in_line);
 
-            /* 2000 scale: the user-confirmed most-stable iteration.
-             * hacktv PAL: sync -0.30*2000=-600, white 0.70*2000=1400.
-             * Span 2000 counts in the 12-bit domain — matching the old
-             * device's ~1960 count span the decoder was calibrated for.
-             * The 169+9 attempt was too small (8% of range); the 255
-             * attempt was also too small. 2000 was "more stable" per the
-             * user. The exact real-capture amplitude match is a separate
-             * calibration task once the decode locks reliably. */
-            buf_a[i] = (int16_t)(cvbs * 2000.0);
-            buf_b[i] = (int16_t)(vhs_rf * 2000.0);
+            /* Channel A (CVBS): 2170 scale — measured from the real EBU
+             * HackDac reference FLAC (per-bar plateau analysis of the
+             * decoded s16 data, converted to the 12-bit tool domain):
+             *   real sync tip    = -10500 int16 = -41 8-bit = -656 12-bit
+ *                      -> reads -0.32
+             *   real blanking    = ~0 int16                -> reads 0.00
+             *   real white bar   = +24300 int16 = +95 8-bit = +1519 12-bit
+             *                      -> reads +0.74
+             *   real chroma peak = +32512 int16 = +127 8-bit (8-bit MAX —
+             *                      the yellow/cyan composite peaks CLIP)
+ *                      -> reads +0.99
+             * buf_a = hacktv_value * 2170:
+             *   sync  -0.30*2170 = -651  (reads -0.32, real -0.32)
+             *   blank  0.00*2170 =    0  (reads  0.00, real  0.00)
+             *   white  0.70*2170 = 1519  (reads +0.74, real +0.74)
+             *   yellow 0.934*2170 = 2027 (reads +0.99, real clips +0.99)
+             * Channel B (VHS RF): ORIGINAL 1024 scale — DO NOT CHANGE. */
+            buf_a[i] = (int16_t)(cvbs * 2170.0);
+            buf_b[i] = (int16_t)(vhs_rf * 1024.0);
 
             s_sim_sample_count++;
         }
