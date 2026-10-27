@@ -3,7 +3,19 @@ project('MISRC', 'c',
         meson_version: '>=0.54')
 
 
-version_target = vcs_tag(command: ['git-version.sh'], fallback: 'unknown_version', input: 'version.h.in', output: 'version.h')
+# Version string: git-version.py is the portable twin of git-version.sh.
+# Native-Windows meson/Python cannot execute a POSIX shell script, which left
+# local Windows builds on the 'unknown_version' fallback (v1.2.7 updater
+# false-positive class). Any Python that can run meson itself can run the
+# port; git-version.sh stays the source of truth for CI shell scripts.
+version_prog = find_program('python3', 'python', required: false, native: true)
+if version_prog.found()
+  version_target = vcs_tag(command: [version_prog, files('git-version.py')],
+                           fallback: 'unknown_version', input: 'version.h.in', output: 'version.h')
+else
+  version_target = vcs_tag(command: ['git-version.sh'],
+                           fallback: 'unknown_version', input: 'version.h.in', output: 'version.h')
+endif
 
 warnings = [
   '-Wall',
@@ -445,6 +457,8 @@ if raylib_dep.found()
     'misrc_gui/processing/gui_rf_stream_marks.c',
     'misrc_gui/signal/gui_histogram.c',
     'misrc_gui/signal/gui_demod.c',
+    # Test Gen: on-demand PAL/NTSC/SECAM test signal (hacktv values)
+    'misrc_gui/signal/gui_testgen.c',
     # Visualization
     'misrc_gui/visualization/gui_oscilloscope.c',
     'misrc_gui/visualization/gui_phosphor_rt.c',
@@ -699,9 +713,12 @@ if raylib_dep.found()
     else
       settings_path_ldflags += ['-lm']
     endif
+    # gui_settings.c (included by the harness) calls gui_monitor_settings_copy
+    # since the M-Server/M-Client modes landed (bdcbb7a); link the real
+    # implementation instead of a stub. It is self-contained (libc only).
     settings_paths_test = executable('gui_settings_paths_test',
       ['test/gui_settings_paths_test.c', 'misrc_gui/ui/gui_ui_scale.c', 'common/file_utils.c',
-       'common/ddd_protocol.c'],
+       'common/ddd_protocol.c', 'misrc_gui/net/gui_monitor_settings.c'],
       dependencies: overlay_test_deps, include_directories: gui_includes,
       c_args: gui_cflags + ['-fwhole-program'], link_args: settings_path_ldflags,
       override_options: ['b_lto=true', 'optimization=2'])
@@ -733,8 +750,12 @@ if raylib_dep.found()
         depends: [misrc_gui_exe])
     endif
     if flac_dep.found()
+      # gui_record.c writes through the mls_proxy_* API since bdcbb7a; the
+      # CPU-only harnesses link the stdio-passthrough stub (never the networked
+      # local-save stack). Same rule as gui_playback_audio_stub.c.
       record_paths_test = executable('gui_record_paths_test',
-        ['test/gui_record_paths_test.c', 'common/file_utils.c', version_target],
+        ['test/gui_record_paths_test.c', 'common/file_utils.c', version_target,
+         'test/monitor_local_save_stub.c'],
         dependencies: overlay_test_deps + [flac_dep], include_directories: gui_includes,
         c_args: cflags + ['-fwhole-program'], link_args: ldflags,
         override_options: ['b_lto=true', 'optimization=2'])
@@ -743,9 +764,13 @@ if raylib_dep.found()
 
     # Exercise the production stats sizing with deterministic font metrics.
     # As above, LTO drops unrelated UI/backend code from the included source.
+    # gui_ui.c's timeline name budget reads the selected playback file info
+    # (gui_playback_get_selected_file_info): satisfied by the info stub TU
+    # (NOT the audio stub - the playback harnesses compile the real
+    # gui_playback.c and would collide).
     stats_layout_test = executable('gui_stats_layout_test',
       ['test/gui_stats_layout_harness.c', 'misrc_gui/ui/gui_ui_scale.c',
-       'common/file_utils.c', version_target],
+       'common/file_utils.c', 'test/gui_playback_info_stub.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -755,7 +780,8 @@ if raylib_dep.found()
 
     # Check connection-button text and padding with the same CPU-only setup.
     toolbar_layout_test = executable('gui_toolbar_layout_test',
-      ['test/gui_toolbar_layout_harness.c', 'common/file_utils.c', version_target],
+      ['test/gui_toolbar_layout_harness.c', 'common/file_utils.c',
+       'test/gui_playback_info_stub.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -764,7 +790,8 @@ if raylib_dep.found()
     test('gui_toolbar_layout', toolbar_layout_test)
 
     viewport_layout_test = executable('gui_viewport_layout_test',
-      ['test/gui_viewport_layout_harness.c', 'common/file_utils.c', version_target],
+      ['test/gui_viewport_layout_harness.c', 'common/file_utils.c',
+       'test/gui_playback_info_stub.c', version_target],
       dependencies: overlay_test_deps,
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -801,7 +828,8 @@ if raylib_dep.found()
       test('gui_playback_resolve', playback_resolve_test)
     endif
     rf_input_stamps_test = executable('gui_rf_input_stamps_test',
-      'test/gui_rf_input_stamps_test.c',
+      ['test/gui_rf_input_stamps_test.c', 'test/monitor_local_save_stub.c',
+       'common/file_utils.c'],
       dependencies: overlay_test_deps + [dependency('threads')],
       include_directories: gui_includes,
       c_args: gui_cflags,
@@ -843,6 +871,10 @@ if raylib_dep.found()
     )
     test('gui_cvbs_baseband', cvbs_baseband_test)
 
+    # gui_audio.c (included by both harnesses) redirects stdio through the
+    # mls_proxy_* macros; the harnesses already self-define those (their own
+    # file_open_utf8 stubs get renamed by the macro). The only extra symbol
+    # is gui_monitor_server_active (stubbed inside each harness).
     audio_hifi_monitor_test = executable('gui_audio_hifi_monitor_test',
       'test/gui_audio_hifi_monitor_test.c',
       dependencies: overlay_test_deps + [dependency('threads')],
@@ -899,6 +931,7 @@ if raylib_dep.found()
       # s16le RF and an output directory, so it is not a default CI test.
       rf_reconnect_sources = [
         'test/gui_rf_playback_reconnect_test.c', 'test/gui_playback_audio_stub.c',
+        'test/monitor_local_save_stub.c',
         'common/file_utils.c',
         'misrc_gui/input/gui_playback_length_cache.c',
         'misrc_gui/visualization/gui_fft.c',

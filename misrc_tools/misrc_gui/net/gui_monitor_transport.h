@@ -18,6 +18,11 @@ bool gui_monitor_server_active(void);
 uint16_t gui_monitor_server_port(void);
 int gui_monitor_client_start(gui_app_t *app, const char *host, uint16_t port);
 void gui_monitor_client_stop(void);
+/* Consume a stop's staged local-profile/device restore on the MAIN thread
+ * (gui_monitor_client_stop may run on the net transition worker; app->settings
+ * and app->devices are main-thread-owned). Returns true when a restore was
+ * pending and applied. Also applied synchronously by gui_net_stop at exit. */
+bool gui_monitor_client_take_pending_restore(gui_app_t *app);
 bool gui_monitor_client_running(void);
 bool gui_monitor_client_matches(const char *host, uint16_t port);
 bool gui_monitor_client_connected(void);

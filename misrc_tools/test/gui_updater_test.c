@@ -153,10 +153,24 @@ static void test_versions_and_tags(void)
     assert(gui_updater_compare_versions("v1.2.6", "v1.2.6") == 0);
     assert(gui_updater_compare_versions("v1.3.0", "v1.2.9") > 0);
     assert(gui_updater_compare_versions("v2.0.0", "v10.0.0") < 0);
-    /* Dev builds fall back to text compare: "dev-..." < "v1.2.6" ('d' < 'v'),
-     * so a dev build still sees the release as an update. */
-    assert(gui_updater_compare_versions("dev-2026-10-21-abcdef", "v1.2.6") < 0);
-    assert(gui_updater_compare_versions("v1.2.6", "dev-2026-10-21-abcdef") > 0);
+    /* Dev/unversioned builds are NOT comparable: never older, never newer.
+     * (The old lexical fallback ('d' < 'v') made every dev build permanently
+     * report "update available" against the current release.) */
+    assert(gui_updater_compare_versions("dev-2026-10-21-abcdef", "v1.2.6") == 0);
+    assert(gui_updater_compare_versions("dev-2026-10-21-abcdef-dirty", "v1.2.6") == 0);
+    assert(gui_updater_compare_versions("unknown_version", "v1.2.6") == 0);
+    assert(gui_updater_compare_versions("dev-2026-10-21-abcdef", "v99.99.99") == 0);
+    /* A comparable current against a non-semver latest keeps the text edge. */
+    assert(gui_updater_compare_versions("v1.2.6", "weird-tag") < 0);
+    assert(gui_updater_compare_versions("v1.2.6", "aaaa") > 0);
+
+    assert(gui_updater_version_is_comparable("v1.2.6"));
+    assert(gui_updater_version_is_comparable("1.10.0"));
+    assert(!gui_updater_version_is_comparable("dev-2026-10-21-abcdef"));
+    assert(!gui_updater_version_is_comparable("dev-2026-10-21-abcdef-dirty"));
+    assert(!gui_updater_version_is_comparable("unknown_version"));
+    assert(!gui_updater_version_is_comparable(""));
+    assert(!gui_updater_version_is_comparable(NULL));
 
     assert(gui_updater_is_release_tag_safe("v1.2.6"));
     assert(gui_updater_is_release_tag_safe("v1.2.6-rc1"));

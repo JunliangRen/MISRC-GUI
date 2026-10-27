@@ -182,8 +182,13 @@ Color gui_dropdown_option_color(bool selected, bool hovered)
 
 /* Stub: the production scale-dropdown click handler persists the selection via
  * gui_settings_save; the harness doesn't link gui_settings.c, so provide a
- * no-op so the link resolves. Signature must match gui_app.h. */
+ * no-op. */
 void gui_settings_save(const gui_settings_t *settings) { (void)settings; }
+
+/* Stub: the Simulated-device system selector's click handler reports the
+ * new system via gui_app_set_status; the harness doesn't link the status
+ * module. */
+void gui_app_set_status(gui_app_t *app, const char *message) { (void)app; (void)message; }
 
 /* Stub: the production overlay scales text measurements to logical units via
  * gui_ui_get_scale_factor(); the harness doesn't link gui_ui_scale.c,

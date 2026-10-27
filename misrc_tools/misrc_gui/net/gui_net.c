@@ -456,6 +456,97 @@ static net_client_t *s_client = NULL;
 /* Global init state. */
 static bool s_globals_init = false;
 
+/* -------------------------------------------------------------------------
+ * Async mode transition (gui_net_request_apply_mode)
+ * -------------------------------------------------------------------------
+ * gui_net_apply_mode stops/starts the server/client/monitor workers and JOINS
+ * those threads; the joins can wait out multi-second socket timeouts against
+ * an unreachable peer. Running it directly in the UI click handler stalled the
+ * render thread for seconds when switching modes (notably into Monitor &
+ * Remote). The transition worker owns the whole stop/start sequence instead;
+ * while s_transition_running is set, the main-thread pollers and query helpers
+ * below all early-out so they never race the worker mutating the net globals
+ * (s_server / s_client / the monitor statics). gui_net_stop() joins a running
+ * worker before the normal shutdown teardown. */
+static thrd_t s_transition_thread;
+static bool s_transition_thread_started = false;
+static atomic_bool s_transition_running = ATOMIC_VAR_INIT(false);
+static atomic_bool s_transition_reenumerate = ATOMIC_VAR_INIT(false);
+/* Mode before the first transition of a chain + the force-reapply flag.
+ * Written by the requester (main thread) BEFORE the worker spawns, only
+ * while no worker is running; read once by the worker at start. */
+static int s_transition_prev_mode = GUI_NET_MODE_LOCAL;
+static bool s_transition_force = false;
+
+bool gui_net_transition_busy(void) {
+    return atomic_load(&s_transition_running);
+}
+
+static int net_transition_normalize_mode(int mode) {
+    if (mode == GUI_NET_MODE_MONITOR_SERVER) return GUI_NET_MODE_SERVER;
+    if (mode < GUI_NET_MODE_LOCAL || mode > GUI_NET_MODE_LAST) return GUI_NET_MODE_LOCAL;
+    return mode;
+}
+
+/* Chasing worker: applies app->settings.net_mode, then re-reads it - a click
+ * during a running transition just updates settings.net_mode, and the worker
+ * applies the newest target next instead of refusing the click. This keeps
+ * rapid multi-click cycling converging on the last chosen mode. */
+static int net_transition_thread(void *arg) {
+    gui_app_t *app = (gui_app_t *)arg;
+    int applied = net_transition_normalize_mode(s_transition_prev_mode);
+    bool force = s_transition_force;
+    for (;;) {
+        int want = net_transition_normalize_mode(app->settings.net_mode);
+        if (!force && want == applied) break;
+        force = false;
+        int prev = applied;
+        (void)gui_net_apply_mode(app);
+        applied = want;
+        /* Leaving a client mode / returning to Local: the main loop
+         * re-enumerates local devices once (app->devices is main-owned). */
+        if (want == GUI_NET_MODE_LOCAL || prev == GUI_NET_MODE_CLIENT ||
+            prev == GUI_NET_MODE_MONITOR_CLIENT) {
+            atomic_store(&s_transition_reenumerate, true);
+        }
+    }
+    bool reenum = atomic_exchange(&s_transition_reenumerate, false);
+    /* Completion flag last (seq_cst): every net_status write above is visible
+     * to the main thread before it resumes touching the net globals. */
+    atomic_store(&s_transition_running, false);
+    if (app && reenum) {
+        /* app->devices is main-thread-owned: only the flag crosses threads. */
+        atomic_store(&app->net_reenumerate_pending, true);
+    }
+    return 0;
+}
+
+int gui_net_request_apply_mode(gui_app_t *app, int prev_mode, bool force_reapply) {
+    if (!app) return -1;
+    if (atomic_load(&s_transition_running)) {
+        /* Queued, not refused: the click has already written the newest
+         * target into settings.net_mode; the running worker chases it. */
+        return 0;
+    }
+    gui_net_init_globals();
+    /* Join any PREVIOUS (already finished) worker first so its thread handle
+     * is never leaked; instant because it only runs when not busy. */
+    if (s_transition_thread_started) {
+        thrd_join(s_transition_thread, NULL);
+        s_transition_thread_started = false;
+    }
+    s_transition_prev_mode = net_transition_normalize_mode(prev_mode);
+    s_transition_force = force_reapply;
+    atomic_store(&s_transition_reenumerate, false);
+    atomic_store(&s_transition_running, true);
+    if (thrd_create(&s_transition_thread, net_transition_thread, app) != thrd_success) {
+        atomic_store(&s_transition_running, false);
+        return -1;  /* caller may fall back to the synchronous apply */
+    }
+    s_transition_thread_started = true;
+    return 0;
+}
+
 void gui_net_init_globals(void) {
     if (s_globals_init) return;
 #ifdef _WIN32
@@ -479,17 +570,20 @@ void gui_net_cleanup_globals(void) {
 
 bool gui_net_is_client(const gui_app_t *app) {
     (void)app;
+    if (atomic_load(&s_transition_running)) return false;
     return (s_client != NULL && !s_client->monitor_only) ||
            (app && app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT);
 }
 
 bool gui_net_is_server(const gui_app_t *app) {
     (void)app;
+    if (atomic_load(&s_transition_running)) return false;
     return s_server != NULL;
 }
 
 bool gui_net_active(const gui_app_t *app) {
     (void)app;
+    if (atomic_load(&s_transition_running)) return false;
     if (s_server && atomic_load(&s_server->running)) return true;
     if (gui_monitor_server_active() || gui_monitor_client_connected()) return true;
     if (s_client && atomic_load(&s_client->connected)) return true;
@@ -515,6 +609,10 @@ void gui_net_set_status(gui_app_t *app, const char *msg) {
 
 void gui_net_status_string(const gui_app_t *app, char *buf, size_t len) {
     if (!buf || len == 0) return;
+    if (atomic_load(&s_transition_running)) {
+        snprintf(buf, len, "Switching network mode...");
+        return;
+    }
     if (s_server) {
         if (atomic_load(&s_server->running)) {
             snprintf(buf, len, "Listening on :%u (RF + MISRC-M/2 monitor)", (unsigned)s_server->port);
@@ -1025,8 +1123,8 @@ static void server_stop(net_server_t *srv) {
  * select() so an unreachable host does not block the caller for the full TCP
  * timeout (tens of seconds). Returns a blocking socket with SO_RCVTIMEO /
  * SO_SNDTIMEO set so later recv/send calls also cannot hang forever. */
-#define NET_CONNECT_TIMEOUT_MS 2000
-#define NET_IO_TIMEOUT_MS      1000
+#define NET_CONNECT_TIMEOUT_MS 300
+#define NET_IO_TIMEOUT_MS      500
 
 static net_sock_t client_connect(const char *host, uint16_t port) {
     net_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1430,7 +1528,12 @@ static int client_worker_thread(void *arg) {
                 atomic_store(&cli->ingest_want, false);
                 first_contact = false;  /* re-fetch /devices on reconnect */
             }
-            thrd_sleep_ms(backoff_ms);
+            /* Interruptible backoff (50 ms slices): client_stop joins this
+             * thread, and the old single thrd_sleep_ms(backoff) made a mode
+             * switch wait out up to 2 s of unreachable-peer backoff. */
+            for (int slept = 0; slept < backoff_ms && !atomic_load(&cli->stop_flag); slept += 50) {
+                thrd_sleep_ms(50);
+            }
             if (backoff_ms < 2000) backoff_ms += 250;
             continue;
         }
@@ -1584,8 +1687,11 @@ static int client_worker_thread(void *arg) {
         }
 
     /* 1s poll interval: halves TCP connection churn vs 500ms while staying
-     * responsive to peer state changes. */
-    thrd_sleep_ms(1000);
+     * responsive to peer state changes. 50 ms slices so a stop (mode switch)
+     * joins within a slice instead of waiting out the whole interval. */
+    for (int slept = 0; slept < 1000 && !atomic_load(&cli->stop_flag); slept += 50) {
+        thrd_sleep_ms(50);
+    }
     }
     atomic_store(&cli->ingest_want, false);
     return 0;
@@ -1617,7 +1723,7 @@ static int client_discovery_thread(void *arg) {
         net_close(fd);
         return 0;
     }
-    net_set_timeouts(fd, 1000, 1000);  /* 1s recv timeout */
+    net_set_timeouts(fd, 250, 250);  /* 250ms recv timeout: client_stop joins the listener within a slice */
     while (!atomic_load(&cli->discovery_stop)) {
         char buf[256];
         struct sockaddr_in src;
@@ -1806,10 +1912,23 @@ static void client_stop(net_client_t *cli) {
  * ------------------------------------------------------------------------- */
 
 void gui_net_stop(gui_app_t *app) {
+    /* A mode transition worker may be mid-apply; join it first so it never
+     * touches freed state afterwards. A FINISHED worker is joined too so its
+     * thread handle is never leaked. */
+    if (atomic_load(&s_transition_running)) {
+        thrd_join(s_transition_thread, NULL);
+        atomic_store(&s_transition_running, false);
+    } else if (s_transition_thread_started) {
+        thrd_join(s_transition_thread, NULL);
+    }
+    s_transition_thread_started = false;
     gui_monitor_client_stop();
     gui_monitor_server_stop();
     if (s_server) server_stop(s_server);
     if (s_client) client_stop(s_client);
+    /* Apply any staged M-Client local-profile/device restore synchronously:
+     * at shutdown the per-frame poller that normally consumes it is gone. */
+    (void)gui_monitor_client_take_pending_restore(app);
     if (app) {
         atomic_store(&app->net_connected, false);
         app->net_state = NULL;
@@ -1959,6 +2078,8 @@ void gui_net_tap_audio(gui_app_t *app, const void *data, size_t bytes) {
 
 void gui_net_poll_commands(gui_app_t *app) {
     if (!app) return;
+    /* Transition worker owns the net globals while it runs; skip the frame. */
+    if (atomic_load(&s_transition_running)) return;
     if(gui_monitor_server_active())gui_monitor_server_poll_settings(app);
     /* Server mode: execute queued commands locally on the main thread. */
     if (s_server || gui_monitor_server_active()) {
@@ -2032,6 +2153,12 @@ void gui_net_poll_commands(gui_app_t *app) {
 
 void gui_net_poll_mirror(gui_app_t *app) {
     if (!app) return;
+    /* Transition worker owns the net globals while it runs; skip the frame. */
+    if (atomic_load(&s_transition_running)) return;
+    /* Staged M-Client local-profile/device restore: gui_monitor_client_stop
+     * (possibly driven by the transition worker) defers its app->settings and
+     * app->devices writes here, on their owning main thread. */
+    (void)gui_monitor_client_take_pending_restore(app);
     if(app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT) {
         gui_monitor_client_sync_main(app);
         if(gui_monitor_client_connected()) {
@@ -2105,7 +2232,7 @@ void gui_net_client_request_device(gui_app_t *app, int device_index) {
 
 /* Discovery: return the current count of discovered servers (client mode). */
 int gui_net_discovered_count(void) {
-    if (!s_client) return 0;
+    if (!s_client || atomic_load(&s_transition_running)) return 0;
     net_mutex_lock(&s_client->disc_mtx);
     int n = s_client->discovered_count;
     net_mutex_unlock(&s_client->disc_mtx);
@@ -2116,7 +2243,7 @@ int gui_net_discovered_count(void) {
  * false if index is out of range or not in client mode. */
 bool gui_net_get_discovered(int index, char *host, size_t host_cap,
                             uint16_t *port, char *name, size_t name_cap) {
-    if (!s_client) return false;
+    if (!s_client || atomic_load(&s_transition_running)) return false;
     bool ok = false;
     net_mutex_lock(&s_client->disc_mtx);
     if (index >= 0 && index < s_client->discovered_count) {
@@ -2137,7 +2264,7 @@ bool gui_net_get_discovered(int index, char *host, size_t host_cap,
 /* Discovery: select discovered server #index as the connection target. Sets
  * the client host/port settings and re-applies mode so the worker reconnects. */
 void gui_net_select_discovered(gui_app_t *app, int index) {
-    if (!app || !s_client) return;
+    if (!app || !s_client || atomic_load(&s_transition_running)) return;
     char host[64] = {0};
     uint16_t port = 0;
     char name[64] = {0};
@@ -2156,7 +2283,10 @@ void gui_net_select_discovered(gui_app_t *app, int index) {
         else
             snprintf(msg,sizeof(msg),"Monitor & Remote failed to connect to %s:%u",host,(unsigned)port);
     } else if (app->settings.net_mode == GUI_NET_MODE_CLIENT && !s_client->monitor_only) {
-        (void)gui_net_apply_mode(app);
+        /* Async: the legacy worker restart joins threads with socket
+         * timeouts; never stall the render thread on a discovered click.
+         * Same mode, new host: force the re-apply. */
+        (void)gui_net_request_apply_mode(app, GUI_NET_MODE_CLIENT, true);
         snprintf(msg, sizeof(msg), "Connecting to discovered server %s:%u (%s)", host, (unsigned)port, name);
     } else {
         return;
@@ -2167,6 +2297,7 @@ void gui_net_select_discovered(gui_app_t *app, int index) {
 /* True when client connection is active at the worker level (connected or
  * currently trying). Used by the UI Action button label/state. */
 bool gui_net_client_connection_running(const gui_app_t *app) {
+    if (atomic_load(&s_transition_running)) return false;
     if(app && app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT)
         return gui_monitor_client_running();
     if (!s_client) return false;
@@ -2174,6 +2305,7 @@ bool gui_net_client_connection_running(const gui_app_t *app) {
 }
 
 bool gui_net_client_peer_capturing(const gui_app_t *app) {
+    if (atomic_load(&s_transition_running)) return false;
     if(app && app->settings.net_mode==GUI_NET_MODE_MONITOR_CLIENT)
         return gui_monitor_client_connected() && gui_monitor_client_peer_state()>=1;
     if (!s_client) return false;
@@ -2186,6 +2318,10 @@ bool gui_net_client_peer_capturing(const gui_app_t *app) {
  * - if disconnected, (re)start worker using current host:port settings. */
 void gui_net_client_toggle_connection(gui_app_t *app) {
     if (!app) return;
+    if (atomic_load(&s_transition_running)) {
+        gui_app_set_status(app, "Network mode switch in progress");
+        return;
+    }
     if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
         if(gui_monitor_client_running()) {
             gui_monitor_client_stop();
@@ -2211,7 +2347,7 @@ void gui_net_client_toggle_connection(gui_app_t *app) {
     const char *h = app->settings.net_client_host;
 
     if (!s_client) {
-        (void)gui_net_apply_mode(app);
+        (void)gui_net_request_apply_mode(app, GUI_NET_MODE_CLIENT, true);
         return;
     }
 

@@ -139,6 +139,13 @@ static void mon_cfg_snapshot(gui_app_t *app);
 static atomic_flag g_fs_lock=ATOMIC_FLAG_INIT;
 static void fs_lock(void){while(atomic_flag_test_and_set_explicit(&g_fs_lock,memory_order_acquire))thrd_sleep_ms(1);}
 static void fs_unlock(void){atomic_flag_clear_explicit(&g_fs_lock,memory_order_release);}
+
+/* Staged M-Client local-profile/device restore: gui_monitor_client_stop may
+ * run on the net transition worker, but the app->settings / app->devices
+ * restores belong to the MAIN thread. Stop stages the restore; the main-thread
+ * poller (and gui_net_stop at exit) consumes it. A new client session clears
+ * it (reconnecting must not restore the local catalogue mid-session). */
+static atomic_bool g_monitor_restore_pending=ATOMIC_VAR_INIT(false);
 static struct {
     char requested[MON_REMOTE_PATH];unsigned page,request_seq,seen_seq;
     char selection[MON_REMOTE_PATH];bool select_pending;
@@ -728,7 +735,7 @@ static int mon_get(const char *host,uint16_t port,const char *path,char *dst,siz
     for(struct addrinfo *p=addr;p;p=p->ai_next){
         sock=socket(p->ai_family,p->ai_socktype,p->ai_protocol);
         if(sock==MON_BAD)continue;
-        mon_timeouts(sock,1000);
+        mon_timeouts(sock,400);
         if(connect(sock,p->ai_addr,(int)p->ai_addrlen)==0)break;
         mon_close(sock);sock=MON_BAD;
     }
@@ -767,7 +774,7 @@ static int mon_get_preview(const char *host,uint16_t port){
     for(struct addrinfo *p=addr;p;p=p->ai_next){
         sock=socket(p->ai_family,p->ai_socktype,p->ai_protocol);
         if(sock==MON_BAD)continue;
-        mon_timeouts(sock,900);
+        mon_timeouts(sock,400);
         if(connect(sock,p->ai_addr,(int)p->ai_addrlen)==0)break;
         mon_close(sock);sock=MON_BAD;
     }
@@ -921,10 +928,13 @@ static int mon_client_thread(void *ctx){
             atomic_store(&g_client.record_stats_valid,valid);
             atomic_store(&g_client.connected,true);
             atomic_store(&g_client.app->net_connected,true);
-            if(state>0){
+            /* Skipping the preview fetch when stopping halves the
+             * gui_monitor_client_stop join wait (a mode switch stopping the
+             * monitor thread does not wait out a second 400 ms transfer). */
+            if(state>0 && !atomic_load(&g_client.stopping)){
                 if(mon_get_preview(g_client.host,g_client.port)!=0)
                     gui_rd_client_clear();
-            }else gui_rd_client_clear();
+            }else if(state<=0) gui_rd_client_clear();
             /* M-Client's server-owned filesystem browser runs only on this
              * network worker. GUI remains responsive on slow NAS mounts. */
             mon_worker_folders();
@@ -1002,6 +1012,9 @@ static int mon_client_thread(void *ctx){
 int gui_monitor_client_start(gui_app_t *app,const char *host,uint16_t port){
     if(!app||!host||!host[0]||!port)return -1;
     gui_monitor_client_stop();
+    /* A reconnect cancels any staged restore: the local catalogue must not be
+     * restored over a fresh M-Client session that just snapshotted it. */
+    atomic_store(&g_monitor_restore_pending,false);
     g_client.app=app;g_client.port=port;
     mon_cfg_disconnect();
     cfg_lock();
@@ -1035,14 +1048,10 @@ void gui_monitor_client_stop(void){
     thrd_join(g_client.thread,NULL);
     if(g_client.app){
         /* Neither Pi settings nor its remote device indices may leak into
-         * Harry's existing Local / full-RF Client modes. */
-        gui_settings_restore_monitor_profile(&g_client.app->settings);
-        cfg_lock();
-        memcpy(g_client.app->devices,g_cfg_client.local_devices,
-            (size_t)g_cfg_client.local_count*sizeof(device_info_t));
-        g_client.app->device_count=g_cfg_client.local_count;
-        g_client.app->selected_device=g_cfg_client.local_selected;
-        cfg_unlock();
+         * Harry's existing Local / full-RF Client modes. The settings/devices
+         * restores are STAGED for the main thread (this may be the net
+         * transition worker); the atomic flag clears are thread-safe. */
+        atomic_store(&g_monitor_restore_pending,true);
         atomic_store(&g_client.app->net_connected,false);
         atomic_store(&g_client.app->net_cmd_start,false);
         atomic_store(&g_client.app->net_cmd_stop,false);
@@ -1061,6 +1070,23 @@ void gui_monitor_client_stop(void){
     fs_lock();memset(&g_fs_client,0,sizeof(g_fs_client));fs_unlock();
 }
 bool gui_monitor_client_running(void){return atomic_load(&g_client.running);}
+bool gui_monitor_client_take_pending_restore(gui_app_t *app){
+    if(!app)return false;
+    if(!atomic_exchange(&g_monitor_restore_pending,false))return false;
+    /* MAIN THREAD ONLY (the net pollers and gui_net_stop call this): apply the
+     * stop's staged restores - the local recording profile and the local
+     * device catalogue saved when the M-Client session began. */
+    gui_settings_restore_monitor_profile(&app->settings);
+    cfg_lock();
+    if(g_cfg_client.local_count>0){
+        memcpy(app->devices,g_cfg_client.local_devices,
+            (size_t)g_cfg_client.local_count*sizeof(device_info_t));
+    }
+    app->device_count=g_cfg_client.local_count;
+    app->selected_device=g_cfg_client.local_selected;
+    cfg_unlock();
+    return true;
+}
 bool gui_monitor_client_connected(void){return atomic_load(&g_client.connected);}
 int gui_monitor_client_peer_state(void){return atomic_load(&g_client.peer_state);}
 uint32_t gui_monitor_client_peer_rate(void){return atomic_load(&g_client.peer_rate);}

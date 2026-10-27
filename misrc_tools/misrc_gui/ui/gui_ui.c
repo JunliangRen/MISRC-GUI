@@ -713,6 +713,62 @@ static char s_rtlsdr_freq_str[32] = {0};
 static bool s_record_limit_window_open = false;
 // Version info popup state (toolbar "i" badge button)
 static bool s_version_info_window_open = false;
+// Net mode hold-press menu (About window "Mode" toggle): a press arms the
+// decision, a quick release cycles the mode, holding >= 450 ms opens a
+// direct-select menu. Resolution runs per frame in gui_handle_interactions
+// (clicks fire on press, so the toggle itself only arms).
+static bool s_net_mode_menu_open = false;
+static bool s_net_mode_press_armed = false;
+static double s_net_mode_press_time = 0.0;
+static bool s_net_mode_hold_fired = false;
+
+// Forward declaration (defined later in this file; the net mode apply helper
+// below runs before the definition site).
+static void gui_ui_clear_text_edit(void);
+
+// Net mode cycle order (keep numeric mode 3 as a saved-config alias only):
+// Local -> Server -> Client -> Monitor & Remote -> Local.
+static int gui_ui_net_mode_cycle_next(int cur) {
+    if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_LAST) cur = GUI_NET_MODE_LOCAL;
+    if (cur == GUI_NET_MODE_MONITOR_SERVER) return GUI_NET_MODE_LOCAL;
+    if (cur == GUI_NET_MODE_CLIENT) return GUI_NET_MODE_MONITOR_CLIENT;
+    if (cur == GUI_NET_MODE_MONITOR_CLIENT) return GUI_NET_MODE_LOCAL;
+    return cur + 1;
+}
+
+// Shared by the quick-click cycle and the hold-press menu: update the mode,
+// save, and hand the stop/start sequence to the async net transition worker.
+// The synchronous gui_net_apply_mode joins network worker threads that can
+// sit in multi-second socket timeouts - running it inline in the click
+// handler is what made switching to Monitor & Remote stall the UI.
+static void gui_ui_net_mode_apply(gui_app_t *app, int next) {
+    if (!app) return;
+    if (gui_playback_is_starting(app)) {
+        gui_app_set_status(app, "Network mode is locked while playback prepares");
+        return;
+    }
+    int cur = app->settings.net_mode;
+    if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_LAST) cur = GUI_NET_MODE_LOCAL;
+    app->settings.net_mode = next;
+    gui_ui_clear_text_edit();
+    gui_settings_save(&app->settings);
+    char msg[96];
+    snprintf(msg, sizeof(msg), "Network mode: %s", gui_net_mode_name(next));
+    gui_app_set_status(app, msg);
+    /* Rapid cycling: a click while a transition is running is QUEUED (the
+     * worker chases settings.net_mode), never refused - the label follows
+     * the click immediately. Leaving a client mode / returning to Local must
+     * bring the local device list back (the worker defers that enumerate to
+     * the main loop); reenum here only feeds the sync fallback below. */
+    bool reenum = (next == GUI_NET_MODE_LOCAL || cur == GUI_NET_MODE_CLIENT ||
+                   cur == GUI_NET_MODE_MONITOR_CLIENT);
+    if (gui_net_request_apply_mode(app, cur, false) != 0) {
+        // Worker unavailable (spawn failure): fall back to the synchronous
+        // apply so the mode never ends up half-applied.
+        (void)gui_net_apply_mode(app);
+        if (reenum) gui_app_enumerate_devices(app);
+    }
+}
 // Metadata popup state (toolbar scroll badge button)
 static bool s_metadata_window_open = false;
 static bool s_record_limit_armed = false;
@@ -1480,8 +1536,10 @@ static char playback_timeline_display_a[64];
 static char playback_timeline_display_b[64];
 static char playback_readout_display_a[32];
 static char playback_readout_display_b[32];
-static char playback_name_display_a[64];
-static char playback_name_display_b[64];
+/* Full filenames (gui_ui_playback_file_basename): sized for whole basenames,
+   not abbreviated ones - the timeline name slot budgets from these. */
+static char playback_name_display_a[128];
+static char playback_name_display_b[128];
 static char playback_fileinfo_display_a[48];
 static char playback_fileinfo_display_b[48];
 static char playback_index_display[2][96];
@@ -4368,9 +4426,18 @@ static void render_version_info_window(gui_app_t *app)
     }
 
     bool update_check_running = atomic_load_explicit(&s_update_check_running, memory_order_acquire);
+    /* Dev/unversioned builds (dev-YYYY-MM-DD-<sha>, unknown_version) are never
+     * comparable with a release tag; show what they are instead of claiming an
+     * update. The old lexical compare ('d' < 'v') permanently reported
+     * "Available: vN.N.N" on every dev build. */
+    bool update_current_comparable = gui_updater_version_is_comparable(MIRSC_TOOLS_VERSION);
     Color update_status_color = COLOR_TEXT_DIM;
     if (update_check_running) {
         snprintf(vi_update_status, sizeof(vi_update_status), "Checking...");
+    } else if (!update_current_comparable && app->settings.update_last_release_tag[0]) {
+        snprintf(vi_update_status, sizeof(vi_update_status),
+                 "Dev build (%s) - latest release %s",
+                 MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
     } else if (app->settings.update_last_release_tag[0]) {
         int update_cmp = gui_updater_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag);
         if (update_cmp < 0) {
@@ -4394,6 +4461,7 @@ static void render_version_info_window(gui_app_t *app)
     // without a manifest. Two-click confirm: first click arms, second runs.
     bool update_install_available =
         !update_check_running &&
+        update_current_comparable &&
         app->settings.update_last_release_tag[0] &&
         (gui_updater_compare_versions(MIRSC_TOOLS_VERSION, app->settings.update_last_release_tag) < 0);
     bool update_install_blocked = update_check_running ||
@@ -4745,6 +4813,11 @@ static void render_version_info_window(gui_app_t *app)
             if (mode < GUI_NET_MODE_LOCAL || mode > GUI_NET_MODE_LAST) mode = GUI_NET_MODE_LOCAL;
             const char *mode_label = gui_net_mode_name(mode);
             Color mode_bg = (mode == GUI_NET_MODE_LOCAL) ? COLOR_BUTTON : COLOR_BUTTON_ACTIVE;
+            /* Reverted pre-PR compact toggle style, sized to the longest mode
+             * label so "Monitor & Remote" never clips; the hint names the
+             * modes again instead of the count. */
+            int mode_btn_w = gui_ui_measure_button_width(app, gui_net_mode_name(GUI_NET_MODE_MONITOR_CLIENT),
+                                                         FONT_SIZE_NORMAL, 8, 0, 90, 220);
             CLAY(CLAY_ID("VersionInfoNetModeRow"), {
                 .layout = { .sizing = { CLAY_SIZING_GROW(0), CLAY_SIZING_FIT(0) }, .layoutDirection = CLAY_LEFT_TO_RIGHT, .childAlignment = { .y = CLAY_ALIGN_Y_CENTER }, .childGap = 10 }
             }) {
@@ -4754,7 +4827,7 @@ static void render_version_info_window(gui_app_t *app)
                 }
                 CLAY(CLAY_ID("VersionInfoNetModeToggle"), {
                     .layout = {
-                        .sizing = { CLAY_SIZING_FIXED(180), CLAY_SIZING_FIXED(28) },
+                        .sizing = { CLAY_SIZING_FIXED(mode_btn_w), CLAY_SIZING_FIXED(28) },
                         .childAlignment = { .x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER }
                     },
                     .backgroundColor = to_clay_color(mode_bg),
@@ -4763,15 +4836,35 @@ static void render_version_info_window(gui_app_t *app)
                     CLAY_TEXT(make_string(mode_label),
                         CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
                 }
-                CLAY_TEXT(CLAY_STRING("click to cycle (4 modes)"),
+                CLAY_TEXT(CLAY_STRING("Local / Server / Client / Monitor & Remote (hold for list)"),
                     CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
             }
-        }
-
-        if (app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
-            CLAY_TEXT(CLAY_STRING("Monitor waveform + FFT (Zstd-1)"),
-                CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS,
-                    .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            /* Hold-press direct-select menu (armed by a >= 450 ms press on
+             * the toggle; consumed in the version-window click gate). */
+            if (s_net_mode_menu_open) {
+                static const int menu_ids[4] = {
+                    GUI_NET_MODE_LOCAL, GUI_NET_MODE_SERVER,
+                    GUI_NET_MODE_CLIENT, GUI_NET_MODE_MONITOR_CLIENT
+                };
+                for (int i = 0; i < 4; i++) {
+                    bool sel = (app->settings.net_mode == menu_ids[i]);
+                    Color item_bg = sel ? COLOR_BUTTON_ACTIVE : COLOR_BUTTON;
+                    CLAY(CLAY_IDI("VersionInfoNetModeMenuItem", i), {
+                        .layout = {
+                            .sizing = { CLAY_SIZING_FIXED(mode_btn_w), CLAY_SIZING_FIXED(26) },
+                            .childAlignment = { .x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER },
+                            .padding = { 8, 8, 0, 0 }
+                        },
+                        .backgroundColor = to_clay_color(item_bg),
+                        .cornerRadius = CLAY_CORNER_RADIUS(4)
+                    }) {
+                        CLAY_TEXT(make_string(gui_net_mode_name(menu_ids[i])),
+                            CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_NORMAL, .textColor = to_clay_color(COLOR_TEXT) }));
+                    }
+                }
+                CLAY_TEXT(CLAY_STRING("click a mode to switch directly"),
+                    CLAY_TEXT_CONFIG({ .fontSize = FONT_SIZE_STATS, .textColor = to_clay_color(COLOR_TEXT_DIM) }));
+            }
         }
 
         // Server: port field.
@@ -6788,13 +6881,36 @@ static gui_playback_timeline_layout_t gui_ui_playback_timeline_layout(gui_app_t 
     bool stacked = available - label_width - 8 < 64;
     // Right-side file info slots (see the HARD DEV NOTE above the helpers):
     // fixed representative widths per tier so value changes never reflow the
-    // row; tiers degrade full -> compact-fileinfo -> name+readout -> readout
-    // only. Stacked rows fit the info line separately below the track.
+    // row. The FILENAME slot now budgets from the actual loaded filenames
+    // (full names, not a fixed sample width - see gui_ui_playback_file_basename);
+    // tiers degrade full -> compact-fileinfo -> name+readout -> readout only.
+    // Stacked rows fit the info line separately below the track.
     int readout_full = gui_ui_measure_text_width(app, "16-bit 999.9 MSPS", FONT_SIZE_STATUS, 1);
     int readout_compact_w = gui_ui_measure_text_width(app, "16-bit 999M", FONT_SIZE_STATUS, 1);
     int fileinfo_full = gui_ui_measure_text_width(app, "RAW 9999.9GiB FLAC 9999.9GiB 99.9x", FONT_SIZE_STATUS, 1);
     int fileinfo_compact_w = gui_ui_measure_text_width(app, "9999.9G/999.9G", FONT_SIZE_STATUS, 1);
-    int name_slot = gui_ui_measure_text_width(app, "Tape_08_2026.10.11_01.49.01.flac", FONT_SIZE_STATUS, 1);
+    // Full-name budget: the widest loaded basename this session (sticky, so
+    // loading a longer name resizes the slot and it never shrinks mid-file).
+    // Capped at 420 px (the discovery-row cap) so a pathological basename
+    // cannot starve the readouts; only beyond the cap does the name ellipsize.
+    #define PLAYBACK_NAME_SLOT_MAX_W 420
+    static int s_playback_name_slot_w = 0;
+    if (app) {
+        static char s_name_probe[128];
+        int session_w = 0;
+        for (int ch = 0; ch < 2; ch++) {
+            s_name_probe[0] = '\0';
+            gui_ui_playback_file_basename(app, ch, s_name_probe, sizeof(s_name_probe));
+            if (s_name_probe[0]) {
+                int w = gui_ui_measure_text_width(app, s_name_probe, FONT_SIZE_STATUS, 1);
+                if (w > session_w) session_w = w;
+            }
+        }
+        if (session_w > s_playback_name_slot_w) s_playback_name_slot_w = session_w;
+        if (s_playback_name_slot_w > PLAYBACK_NAME_SLOT_MAX_W) s_playback_name_slot_w = PLAYBACK_NAME_SLOT_MAX_W;
+    }
+    int name_slot = s_playback_name_slot_w > 0 ? s_playback_name_slot_w
+        : gui_ui_measure_text_width(app, "Tape_08_2026.10.11_01.49.01.flac", FONT_SIZE_STATUS, 1);
     int readout_width = 0;
     int fileinfo_width = 0;
     int name_width = 0;
@@ -6805,6 +6921,7 @@ static gui_playback_timeline_layout_t gui_ui_playback_timeline_layout(gui_app_t 
         int full_all = name_slot + 8 + readout_full + 8 + fileinfo_full;
         int mid_all = name_slot + 8 + readout_full + 8 + fileinfo_compact_w;
         int name_readout = name_slot + 8 + readout_full;
+        int name_compact_readout = name_slot + 8 + readout_compact_w;
         if (room >= full_all) {
             name_width = name_slot;
             readout_width = readout_full;
@@ -6817,6 +6934,10 @@ static gui_playback_timeline_layout_t gui_ui_playback_timeline_layout(gui_app_t 
         } else if (room >= name_readout) {
             name_width = name_slot;
             readout_width = readout_full;
+        } else if (room >= name_compact_readout) {
+            name_width = name_slot;
+            readout_width = readout_compact_w;
+            readout_compact = true;
         } else if (room >= readout_compact_w) {
             readout_width = readout_compact_w;
             readout_compact = true;
@@ -8838,8 +8959,18 @@ void gui_handle_interactions(gui_app_t *app) {
         s_record_limit_window_open = false;
     }
     if (s_version_info_window_open && IsKeyPressed(KEY_ESCAPE)) {
-        s_version_info_window_open = false;
-        s_update_install_armed = false;
+        // ESC closes the hold-press mode menu first; only a second ESC (or a
+        // menu already closed) dismisses the window.
+        if (s_net_mode_menu_open) {
+            s_net_mode_menu_open = false;
+            s_net_mode_press_armed = false;
+            s_net_mode_hold_fired = false;
+        } else {
+            s_version_info_window_open = false;
+            s_update_install_armed = false;
+            s_net_mode_press_armed = false;
+            s_net_mode_hold_fired = false;
+        }
     }
     if (s_metadata_window_open && IsKeyPressed(KEY_ESCAPE)) {
         s_metadata_window_open = false;
@@ -9107,6 +9238,26 @@ void gui_handle_interactions(gui_app_t *app) {
         }
         // Version info popup modal interactions (consume before toolbar underneath)
         if (s_version_info_window_open) {
+            // Net mode hold-press menu takes priority over everything else in
+            // the modal while it is open: an item click switches directly, any
+            // other click (toggle included) just closes the menu.
+            if (s_net_mode_menu_open) {
+                static const int menu_ids[4] = {
+                    GUI_NET_MODE_LOCAL, GUI_NET_MODE_SERVER,
+                    GUI_NET_MODE_CLIENT, GUI_NET_MODE_MONITOR_CLIENT
+                };
+                bool on_item = false;
+                for (int i = 0; i < 4 && !on_item; i++) {
+                    if (Clay_PointerOver(CLAY_IDI("VersionInfoNetModeMenuItem", i))) {
+                        on_item = true;
+                        s_net_mode_menu_open = false;
+                        gui_ui_net_mode_apply(app, menu_ids[i]);
+                    }
+                }
+                if (!on_item) s_net_mode_menu_open = false;
+                gui_ui_set_click_consumed();
+                return;
+            }
             if (Clay_PointerOver(CLAY_ID("VersionInfoCheckUpdateButton"))) {
                 gui_ui_process_update_check_result(app);
                 if (atomic_load_explicit(&s_update_check_running, memory_order_acquire)) {
@@ -9325,31 +9476,21 @@ void gui_handle_interactions(gui_app_t *app) {
                 gui_ui_set_click_consumed();
                 return;
             }
-            // Preserve legacy mode ids; append preview-only roles after Client.
+            // Net mode toggle: a press only ARMS the hold decision (clicks fire
+            // on press; acting here would also run the heavy apply inline).
+            // Quick release cycles, >= 450 ms hold opens the direct-select
+            // menu - both resolved per frame below the click gate.
             if (Clay_PointerOver(CLAY_ID("VersionInfoNetModeToggle"))) {
                 if (gui_playback_is_starting(app)) {
                     gui_app_set_status(app, "Network mode is locked while playback prepares");
                     gui_ui_set_click_consumed();
                     return;
                 }
-                int cur = app->settings.net_mode;
-                if (cur < GUI_NET_MODE_LOCAL || cur > GUI_NET_MODE_LAST) cur = GUI_NET_MODE_LOCAL;
-                /* Keep numeric mode 3 as a saved-config alias only:
-                 * Local -> Server -> Client -> Monitor & Remote -> Local. */
-                int next = (cur == GUI_NET_MODE_MONITOR_SERVER) ? GUI_NET_MODE_LOCAL
-                    : (cur == GUI_NET_MODE_CLIENT) ? GUI_NET_MODE_MONITOR_CLIENT
-                    : (cur == GUI_NET_MODE_MONITOR_CLIENT) ? GUI_NET_MODE_LOCAL
-                    : cur + 1;
-                app->settings.net_mode = next;
-                gui_ui_clear_text_edit();
-                gui_settings_save(&app->settings);
-                (void)gui_net_apply_mode(app);
-                // Returning to Local restores the local hardware device list
-                // (client mode had replaced it with the server's mirrored list).
-                if (next == GUI_NET_MODE_LOCAL || cur == GUI_NET_MODE_CLIENT ||
-                    cur == GUI_NET_MODE_MONITOR_CLIENT) {
-                    gui_app_enumerate_devices(app);
-                }
+                /* No busy gate: cycling during a running transition queues the
+                 * newest mode (the transition worker chases it). */
+                s_net_mode_press_armed = true;
+                s_net_mode_hold_fired = false;
+                s_net_mode_press_time = GetTime();
                 gui_ui_set_click_consumed();
                 return;
             }
@@ -9410,13 +9551,19 @@ void gui_handle_interactions(gui_app_t *app) {
             if (Clay_PointerOver(CLAY_ID("VersionInfoCloseButton"))) {
                 s_version_info_window_open = false;
                 s_update_install_armed = false;
-                // Commit any in-progress net field edit on close.
+                s_net_mode_menu_open = false;
+                s_net_mode_press_armed = false;
+                s_net_mode_hold_fired = false;
+                // Commit any in-progress net field edit on close. Async: the
+                // apply joins network threads with socket timeouts and must
+                // not stall the close click. Same mode (port/host edit):
+                // force the re-apply; a queued request would skip it.
                 if (s_active_text_field == UI_TEXT_FIELD_NET_SERVER_PORT ||
                     s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_HOST ||
                     s_active_text_field == UI_TEXT_FIELD_NET_CLIENT_PORT) {
                     gui_ui_clear_text_edit();
                     gui_settings_save(&app->settings);
-                    (void)gui_net_apply_mode(app);
+                    (void)gui_net_request_apply_mode(app, app->settings.net_mode, true);
                 }
                 gui_ui_set_click_consumed();
                 return;
@@ -9428,6 +9575,9 @@ void gui_handle_interactions(gui_app_t *app) {
             if (Clay_PointerOver(CLAY_ID("VersionInfoBackdrop"))) {
                 s_version_info_window_open = false;
                 s_update_install_armed = false;
+                s_net_mode_menu_open = false;
+                s_net_mode_press_armed = false;
+                s_net_mode_hold_fired = false;
                 gui_ui_set_click_consumed();
                 return;
             }
@@ -9635,6 +9785,9 @@ void gui_handle_interactions(gui_app_t *app) {
                 s_metadata_window_open = false;
             } else {
                 s_update_install_armed = false;
+                s_net_mode_menu_open = false;
+                s_net_mode_press_armed = false;
+                s_net_mode_hold_fired = false;
             }
             gui_ui_set_click_consumed();
             return;
@@ -10653,6 +10806,29 @@ void gui_handle_interactions(gui_app_t *app) {
             s_ui_consumed_click = true;
         } else if (!s_ui_consumed_click && gui_dropdown_handle_click(app)) {
             s_ui_consumed_click = true;
+        }
+    }
+
+    // Net mode hold-press resolution: a press on the Mode toggle (armed in the
+    // version-window click gate above) becomes either a quick-click cycle
+    // (released under 450 ms while still over the toggle) or opens the
+    // direct-select menu (held 450 ms). Runs outside the press gate so a
+    // press spanning many frames is detected.
+    if (s_net_mode_press_armed) {
+        bool over_toggle = s_version_info_window_open &&
+            Clay_PointerOver(CLAY_ID("VersionInfoNetModeToggle"));
+        if (!IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
+            bool quick_click = !s_net_mode_hold_fired && over_toggle;
+            s_net_mode_press_armed = false;
+            s_net_mode_hold_fired = false;
+            if (quick_click) {
+                gui_ui_net_mode_apply(app, gui_ui_net_mode_cycle_next(app->settings.net_mode));
+            }
+        } else if (!s_net_mode_hold_fired && over_toggle &&
+                   (GetTime() - s_net_mode_press_time) >= 0.45) {
+            s_net_mode_hold_fired = true;
+            s_net_mode_menu_open = true;
+            gui_dropdown_close_all();
         }
     }
 }

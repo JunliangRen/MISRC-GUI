@@ -130,12 +130,20 @@ static void print_usage(const char *program_name) {
             "--auto-capture starts capture unattended ~1 s after launch (Local mode;\n"
             "           no --config required).\n"
             "--auto-record <seconds> runs a full unattended record cycle: start\n"
-            "           capture, settle 2 s, record <seconds> seconds, wait for\n"
-            "           the output file finalize, stop capture, exit 0 (exit 1 on\n"
+            "           capture, settle 2 s, record <seconds> seconds, wait for the\n"
+            "           output file finalize, stop capture, exit 0 (exit 1 on\n"
             "           failure). Set overwrite_files true (or timestamped\n"
             "           auto-names) in the config so the overwrite confirmation\n"
             "           popup cannot stall the run. Progress is logged with\n"
             "           [AUTO] prefixes on stderr.\n"
+            "\n"
+            "Positional playback files (no flag needed):\n"
+            "  %s <rf-file> [<file2> ...]   loads playback files at launch through\n"
+            "           the same content-classifying pipeline as drag-and-drop\n"
+            "           (RF files -> channel A by default, audio-rate file -> the\n"
+            "           monitor source) and starts playback. Works on every\n"
+            "           platform - including macOS while elevated, where Finder\n"
+            "           drag-and-drop cannot land in the root-owned window.\n"
             "\n"
             "Headless network server (Linux):\n"
             "  --headless-server [--config <path>] [--select-device <selector>]\n"
@@ -148,6 +156,7 @@ static void print_usage(const char *program_name) {
             "  --device-list / --devices  list available capture devices and exit.\n"
             "\n",
             MIRSC_TOOLS_VERSION,
+            program_name ? program_name : "misrc_gui",
             program_name ? program_name : "misrc_gui");
 #if !defined(__ANDROID__)
     /* Append the full misrc_capture CLI option list (single source of truth). */
@@ -199,8 +208,13 @@ static int gui_run_update_cli(gui_update_cli_mode_t mode, const char *manifest_s
     }
     printf("latest: %s\n", latest_tag);
     printf("current: %s\n", MIRSC_TOOLS_VERSION);
+    /* Dev/unversioned builds are never comparable with a release tag: the
+     * compare returns 0 (never "older"), and the flag below tells scripts
+     * why no update is claimed for this binary. */
+    bool current_comparable = gui_updater_version_is_comparable(MIRSC_TOOLS_VERSION);
+    printf("current_comparable: %s\n", current_comparable ? "true" : "false");
     int cmp = gui_updater_compare_versions(MIRSC_TOOLS_VERSION, latest_tag);
-    printf("update_available: %s\n", (cmp < 0) ? "true" : "false");
+    printf("update_available: %s\n", (cmp < 0 && current_comparable) ? "true" : "false");
 
     if (mode == GUI_UPDATE_CLI_CHECK) {
         return 0;
@@ -715,10 +729,15 @@ int main(int argc, char **argv) {
     bool update_cli_mode_error = false;   /* more than one update mode flag given */
     const char *update_manifest_source = NULL;  /* --update-manifest <url-or-path> */
     bool update_cli_yes = false;                 /* --install-update confirmation */
+    // Positional playback files (see print_usage): bare paths with no capture
+    // flags seen, collected for the launch-time drop-pipeline load.
+    const char *positional_files[8] = {0};
+    int positional_file_count = 0;
     // First pass: classify args. Any arg that isn't a pure GUI flag is treated
     // as a capture arg and routes the process into headless CLI capture mode
     // (the full misrc_capture CLI), so the GUI binary doubles as the CLI tool
-    // when invoked from a terminal with capture options.
+    // when invoked from a terminal with capture options. EXCEPTION: a bare
+    // path (not a flag, no capture flag seen) is a positional playback file.
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if ((strcmp(a, "--help") == 0) || (strcmp(a, "-h") == 0)) {
@@ -804,6 +823,20 @@ int main(int argc, char **argv) {
         }
         if (strcmp(a, "--yes") == 0) {
             update_cli_yes = true;
+            continue;
+        }
+        if (a[0] != '\0' && a[0] != '-' && !has_capture_arg) {
+            // Bare path with no capture flag seen: a positional playback file
+            // (misrc_gui <file> [...] / Finder "Open With"). Capture-flag
+            // values never land here (their flags set has_capture_arg first),
+            // so the headless CLI routing is unchanged.
+            if (positional_file_count <
+                (int)(sizeof(positional_files) / sizeof(positional_files[0]))) {
+                positional_files[positional_file_count++] = a;
+            } else {
+                fprintf(stderr, "Too many positional files (max %d); ignoring: %s\n",
+                        (int)(sizeof(positional_files) / sizeof(positional_files[0])), a);
+            }
             continue;
         }
         has_capture_arg = true;
@@ -1012,6 +1045,19 @@ int main(int argc, char **argv) {
                 }
             }
         }
+    }
+
+    // Positional file arguments (misrc_gui <file> [...] / Finder "Open
+    // With"): route through the same content-classifying drop pipeline as
+    // drag-and-drop. Zone defaults to channel A (no panel bounds are rendered
+    // yet, so the drop-zone picker resolves to A). Unlike drag-and-drop this
+    // also works on macOS while elevated (root windows never receive Finder
+    // drops; the elevated relaunch forwards argv, so the file argument
+    // survives it).
+    if (positional_file_count > 0) {
+        (void)gui_playback_handle_dropped_files(&app,
+            (const char *const *)positional_files,
+            (size_t)positional_file_count, 0.0f, 0.0f);
     }
 
     // Enable auto-reconnect by default
@@ -1231,6 +1277,13 @@ int main(int argc, char **argv) {
         // GetMousePosition call - UI scale integration contract).
         if (IsFileDropped()) {
             FilePathList dropped_files = LoadDroppedFiles();
+            /* Diagnostic: exactly one line when the platform DELIVERS a drop.
+             * A macOS/Linux run that sees no line means the windowing layer
+             * never delivered the event (platform issue); a line plus a
+             * status/reject message means the handler ran and refused the
+             * file(s) (app issue). See dev/playback_drag_drop_audio.md. */
+            fprintf(stderr, "[PLAYBACK] Drop delivered: %d file(s)\n",
+                    (int)dropped_files.count);
             if (dropped_files.count > 0 && dropped_files.paths) {
                 Vector2 drop_point = gui_ui_get_mouse_position();
                 gui_playback_handle_dropped_files(&app,
@@ -1240,6 +1293,23 @@ int main(int argc, char **argv) {
             }
             UnloadDroppedFiles(dropped_files);
         }
+#if defined(__APPLE__)
+        /* macOS elevated (root) processes do not receive Finder drag-and-drop
+         * (the WindowServer refuses cross-session drag delivery), and this app
+         * always relaunches elevated for MS2130 hsdaoh/libusb capture. Tell
+         * playback users once where the working entry points are instead of a
+         * silent no-op drop. */
+        {
+            static bool s_macos_drop_hint_shown = false;
+            if (!s_macos_drop_hint_shown && geteuid() == 0 &&
+                app.selected_device >= 0 && app.selected_device < app.device_count &&
+                app.devices[app.selected_device].type == DEVICE_TYPE_PLAYBACK) {
+                s_macos_drop_hint_shown = true;
+                gui_app_set_status(&app,
+                    "macOS elevated: drag-and-drop is unavailable - use Browse or: misrc_gui <file>");
+            }
+        }
+#endif
 #if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
         if (app.is_capturing) {
             double now = GetTime();
@@ -1437,6 +1507,13 @@ int main(int argc, char **argv) {
         // are no-ops when net_mode == Local.
         gui_net_poll_commands(&app);
         gui_net_poll_mirror(&app);
+        // Deferred device re-enumeration after an async net mode transition:
+        // the transition worker (gui_net_request_apply_mode) set the flag on
+        // completion; the device array is main-thread-owned, so the enumerate
+        // runs here, not on the worker.
+        if (atomic_exchange(&app.net_reenumerate_pending, false)) {
+            gui_app_enumerate_devices(&app);
+        }
 
         // stop-on-dropout requests are posted from capture callbacks and consumed here.
         if (app.is_capturing && atomic_exchange(&app.dropout_stop_requested, false)) {

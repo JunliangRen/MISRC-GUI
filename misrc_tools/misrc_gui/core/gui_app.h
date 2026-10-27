@@ -613,7 +613,12 @@ typedef struct gui_app {
     atomic_int  net_peer_device_count;  // device count from peer /devices.
     atomic_int  net_peer_selected;      // selected_device from peer.
     atomic_bool net_connected;          // server listening / client connected.
-    atomic_bool net_error;              // last operation failed (see net_status).
+    atomic_bool net_error;               // last operation failed (see net_status).
+    /* Set by the async net mode transition worker (gui_net_request_apply_mode)
+     * when the main loop should re-enumerate local devices once (leaving a
+     * client mode / returning to Local). Consumed on the main thread; the
+     * device array itself is main-thread-owned. */
+    atomic_bool net_reenumerate_pending;
 
     // Dedicated network status line, shown ONLY in the info window's Network
     // section. Net code writes this via gui_net_set_status() and must NEVER

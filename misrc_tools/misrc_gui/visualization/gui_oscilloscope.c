@@ -112,6 +112,10 @@ typedef struct {
     // channel label, time/div and waveform keep rendering.
     gui_chrome_hide_t chrome_hide;
 
+    // Simulated-device system selector button (visible only when the
+    // Simulated device is selected; cycles PAL -> NTSC -> SECAM).
+    Rectangle sim_sys_btn_rect;
+
     panel_menu_item_t menu_items[TRIGGER_MODE_COUNT];
 
     // Drag state for trigger level
@@ -1677,6 +1681,20 @@ static bool waveform_panel_handle_click(void *state_ptr, struct gui_app *app, in
         return false;
     }
 
+    // Simulated-device system selector button (rendered by waveform_render):
+    // cycles PAL -> NTSC -> SECAM; the simulated capture thread detects the
+    // settings.video_system change on its next batch and regenerates the frame.
+    if (state->sim_sys_btn_rect.width > 0 &&
+        CheckCollisionPointRec(click, state->sim_sys_btn_rect)) {
+        int next = (app->settings.video_system + 1) % 3;
+        app->settings.video_system = next;
+        gui_settings_save(&app->settings);
+        gui_app_set_status(app, next == 0 ? "Test Gen: PAL" :
+                                 next == 1 ? "Test Gen: NTSC" :
+                                            "Test Gen: SECAM");
+        return true;
+    }
+
     // Control clicks first (only while the overlay is shown — its rectangles
     // are stale while hidden) so a double-click ON a control never toggles
     // the chrome; a consumed control click also resets the tracker.
@@ -1849,11 +1867,42 @@ static void waveform_render(void *state_ptr, gui_app_t *app, int channel,
     }
 
     // Dispatch based on render mode
-    // Dispatch based on render mode
     if (state->render_mode == WAVEFORM_MODE_PHOSPHOR) {
         render_waveform_phosphor_internal(state, app, channel, bounds, channel_color);
     } else {
         render_waveform_line_internal(state, app, channel, bounds, channel_color);
+    }
+
+    // Simulated-device system selector: rendered AFTER the waveform so the
+    // phosphor texture and grid drawing cannot cover it. Visible only when
+    // the Simulated device is the selected capture source. Cycles
+    // PAL -> NTSC -> SECAM on click (updates settings.video_system; the
+    // simulated capture thread detects the change and regenerates).
+    {
+        bool is_sim = (app->selected_device >= 0 &&
+                       app->selected_device < app->device_count &&
+                       app->devices[app->selected_device].type == DEVICE_TYPE_SIMULATED);
+        if (is_sim && !gui_chrome_hide_hidden(&state->chrome_hide)) {
+            const char *sys_labels[] = {"PAL", "NTSC", "SECAM"};
+            int sys = app->settings.video_system;
+            if (sys < 0 || sys > 2) sys = 0;
+            char btn_label[24];
+            snprintf(btn_label, sizeof(btn_label), "Gen: %s", sys_labels[sys]);
+            float btn_h = 18.0f;
+            float btn_w = (float)gui_text_measure(btn_label, FONT_SIZE_DROPDOWN_OPT) + 16.0f;
+            if (btn_w < 90.0f) btn_w = 90.0f;
+            /* Right-aligned, one row BELOW the Scale/Mode/Trig group —
+             * in-line with the other controls, same right margin. */
+            float btn_x = bounds.x + bounds.width - btn_w - 8.0f;
+            float btn_y = bounds.y + 8.0f + btn_h + 6.0f;
+            state->sim_sys_btn_rect = (Rectangle){btn_x, btn_y, btn_w, btn_h};
+            DrawRectangleRounded(state->sim_sys_btn_rect, 0.15f, 4, COLOR_BUTTON_ACTIVE);
+            gui_text_draw(btn_label, btn_x + 8.0f,
+                          btn_y + (btn_h - FONT_SIZE_DROPDOWN_OPT) * 0.5f,
+                          FONT_SIZE_DROPDOWN_OPT, COLOR_TEXT);
+        } else {
+            state->sim_sys_btn_rect = (Rectangle){0};
+        }
     }
 }
 

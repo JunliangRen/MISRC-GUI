@@ -17,6 +17,7 @@
 #include "../net/gui_net.h"
 #include "../net/gui_monitor_transport.h"
 #include "../net/gui_remote_display.h"
+#include "gui_text.h"
 #include <stdio.h>
 
 //-----------------------------------------------------------------------------
@@ -105,8 +106,11 @@ static void render_single_panel(gui_app_t *app, int channel,
     if(app->settings.net_mode == GUI_NET_MODE_MONITOR_CLIENT) {
         if(type != PANEL_VIEW_WAVEFORM && type != PANEL_VIEW_FFT) {
             DrawRectangleRec(bounds,COLOR_PANEL_BG);
-            DrawText("Monitor & Remote: only Waveform/FFT preview available",
-                     (int)bounds.x+12,(int)bounds.y+15,14,COLOR_TEXT_DIM);
+            /* gui_text_draw = the app's Inter font; raw raylib DrawText would
+             * render the built-in bitmap font (the placeholder font that was
+             * asked to be removed entirely). */
+            gui_text_draw("Monitor & Remote: only Waveform/FFT preview available",
+                     bounds.x+12,bounds.y+15,14,COLOR_TEXT_DIM);
             return;
         }
         /* Static scratch: 49 KiB per snapshot, not allocated on every draw. */
@@ -114,8 +118,8 @@ static void render_single_panel(gui_app_t *app, int channel,
         bool valid=gui_monitor_client_connected() && gui_rd_client_snapshot(&frame);
         if(!valid || !state || channel >= (int)frame.channels) {
             DrawRectangleRec(bounds,COLOR_PANEL_BG);
-            DrawText("Waiting for Server preview...",
-                     (int)bounds.x+12,(int)bounds.y+15,14,COLOR_TEXT_DIM);
+            gui_text_draw("Waiting for Server preview...",
+                     bounds.x+12,bounds.y+15,14,COLOR_TEXT_DIM);
             return;
         }
         if(type==PANEL_VIEW_FFT)
@@ -140,9 +144,9 @@ static void render_single_panel(gui_app_t *app, int channel,
         DrawRectangleRec(bounds, (Color){20, 20, 20, 255});
         DrawRectangleLinesEx(bounds, 1, (Color){60, 60, 60, 255});
         const char *name = panel_view_type_name(type);
-        int w = MeasureText(name, 14);
-        DrawText(name, (int)(bounds.x + bounds.width/2 - w/2),
-                 (int)(bounds.y + bounds.height/2 - 7), 14, COLOR_TEXT_DIM);
+        int w = gui_text_measure(name, 14);
+        gui_text_draw(name, bounds.x + bounds.width/2 - w/2,
+                 bounds.y + bounds.height/2 - 7, 14, COLOR_TEXT_DIM);
     }
 }
 

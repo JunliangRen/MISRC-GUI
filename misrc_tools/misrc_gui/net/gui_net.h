@@ -59,8 +59,26 @@ void gui_net_cleanup_globals(void);
 
 /* Apply the configured net mode to the app. Starts/stops the server or client so
  * that app state matches app->settings.net_mode + port/host. Called from the UI
- * on mode change and at startup. Returns 0 on success, negative on error. */
+ * on mode change and at startup. Returns 0 on success, negative on error.
+ * This STOPS/STARTS and JOINS network worker threads (multi-second socket
+ * timeouts against an unreachable peer): UI click handlers must use the
+ * asynchronous gui_net_request_apply_mode() instead. */
 int gui_net_apply_mode(gui_app_t *app);
+
+/* Asynchronous gui_net_apply_mode on a worker so the render thread never
+ * stalls on thread joins. The worker CHASES app->settings.net_mode: a click
+ * while a transition is running returns 0 (queued) - the newest target is
+ * applied next, so rapid cycling converges on the last chosen mode.
+ * prev_mode: the mode before this request (for the deferred local device
+ * re-enumeration when leaving a client mode / returning to Local).
+ * force_reapply: apply once even when the mode is unchanged (same-mode port
+ * or host edits). Returns 0 started/queued, -1 only when the worker could
+ * not be created (caller may then apply synchronously). */
+int gui_net_request_apply_mode(gui_app_t *app, int prev_mode, bool force_reapply);
+
+/* True while an async mode transition (gui_net_request_apply_mode) runs. The
+ * main-thread pollers and query helpers early-out while it is set. */
+bool gui_net_transition_busy(void);
 
 /* Tear down any active server/client (for gui_app_cleanup and mode switches). */
 void gui_net_stop(gui_app_t *app);

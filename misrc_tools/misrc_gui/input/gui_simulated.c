@@ -28,6 +28,7 @@
 #include "../core/gui_app.h"
 #include "../processing/gui_extract.h"
 #include "../processing/gui_display_thread.h"
+#include "../signal/gui_testgen.h"
 #include "../../common/buffer_manager.h"
 #include "../../common/threading.h"
 
@@ -98,6 +99,12 @@
 // Video Signal Levels
 //-----------------------------------------------------------------------------
 
+/* REVERTED to the original values the CVBS decoder was validated against.
+ * The hacktv "accurate" values (-0.30/0/0/0.70) broke the decoder's
+ * level adaptation (the shallower sync depth and lack of black-blanking
+ * separation caused rolling). These values decode correctly; the hacktv
+ * correction needs to be applied incrementally after confirming each
+ * step still decodes. */
 #define SYNC_LEVEL      (-0.4)    // Sync tip
 #define BLANKING_LEVEL  (0.0)     // Blanking/black level
 #define BLACK_LEVEL     (0.075)   // Setup/pedestal (7.5 IRE)
@@ -361,7 +368,7 @@ static const double bar_rgb[8][3] = {
 //-----------------------------------------------------------------------------
 
 // Test mode: set to 1-7 to output a single solid color bar, 0 for normal bars
-#define TEST_SINGLE_COLOR 1  // 0=normal, 1=yellow, 2=cyan, 3=green, 4=magenta, 5=red, 6=blue
+#define TEST_SINGLE_COLOR 0  // 0=normal bars, 1=yellow, 2=cyan, 3=green, 4=magenta, 5=red, 6=blue
 
 // Get Y, U, V values for current bar
 static void sim_get_bar_yuv(int bar, double *y, double *u, double *v) {
@@ -474,21 +481,13 @@ static double sim_generate_cvbs(uint64_t sample_index, int *out_line_number, int
             else if (sample_in_line < active_start) {
                 // Back porch - includes color burst
                 int back_porch_pos = sample_in_line - HSYNC_SAMPLES;
-                int burst_start = (int)(0.6 * 40);   // 0.6µs after hsync
+                int burst_start = (int)(0.6 * 40);   // 0.6µs after hsync end (original working value)
                 int burst_duration = (int)(COLORBURST_CYCLES * 40.0 / (COLORBURST_FREQ / 1000000.0));
 
                 if (back_porch_pos >= burst_start && back_porch_pos < burst_start + burst_duration) {
-                    // PAL colorburst: 135° phase (swinging ±45° from line to line)
-                    // cos(135°) = -sqrt(2)/2 ≈ -0.707
-                    // sin(135°) = +sqrt(2)/2 ≈ +0.707
-                    // PAL burst swings between 135° and 225° on alternating lines
-                    // Line n:   phase = 135° -> burst_i = -0.707, burst_q = +0.707
-                    // Line n+1: phase = 225° -> burst_i = -0.707, burst_q = -0.707
-                    // The swing is based on (frame + line) & 1
-
-                    double burst_level = 0.15;  // About 40 IRE peak-to-peak
-                    double burst_i = -0.7071;   // cos(135°) = -sqrt(2)/2
-                    double burst_q = 0.7071;    // sin(135°) = +sqrt(2)/2
+                    double burst_level = 0.15;  // Original working value (about 40 IRE p-p)
+                    double burst_i = -0.7071;   /* cos(135) */
+                    double burst_q = 0.7071;    /* sin(135) */
 
                     // PAL burst phase alternation: swing ±45° on alternating lines
                     // On odd lines (when pal_switch = -1), burst swings to 225°
@@ -607,6 +606,13 @@ static double sim_generate_vhs_rf(double cvbs_luma, double chroma_u, double chro
 // Simulated Capture Thread
 //-----------------------------------------------------------------------------
 
+/* Channel A: hacktv-accurate CVBS stream. One full interlaced frame is
+ * pre-generated per system (PAL/NTSC/SECAM) and streamed continuously -
+ * a live capture signal through the full pipeline (waveform, FFT, Video
+ * panel decode, recording), not a static snapshot. The system follows
+ * app->settings.video_system (0=PAL, 1=NTSC, 2=SECAM); a change detected
+ * in the capture loop regenerates the frame and restarts the stream from
+ * its beginning. */
 static int simulated_capture_thread(void *ctx) {
     gui_app_t *app = (gui_app_t *)ctx;
 
@@ -620,8 +626,14 @@ static int simulated_capture_thread(void *ctx) {
         return -1;
     }
 
+    /* Pre-generated hacktv-accurate CVBS frame (channel A) */
+    int sim_system = -1;   /* force first generation */
+    int16_t *cvbs_frame = NULL;
+    size_t cvbs_frame_samples = 0;
+    uint64_t cvbs_frame_pos = 0;   /* streaming position within the frame */
+
     fprintf(stderr, "[SIM] Simulated capture thread started at %d MSPS (writing to BUF_CAPTURE_RF)\n", SIM_SAMPLE_RATE / 1000000);
-    fprintf(stderr, "[SIM] Channel A: CVBS composite video (PAL color bars)\n");
+    fprintf(stderr, "[SIM] Channel A: hacktv-accurate CVBS (video_system setting)\n");
     fprintf(stderr, "[SIM] Channel B: VHS RF head signal (FM luma + 629kHz chroma)\n");
 
 #if SIM_ENABLE_CVBS_NOISE
@@ -639,47 +651,90 @@ static int simulated_capture_thread(void *ctx) {
     uint64_t batch_count = 0;
 
     while (atomic_load(&app->sim_running)) {
+        /* System (PAL/NTSC/SECAM) follows the app's video_system setting;
+         * detect a change and regenerate the frame. */
+        int want_system = app->settings.video_system;
+        if (want_system < 0 || want_system >= GUI_TESTGEN_SYSTEM_COUNT) {
+            want_system = GUI_TESTGEN_PAL;
+        }
+        if (want_system != sim_system) {
+            sim_system = want_system;
+            size_t need = gui_testgen_frame_samples(
+                (gui_testgen_system_t)sim_system, SIM_SAMPLE_RATE);
+            if (need > 0) {
+                int16_t *grown = (int16_t *)realloc(cvbs_frame,
+                                                    need * sizeof(int16_t));
+                if (grown) {
+                    cvbs_frame = grown;
+                    cvbs_frame_samples = gui_testgen_frame(
+                        (gui_testgen_system_t)sim_system, cvbs_frame, need,
+                        SIM_SAMPLE_RATE);
+                    cvbs_frame_pos = 0;
+                    fprintf(stderr, "[SIM] Channel A: %s hacktv frame "
+                            "(%zu samples at %u MSPS)\n",
+                            gui_testgen_system_name((gui_testgen_system_t)sim_system),
+                            cvbs_frame_samples, SIM_SAMPLE_RATE / 1000000);
+                }
+            }
+        }
+
         for (int i = 0; i < SIM_BUFFER_SIZE; i++) {
+            /* Channel A: stream from the hacktv plugin frame (continuous
+             * live signal through the full capture pipeline). The frame is
+             * hacktv's int16 output; scale to the 12-bit capture domain.
+             * hacktv PAL: sync -0.30*32767=-9830, white 0.70*32767=22937.
+             * 12-bit domain: -2048..2047. Scale by 2048/32767 ≈ 0.0625. */
+            double cvbs;
+            if (cvbs_frame && cvbs_frame_samples > 0) {
+                int16_t raw = cvbs_frame[cvbs_frame_pos % cvbs_frame_samples];
+                cvbs = (double)raw / 32767.0;
+                cvbs_frame_pos++;
+            } else {
+                cvbs = 0.0;
+            }
+
+            /* Channel B: VHS RF from the old per-sample generator. */
             int line_in_frame = 0;
             int field = 0;
             double chroma_u = 0.0;
             double chroma_v = 0.0;
-            double subcarrier_phase = 0.0;
+            {
+                int line_in_field;
+                int sample_in_line_vhs;
+                bool is_half;
+                sim_get_line_type(s_sim_sample_count, &field, &line_in_field,
+                                  &sample_in_line_vhs, &is_half);
+                line_in_frame = (field == 0) ? line_in_field
+                               : (LINES_PER_FIELD + line_in_field);
+            }
+            /* Derive chroma from the bar for VHS (same layout as hacktv) */
+            int sample_in_line = (int)(s_sim_sample_count % LINE_SAMPLES);
+            if (sample_in_line > HSYNC_SAMPLES + BACK_PORCH_SAMPLES &&
+                sample_in_line < LINE_SAMPLES - FRONT_PORCH_SAMPLES) {
+                int active_start = HSYNC_SAMPLES + BACK_PORCH_SAMPLES;
+                int active_end = LINE_SAMPLES - FRONT_PORCH_SAMPLES;
+                int active_width = active_end - active_start;
+                int pixel = sample_in_line - active_start;
+                int bar = (pixel * 8) / active_width;
+                if (bar > 7) bar = 7;
+                if (bar < 0) bar = 0;
+                double y;
+                sim_get_bar_yuv(bar, &y, &chroma_u, &chroma_v);
+            }
+            double vhs_rf = sim_generate_vhs_rf(cvbs, chroma_u, chroma_v,
+                                                line_in_frame, field,
+                                                sample_in_line);
 
-            // Generate CVBS signal and get U/V chroma components for VHS
-            double cvbs = sim_generate_cvbs(s_sim_sample_count, &line_in_frame, &field,
-                                            &chroma_u, &chroma_v, &subcarrier_phase);
-#if SIM_ENABLE_CVBS_NOISE
-            cvbs += sim_noise() * cvbs_noise;
-#endif
-
-            // For VHS, compute luma from CVBS (subtract the chroma we added)
-            // Chroma was: cos(phase) * V + sin(phase) * U
-            double chroma_at_sample = cos(subcarrier_phase) * chroma_v
-                                    + sin(subcarrier_phase) * chroma_u;
-            double cvbs_luma = cvbs - chroma_at_sample;
-
-            // Get sample_in_line for VHS RF generation
-            int field_tmp, line_in_field_tmp, sample_in_line;
-            bool is_half_line_tmp;
-            sim_get_line_type(s_sim_sample_count, &field_tmp, &line_in_field_tmp, &sample_in_line, &is_half_line_tmp);
-
-            // Generate VHS RF with U/V quadrature chroma at 629 kHz
-            double vhs_rf = sim_generate_vhs_rf(cvbs_luma, chroma_u, chroma_v, line_in_frame, field, sample_in_line);
-#if SIM_ENABLE_VHS_RF_NOISE
-            vhs_rf += sim_noise() * rf_noise;
-#endif
-
-#if SIM_ENABLE_SOFT_CLIPPING
-            // Soft clipping - analog-style saturation near limits
-            if (cvbs > 0.95) cvbs = 0.95 + 0.05 * tanh((cvbs - 0.95) * 10.0);
-            if (cvbs < -0.95) cvbs = -0.95 + 0.05 * tanh((cvbs + 0.95) * 10.0);
-            if (vhs_rf > 0.95) vhs_rf = 0.95 + 0.05 * tanh((vhs_rf - 0.95) * 10.0);
-            if (vhs_rf < -0.95) vhs_rf = -0.95 + 0.05 * tanh((vhs_rf + 0.95) * 10.0);
-#endif
-
-            buf_a[i] = (int16_t)(cvbs * 1400.0);
-            buf_b[i] = (int16_t)(vhs_rf * 1024.0);  // 50% of full scale
+            /* 2000 scale: the user-confirmed most-stable iteration.
+             * hacktv PAL: sync -0.30*2000=-600, white 0.70*2000=1400.
+             * Span 2000 counts in the 12-bit domain — matching the old
+             * device's ~1960 count span the decoder was calibrated for.
+             * The 169+9 attempt was too small (8% of range); the 255
+             * attempt was also too small. 2000 was "more stable" per the
+             * user. The exact real-capture amplitude match is a separate
+             * calibration task once the decode locks reliably. */
+            buf_a[i] = (int16_t)(cvbs * 2000.0);
+            buf_b[i] = (int16_t)(vhs_rf * 2000.0);
 
             s_sim_sample_count++;
         }
@@ -712,6 +767,7 @@ static int simulated_capture_thread(void *ctx) {
 
     free(buf_a);
     free(buf_b);
+    free(cvbs_frame);
 
     return 0;
 }

@@ -121,6 +121,12 @@ bool gui_updater_parse_semver_triplet(const char *version, int *major_out, int *
     return true;
 }
 
+bool gui_updater_version_is_comparable(const char *version)
+{
+    int maj = 0, min = 0, pat = 0;
+    return gui_updater_parse_semver_triplet(version, &maj, &min, &pat);
+}
+
 int gui_updater_compare_versions(const char *current_version, const char *latest_version)
 {
     int cmaj = 0, cmin = 0, cpat = 0;
@@ -133,9 +139,15 @@ int gui_updater_compare_versions(const char *current_version, const char *latest
         if (cpat != lpat) return (cpat < lpat) ? -1 : 1;
         return 0;
     }
-    /* Text fallback: dev builds ("dev-2026-10-21-abcdef") do not parse as
-     * semver; compare lexically so a dev build still sees v1.2.6 as newer
-     * ('d' < 'v') and the self-update flow stays exercisable. */
+    /* A dev/unversioned current build ("dev-2026-10-21-abcdef",
+     * "unknown_version") is NOT comparable: return 0 so no caller ever treats
+     * it as older than a release tag. The old lexical fallback ('d' < 'v')
+     * made every such build permanently report "update available" against
+     * the current release even when the dev build was newer. Callers that
+     * need to know use gui_updater_version_is_comparable(). */
+    if (!current_ok) return 0;
+    /* Weird latest (non-semver tag): keep a lexical text comparison for the
+     * release-vs-release edge only. */
     int text_cmp = strcmp(current_version ? current_version : "",
                           latest_version ? latest_version : "");
     if (text_cmp < 0) return -1;

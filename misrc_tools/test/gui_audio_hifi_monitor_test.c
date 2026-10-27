@@ -55,6 +55,9 @@ static void monitor_test_flag_clear(volatile atomic_flag *flag)
 /* Capture/writer paths are outside this monitor-only test. */
 void gui_app_set_status(gui_app_t *a, const char *s) { (void)a; (void)s; assert(false); }
 FILE *file_open_utf8(const char *p, const char *m) { (void)p; (void)m; assert(false); return NULL; }
+/* gui_audio.c taps the capture stream for the M-Server monitor display only
+ * while the unified server runs; idle in this harness. */
+bool gui_monitor_server_active(void) { return false; }
 int bufmgr_ensure_init(buffer_manager_t *m, buffer_id_t id) { (void)m; (void)id; assert(false); return -1; }
 void *bufmgr_read_begin(buffer_manager_t *m, buffer_id_t id, size_t n, int ms)
 { (void)m; (void)id; (void)n; (void)ms; assert(false); return NULL; }
